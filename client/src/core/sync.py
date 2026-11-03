@@ -746,11 +746,14 @@ class SyncClient:
         files[name] = entry = file_entry(name, data)
         return ItemChange(node.id, files, {entry.hash: data})
 
-    def _metadata_change(self, node: Node, **fields: Any) -> ItemChange | None:
-        """`node` with some metadata fields changed, or None if they already match."""
+    def _metadata_change(self, node: Node, touch: bool = True, **fields: Any) -> ItemChange | None:
+        """`node` with some metadata fields changed, or None if they already match.
+        `touch` also sets lastModified, as editing an item does (not reading it)."""
         if all(node.metadata.raw.get(k) == v for k, v in fields.items()):
             return None
-        raw = {**node.metadata.raw, **fields, "lastModified": ms_timestamp(self._clock())}
+        raw = {**node.metadata.raw, **fields}
+        if touch:
+            raw["lastModified"] = ms_timestamp(self._clock())
         return self._replace_file(node, f"{node.id}.metadata", json_bytes(raw))
 
     @staticmethod
@@ -759,15 +762,24 @@ class SyncClient:
         if folder_id != ROOT_ID and (folder is None or not folder.is_folder or tree.is_trashed(folder_id)):
             raise SyncError("the destination folder no longer exists")
 
-    def _update(self, what: str, item_ids: Iterable[str], **fields: Any) -> DocumentTree:
+    def _update(self, what: str, item_ids: Iterable[str], touch: bool = True, **fields: Any) -> DocumentTree:
         """Change metadata fields of existing items (ones gone from the cloud are skipped)."""
         item_ids = list(item_ids)
 
         def edit(tree: DocumentTree) -> list[ItemChange]:
             nodes = [tree.get(i) for i in item_ids]
-            changes = [self._metadata_change(n, **fields) for n in nodes if n is not None]
+            changes = [self._metadata_change(n, touch, **fields) for n in nodes if n is not None]
             return [c for c in changes if c is not None]
         return self._commit(what, edit)
+
+    def set_reading_position(self, doc_id: str, page: int, opened_ms: int | None = None) -> DocumentTree:
+        """Record where a document was left (lastOpenedPage) and, with `opened_ms`, when it
+        was opened (lastOpened). Reading is not editing: lastModified stays, as the
+        tablet's own metadata shows (documents opened after their last change keep it)."""
+        fields: dict[str, Any] = {"lastOpenedPage": int(page)}
+        if opened_ms is not None:
+            fields["lastOpened"] = str(int(opened_ms))
+        return self._update(f"reading position of {doc_id}", [doc_id], touch=False, **fields)
 
     def import_file(self, path: str | Path, parent: str = ROOT_ID, name: str | None = None,
                     progress: Callable[[int, int], None] | None = None) -> str:

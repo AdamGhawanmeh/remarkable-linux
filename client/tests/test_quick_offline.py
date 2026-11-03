@@ -489,9 +489,10 @@ class QuickAppTests(unittest.TestCase):
         self.assertEqual(model.property("filter"), int(library.LibraryView.Filter["Documents"]))
 
 
-class ImportExportTests(unittest.TestCase):
-    """Documents imported from this computer open in the viewer at once, and documents
-    export through ExportDialog's PlatformHelpers.exportFile, over the fake cloud."""
+class WorkflowTests(unittest.TestCase):
+    """What a user does, through the bridges the app's QML calls, over the fake cloud:
+    documents imported from this computer open at once, pages turn, reading positions are
+    kept, documents export (PlatformHelpers.exportFile), and library changes and tags."""
 
     @classmethod
     def setUpClass(cls):
@@ -514,6 +515,7 @@ class ImportExportTests(unittest.TestCase):
         cls.window.resize(1270, 875)
         cls.notices: list[str] = []
         cls.app.singletons.platform_helpers.errorMessage.connect(cls.notices.append)
+        cls.app.library.errorMessage.connect(cls.notices.append)
         cls.out = tmp / "exports"
         cls.out.mkdir()
 
@@ -694,7 +696,7 @@ class ImportExportTests(unittest.TestCase):
     def test_export_problems_are_reported(self):
         notices = len(self.notices)
         self.assertFalse(self.export(self.out / "no-such-folder" / "x.pdf", demo_id("Sketchbook")))
-        self.assertFalse(self.export(self.out, demo_id("Sketchbook"), "ExportPng"))
+        self.assertFalse(self.export(self.out, demo_id("Sketchbook"), "ExportSvg"))
         self.assertIn("no such folder", self.notices[notices])
         self.assertEqual(self.notices[notices + 1], "This export format is not available on Linux")
         epub = self.epub()                                         # nothing to draw yet: fails in the worker
@@ -703,6 +705,142 @@ class ImportExportTests(unittest.TestCase):
         self.assertIn('Unable to export "Pocket book": ValueError: document has no pages', self.notices)
         self.assertEqual(self.app.library.entryForId(epub).property("status"), int(library.EntryWrapper.Status.Ok))
         self.assertFalse((self.out / "epub.pdf").exists())
+
+    def scale(self) -> float:
+        view = next(v for v in self.scene_views() if v.property("status") == 2)
+        return round(view._get("tileManager")._get("scale"), 4)
+
+    def turn_to(self, page: int, page_id: str):
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "setCurrentPage", Q_ARG("QVariant", page))
+        self.assertTrue(self.wait_for(lambda: any(v.property("pageId") == page_id and v.property("status") == 2
+                                                  for v in self.scene_views())))
+        wait(200)
+
+    def test_turning_pages_keeps_them_fitted(self):
+        # Notebook pages all have the same paper, so DocumentViewport never re-fits the
+        # zoom: page 2 used to open at 100 % (scale 1), much larger than the window.
+        notes = self.app.library.entryForId(demo_id("Meeting notes"))
+        self.open_document(notes.property("id"))
+        first = self.scale()
+        self.assertLess(first, 0.9)
+        self.turn_to(1, notes.idForPage(1))
+        self.assertEqual(self.scale(), first)
+        self.close_document()
+        # An inserted note page in a PDF fits like a notebook page; the PDF pages around it keep theirs.
+        paper = self.app.library.entryForId(demo_id("Research paper"))
+        self.open_document(paper.property("id"))
+        pdf_scale = self.scale()
+        self.turn_to(1, paper.idForPage(1))
+        self.assertEqual(self.scale(), first)
+        self.turn_to(2, paper.idForPage(2))
+        self.assertEqual(self.scale(), pdf_scale)
+
+    def test_sync_does_not_reload_the_open_page(self):
+        self.open_document(demo_id("Sketchbook"))
+        view = self.scene_views()[0]
+        self.app.syncer.refresh()
+        self.assertTrue(self.wait_for(lambda: not self.app.syncer.running))
+        wait(300)
+        self.assertEqual(self.scene_views(), [view])
+
+    def cloud_metadata(self, doc_id: str) -> dict:
+        """The document's metadata as a fresh client reads it from the (fake) cloud."""
+        fresh = SyncClient(paired_auth(self.dir / f"auth-{len(self.notices)}", self.cloud),
+                           Path(tempfile.mkdtemp(dir=self.dir)))
+        return fresh.refresh().get(doc_id).metadata.raw
+
+    def test_reading_position_is_kept_and_saved(self):
+        doc_id = demo_id("Research paper")
+        entry = self.app.library.entryForId(doc_id)
+        before = self.cloud_metadata(doc_id)
+        self.open_document(doc_id)
+        self.turn_to(2, entry.idForPage(2))
+        self.close_document()
+        # At once: the entry and the next open start where the reader left.
+        self.assertEqual(entry.property("lastOpenedPage"), 2)
+        self.assertEqual(entry.property("subtext"), "Page 3 of 3")
+        view = self.open_document(doc_id, entry.idForPage(2))
+        self.assertEqual(self.qml("DocumentViewport").property("currentPage"), 2)
+        self.close_document()
+        # Then in the cloud, without touching lastModified (reading is not editing).
+        self.assertTrue(self.wait_for(lambda: self.cloud_metadata(doc_id)["lastOpenedPage"] == 2, 10000))
+        # The commit's result reaches the library on the GUI thread a moment after the cloud has it.
+        self.assertTrue(self.wait_for(lambda: self.app.library.reading_position(doc_id) == {}))
+        after = self.cloud_metadata(doc_id)
+        self.assertEqual(after["lastModified"], before["lastModified"])
+        self.assertGreater(int(after["lastOpened"]), int(before["lastOpened"]))
+        self.assertEqual(entry.property("lastOpenedPage"), 2)
+        del view
+
+    def test_tags_view_opens_a_tagged_page(self):
+        # TagsViewSelectionBehavior: setLastOpenedPage(document, page), then open it.
+        doc_id = demo_id("Meeting notes")
+        entry = self.app.library.entryForId(doc_id)
+        self.app.singletons.controller.setLastOpenedPage(doc_id, 1)
+        self.open_document(doc_id, entry.idForPage(1))
+        self.assertEqual(self.qml("DocumentViewport").property("currentPage"), 1)
+
+    def test_background_saves_fail_quietly(self):
+        from ui.workers import Mutator
+        offline = Mutator(LibrarySource(SyncClient(paired_auth(self.dir / "quiet", self.cloud), self.dir / "q"),
+                                        cached_only=True))
+        failures, done = [], []
+        offline.failed.connect(failures.append)
+        offline.run("Saving the reading position", lambda sync, _: None, "", done.append, quiet=True)
+        self.assertEqual((failures, done), ([], [False]))
+        offline.run("Renaming", lambda sync, _: None, "", done.append)
+        self.assertEqual(failures, ["Renaming: not possible offline"])
+
+    def test_library_changes_and_tags(self):
+        lib, controller = self.app.library, self.app.singletons.controller
+        # Tags set on the tablet: listed, and the library filters by them.
+        self.assertTrue({"work", "reading"} <= set(lib.tagLabels(True)))
+        view = library.LibraryNavigator()
+        view.setLibrary(lib)
+        view.setFilter(int(library.LibraryView.Filter["Documents"]))
+        view.setIgnoreParent(True)
+        view.setFilterTags(["work"])
+        view.updateNow()
+        self.assertEqual(sorted(lib.tree.get(i).name for i in view.property("entryIds")),
+                         ["Meeting notes", "Research paper"])
+        view.setFilterTags(["work", "reading"])                   # documents with all of them
+        view.updateNow()
+        self.assertEqual([lib.tree.get(i).name for i in view.property("entryIds")], ["Research paper"])
+        # LibraryController's changes are cloud commits that come back into the library.
+        sketch, personal = demo_id("Sketchbook"), demo_id("Personal")
+        node = lambda: lib.tree.get(sketch)                       # noqa: E731
+        for change, done in ((lambda: controller.setVisibleName(sketch, "Sketches"), lambda: node().name == "Sketches"),
+                             (lambda: controller.togglePinned([sketch]), lambda: not node().pinned),   # it was a favorite
+                             (lambda: controller.moveEntries([sketch], personal), lambda: node().parent_id == personal),
+                             (lambda: controller.moveEntriesToTrash([sketch]), lambda: lib.tree.is_trashed(sketch)),
+                             (lambda: controller.restoreEntriesFromTrash([sketch]), lambda: node().parent_id == ROOT_ID)):
+            change()
+            self.assertTrue(self.wait_for(done))
+        cloud = self.cloud_metadata(sketch)
+        self.assertEqual((cloud["visibleName"], cloud["pinned"], cloud["parent"]), ("Sketches", False, ROOT_ID))
+
+    def test_unavailable_changes_say_so(self):
+        controller, notices = self.app.singletons.controller, len(self.notices)
+        controller.cloneEntry(demo_id("Sketchbook"), "")               # Copy, then Paste
+        controller.setEntryTags(demo_id("Sketchbook"), ["work"], [])   # the Tag dialog
+        self.assertEqual(self.notices[notices:], ["Copying documents is not available on Linux yet",
+                                                  "Editing tags is not available on Linux yet"])
+
+    def test_export_png(self):
+        paper = demo_id("Research paper")
+        folder = self.out / "images"
+        folder.mkdir()
+        self.assertTrue(self.export(folder, paper, "ExportPng"))
+        self.wait_exported(paper)
+        pngs = sorted((folder / "Research paper").iterdir())
+        self.assertEqual([p.name for p in pngs], [f"Research paper - {n}.png" for n in (1, 2, 3)])
+        first, note = QImage(str(pngs[0])), QImage(str(pngs[1]))
+        self.assertEqual(first.width(), round(595 * 226 / 72))          # the A4 PDF page at 226 DPI
+        self.assertEqual((note.width(), note.height()), (1404, 1872))  # the inserted note page
+        self.assertTrue(self.export(folder, paper, "ExportPng", pages=[2]))   # picked pages; a new folder
+        self.wait_exported(paper)
+        self.assertEqual([p.name for p in (folder / "Research paper 2").iterdir()], ["Research paper - 3.png"])
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["Research paper", "Research paper 2"])
 
     def test_abort_export(self):
         import threading

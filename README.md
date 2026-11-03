@@ -9,8 +9,10 @@
 A native Linux desktop client for your reMarkable library. It runs the official
 reMarkable desktop app's own interface (its QML, fonts and icons, unmodified) on a
 from-scratch Python/Qt implementation of everything underneath: cloud sync, the `.rm`
-notebook renderer, PDF/EPUB viewing, page templates, PDF and `.rmdoc` export, imports,
-folders, moves and the trash, and Screen Share from the tablet.
+notebook renderer, PDF/EPUB viewing, page templates, PDF, PNG and `.rmdoc` export,
+imports, folders, moves and the trash, and Screen Share from the tablet. It is a reader
+and organiser: editing pages is not there yet. See
+[Feature status and roadmap](#feature-status-and-roadmap) for exactly what works.
 
 It works on a **bring-your-own-asset** basis: `install.sh` takes reMarkable's official
 Windows installer (downloaded from reMarkable, or a copy you already have), unpacks
@@ -124,8 +126,10 @@ Your data stays in your home directory, outside the checkout:
 | `~/.config/remarkable-linux/` | Device and user tokens (`auth.json`, mode 0600), settings |
 | `~/.cache/remarkable-linux/` | The synced library and thumbnails |
 
-Imports, new folders, renames, moves and the trash change your reMarkable cloud, as the
-official app does. `--offline` never writes.
+Imports, new folders, renames, moves, favorites and the trash change your reMarkable
+cloud, as the official app does. So does closing a document: the page you were on and
+when you opened it are saved (`lastOpenedPage`, `lastOpened`), so the document reopens
+there on every device. Nothing else about the document changes. `--offline` never writes.
 
 `dist/remarkable-linux/` contains reMarkable's extracted assets: it is for your own use,
 not for sharing (see [Legal](#legal)).
@@ -140,8 +144,47 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 286 offline tests use a fake cloud and synthetic documents; they need no account
+The 309 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
+
+## Feature status and roadmap
+
+What runs on screen is always the official app's interface. Behind it, some of the
+app's features are implemented and some are not yet. Those not implemented are
+disabled the way the official app disables them, or say "not available on Linux yet"
+when you use them.
+
+### Working
+
+| Area | What works |
+|---|---|
+| Interface | The official desktop app's own QML, fonts, icons and translations, unmodified (1:1 UI) |
+| Log in | The app's log-in wizard with a one-time code from my.remarkable.com; **Log out** removes this computer from your account |
+| Cloud sync | Your library from reMarkable's cloud (sync v3/v4); documents download on demand |
+| Offline cache | The cached library opens at once, also without a network; `--offline` never connects or writes |
+| Library | My files and folders, Notebooks, PDFs, Ebooks, Favorites, Trash, sort orders, grid and list views, thumbnails |
+| Search | Title search across the library (Ctrl+F) |
+| Tags | Tags set on the tablet are listed in Tags, and the library filters by them |
+| File operations | New folder, rename, move (drag, Move, Cut and Paste), favorite, move to trash, restore, delete, empty trash |
+| Import | PDF and EPUB, from Import or by dragging files onto the window; imported PDFs open at once |
+| Viewer | Notebooks (`.rm` v3/v5/v6: ink, highlighters, pencils, typed text, page templates), PDFs and EPUBs with your annotations, PDF links, page overview, zoom (Ctrl++, Ctrl+-, Ctrl+0), page turning (Left/Right arrows) |
+| Reading position | Documents reopen at the page you left; synced like the official app |
+| Export | PDF (vector: the original PDF pages, with your ink on top), PNG (one image per page at 226 DPI), `.rmdoc`; whole documents or selected pages, with progress and cancel |
+| Screen Share | LiveView of your tablet's screen (Account > Screen Share, or accept the tablet's request) |
+
+### In progress and known limitations
+
+| Area | Status |
+|---|---|
+| Editing pages | Drawing, typed text (creating or editing text notes), new notebooks and quick sheets are not available. The app's own client-editing feature is off, so the UI hides or disables them, as the official app does without it. |
+| Page management | Adding, moving, copying, duplicating and deleting pages are part of editing: disabled. |
+| Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
+| Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |
+| Search in documents | The search bar inside a document opens but does not find anything yet. |
+| SVG export | Not available yet; PDF and PNG are. |
+| EPUBs | Shown through the PDF version your tablet makes of them. An EPUB imported here opens once the tablet has opened it and synced; until then the viewer says so. There is no reflowing, font or margin setting. |
+| Password-protected PDFs | Not supported. |
+| Not on Linux | Converting handwriting to text, the share sheet (Share), scanning documents and in-app updates. |
 
 ## What install.sh puts where
 

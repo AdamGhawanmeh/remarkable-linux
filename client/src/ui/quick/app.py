@@ -96,6 +96,7 @@ class QuickApp:
         self.exporter = DocumentExporter(source, self.library,
                                          notify=lambda message: self.singletons.platform_helpers.errorMessage.emit(message))
         self.library.abort_export = self.exporter.abort
+        self.library.save_reading_position = self._save_reading_position
         self.singletons = Singletons(
             library=self.library,
             controller=LibraryController(self.library, self.mutator.run),
@@ -129,6 +130,13 @@ class QuickApp:
         self.account.loggedIn.connect(self._logged_in)
         self.account.loginFailed.connect(self._login_failed)
         self.account.loggedOut.connect(self._logged_out)
+
+    def _save_reading_position(self, doc_id: str, page: int, opened_ms: int | None) -> None:
+        """Library.save_reading_position: lastOpenedPage/lastOpened to the cloud, as the app
+        syncs them. Offline or logged out they stay in this session only."""
+        if self.source.writable and self.logged_in:
+            self.mutator.run("Saving the reading position",
+                             lambda sync, _: sync.set_reading_position(doc_id, page, opened_ms), "", quiet=True)
 
     @property
     def logged_in(self) -> bool:
@@ -263,6 +271,7 @@ class QuickApp:
 
     def shutdown(self) -> None:
         self.closing = True
+        self.library.save_reading_positions(include_open=True)
         self.singletons.screen_share.shutdown()
         self.account.wait(60000)
         self.mutator.wait(120000)

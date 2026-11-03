@@ -22,7 +22,7 @@ from core.models import Document, DocumentTree
 from core.sync import SyncClient, SyncError
 
 from .library import LibrarySource
-from .export import export_pdf
+from .export import export_pdf, export_png
 from .pages import DocumentPages, cover_index, render_content
 
 log = logging.getLogger("rm.ui.workers")
@@ -169,7 +169,7 @@ class ExportCancelled(Exception):
 
 
 class Exporter(QObject):
-    """Exports a document to PDF or .rmdoc in the background, one at a time.
+    """Exports a document to PDF, PNG images or .rmdoc in the background, one at a time.
 
     Every job ends with exactly one of finished, failed or cancelled: an error nobody
     expected (pypdf raises all kinds on unusual PDFs) is reported as a failure too,
@@ -190,7 +190,7 @@ class Exporter(QObject):
         self._cancel = threading.Event()
 
     def export(self, kind: str, doc: Document, path: str, pages: list[int] | None = None) -> bool:
-        """Export `doc` (only the pages at indexes `pages`, for a PDF, if given)."""
+        """Export `doc` (only the pages at indexes `pages`, for a PDF or PNGs, if given)."""
         if self.running:
             return False
         self.running = True
@@ -205,10 +205,11 @@ class Exporter(QObject):
             try:
                 if cancel.is_set():
                     raise ExportCancelled()
-                if kind == "pdf":
+                if kind in ("pdf", "png"):
                     document = DocumentPages(self.source, doc)     # own PDF handle for this thread
+                    write = export_pdf if kind == "pdf" else export_png
                     try:
-                        result = export_pdf(document, path, progress=report, indexes=pages)
+                        result = write(document, path, progress=report, indexes=pages)
                     finally:
                         document.close()
                 elif kind == "rmdoc":
@@ -259,11 +260,14 @@ class Mutator(QObject):
         self.pool.setMaxThreadCount(1)
 
     def run(self, what: str, change: Callable[[SyncClient, Callable[[int, int], None]], object],
-            done: str, on_done: Callable[[bool], None] | None = None) -> bool:
-        """`on_done(ok)`, if given, runs on the GUI thread after finished/failed."""
+            done: str, on_done: Callable[[bool], None] | None = None, quiet: bool = False) -> bool:
+        """`on_done(ok)`, if given, runs on the GUI thread after finished/failed. A `quiet`
+        change (one the user did not ask for, such as saving the reading position) logs its
+        failure instead of reporting it."""
         after = on_done or (lambda ok: None)
         if not self.source.writable:
-            self.failed.emit(f"{what}: not possible offline")
+            if not quiet:
+                self.failed.emit(f"{what}: not possible offline")
             after(False)
             return False
 
@@ -274,7 +278,11 @@ class Mutator(QObject):
                     self, lambda: self.progress.emit(what, sent, total)))
                 tree = self.source.sync.tree
             except EXPECTED_ERRORS as err:
-                emit_from_worker(self, lambda: (self.failed.emit(f"{what} failed: {err}"), after(False)))
+                if quiet:
+                    log.warning("%s failed: %s", what, err)
+                    emit_from_worker(self, lambda: after(False))
+                else:
+                    emit_from_worker(self, lambda: (self.failed.emit(f"{what} failed: {err}"), after(False)))
                 return
             emit_from_worker(self, lambda: (self.finished.emit(tree, done), after(True)))
         self.pool.start(_Job(job))

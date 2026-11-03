@@ -39,7 +39,7 @@ from PySide6.QtGui import QColor, QPageSize, QPainter, QPdfWriter
 from viewer.renderer import paint
 from viewer.templates import paint_template
 
-from .pages import PAPER, DocumentPages, PageContent
+from .pages import PAPER, DocumentPages, PageContent, render_content
 
 log = logging.getLogger("rm.ui.export")
 
@@ -326,6 +326,44 @@ def export_pdf(pages: DocumentPages, path: str | Path, *,
         partial.unlink(missing_ok=True)
         raise
     return path
+
+
+def export_png(pages: DocumentPages, folder: str | Path, *,
+               progress: Callable[[int, int], None] | None = None,
+               indexes: Sequence[int] | None = None, scale: float = 1.0) -> Path:
+    """Write every page of `pages`, or those at `indexes`, as PNG images into `folder`
+    (created; it must not exist yet): one "<name> - <n>.png" per page, n counting the
+    document's pages from 1. Pages have the viewer's faithful bounds (the page frame plus
+    any ink beyond it) at `scale` × the tablet's 226 DPI. `progress` as for export_pdf;
+    a failed or stopped export leaves no folder behind."""
+    folder = Path(folder)
+    if not pages.pages:
+        raise ValueError("document has no pages")
+    if indexes is None:
+        indexes = range(len(pages.pages))
+    elif not indexes or not all(0 <= i < len(pages.pages) for i in indexes):
+        raise ValueError(f"no such pages: {list(indexes)} (the document has {len(pages.pages)})")
+    if not folder.parent.is_dir():
+        raise FileNotFoundError(f"no such folder: {folder.parent}")
+    stem = Path(export_file_name(pages.doc.name, ".png")).stem
+    width = len(str(len(pages.pages)))
+    partial = folder.with_name(folder.name + ".part")
+    partial.mkdir()
+    try:
+        for done, index in enumerate(indexes, 1):
+            image = render_content(pages.content(index), scale, "page")
+            target = partial / f"{stem} - {index + 1:0{width}d}.png"
+            if not image.save(str(target), "PNG"):
+                raise OSError(f"cannot write {target.name}")
+            if progress is not None:
+                progress(done, len(indexes))
+        os.replace(partial, folder)
+    except BaseException:
+        for leftover in partial.glob("*"):
+            leftover.unlink(missing_ok=True)
+        partial.rmdir()
+        raise
+    return folder
 
 
 def export_file_name(name: str, suffix: str) -> str:

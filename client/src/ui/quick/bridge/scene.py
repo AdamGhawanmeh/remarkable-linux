@@ -24,6 +24,8 @@ import logging
 from enum import IntEnum
 from typing import Callable
 
+import shiboken6
+
 from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject, QPointF, QRect, QRectF, QSize, QSizeF, Qt,
                             QThreadPool, QTimer, Signal, Slot)
 from PySide6.QtGui import QImage, QPainter, QTransform
@@ -45,6 +47,18 @@ PORTRAIT = QRectF(-HALF_WIDTH, 0, PAGE_WIDTH, PAGE_HEIGHT)
 MAX_PIXELS = 32_000_000
 
 _source: Callable[[], object] = lambda: None
+
+# The transform (center, scale) each DocumentViewport last showed a page at, by viewport
+# item. DocumentViewport turns a page by changing currentPage, which re-fits viewportScale
+# onto the outgoing SceneView, and then creating a new one; it applies the zoom to the new
+# view only when viewportScale changes again, which it never does between two notebook
+# pages (same paper size). So a page's new view starts at its predecessor's transform.
+_viewport_transforms: dict[int, tuple[QPointF, float]] = {}
+
+
+def _viewport_key(item: QQuickItem) -> int | None:
+    parent = item.parentItem()
+    return shiboken6.getCppPointer(parent)[0] if parent is not None and shiboken6.isValid(parent) else None
 
 
 def set_page_source(provider: Callable[[], object]) -> None:
@@ -348,6 +362,9 @@ class _SceneView:
     # -- loading --
     def componentComplete(self) -> None:
         QQuickPaintedItem.componentComplete(self)
+        inherited = _viewport_transforms.get(_viewport_key(self))
+        if inherited is not None:
+            self._tiles.setFocalPoint(*inherited)
         self._load()
 
     def _property_changed(self, name: str) -> None:
@@ -428,6 +445,9 @@ class _SceneView:
         self._set("defaultScale", size.width() / PAGE_WIDTH)
 
     def _transform_changed(self) -> None:
+        key = _viewport_key(self)
+        if key is not None:
+            _viewport_transforms[key] = (QPointF(self._tiles._get("center")), float(self._tiles._get("scale")))
         self.update()
         wanted = self._tiles._get("scale") * self._dpr()
         if self._image is None or abs(self._image_scale - wanted) / wanted > 0.01:

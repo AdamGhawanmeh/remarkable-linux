@@ -508,6 +508,7 @@ class PlatformHelpers(QObject):
         dialog chose, as a URL; `pages` the page indexes, when exporting a selection.
         Starts the export in the background (`export(path, id, kind, pages)`)."""
         kind = {int(PlatformHelpers.ExportType["ExportPdf"]): "pdf",
+                int(PlatformHelpers.ExportType["ExportPng"]): "png",
                 int(PlatformHelpers.ExportType["ExportRmBundle"]): "rmdoc"}.get(int(export_type))
         if self._export is None or kind is None:
             self.errorMessage.emit("This export format is not available on Linux")

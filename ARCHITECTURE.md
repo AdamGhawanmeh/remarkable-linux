@@ -174,8 +174,29 @@ existing file. `DocumentExporter` runs the exports one after another on `workers
 `exportProgress`, as in the app: the grid shows the progress bar and an × that calls
 `abortExport()`. It then turns `Ok`, which shows the app's checkmark, and the notification
 shows the path. A failed or cancelled export passes through `Unknown`, so no checkmark
-appears, and a failure shows the reason in the notification. PNG and SVG report "This
-export format is not available on Linux".
+appears, and a failure shows the reason in the notification. PNG export writes a folder
+named after the document, inside the chosen folder ("Place folder here"), with one
+`<name> - <n>.png` per page at 226 DPI, rendered as the viewer renders it. The binary has a
+`PngExporter`, but its file naming is not recovered, so this naming is our own. SVG reports
+"This export format is not available on Linux".
+
+**Turning pages.** DocumentViewport turns a page by setting `currentPage` first, which
+re-fits `viewportScale` onto the outgoing SceneView, and then creating a new SceneView.
+It applies the zoom to the new view only when `viewportScale` changes again. That never
+happens between two notebook pages (the same paper), so page 2 of every notebook opened at
+scale 1, 100 % tablet pixels. A page's new SceneView therefore starts at the transform its
+viewport last showed (`scene._viewport_transforms`), which already holds the re-fit.
+
+**Reading position.** `DocumentViewport.open` calls `updateLastOpened()`, and `close()`
+calls `LibraryController.setLastOpenedPage(id, currentPage)`. The Tags view calls it too,
+just before opening a tagged page. The Library keeps the position locally, so the next
+open and "Page %1 of %2" use it at once. 1.5 s after the document is closed it saves
+`lastOpenedPage`/`lastOpened` (`SyncClient.set_reading_position`), without touching
+`lastModified`. The user's library shows reading does not change it: 105 documents were
+opened after their last change, with `lastModified` kept. Saving is quiet: offline or
+logged out, the position stays in the session, and a failed save is logged, not shown.
+A sync no longer re-announces items whose index hash did not change: every refresh
+rebuilds every node, and announcing them made an open document reload its page.
 
 **Image providers.** `arkicon` (the Ark SVG icons) and `rmthumb` (page thumbnails) are
 rendered in Python, but Qt Quick calls an asynchronous provider and its responses on its

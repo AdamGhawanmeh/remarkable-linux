@@ -629,7 +629,17 @@ class DocumentWrapper(EntryWrapper):
         self.coverPageNumberChanged.emit(node.content.cover_page_number)
 
     def _page(self) -> int:
-        return self._node.metadata.last_opened_page
+        return int(self._library.reading_position(self._node.id).get("lastOpenedPage",
+                                                                      self._node.metadata.last_opened_page))
+
+    def _last_opened(self) -> int:
+        return int(self._library.reading_position(self._node.id).get("lastOpened",
+                                                                      _ms(self._node.metadata.last_opened)))
+
+    def reading_position_changed(self) -> None:
+        self.lastOpenedPageChanged.emit(self._page())
+        for signal in (self.lastOpenedChanged, self.subtextChanged, self.progressTextChanged):
+            signal.emit()
 
     def _progress_text(self) -> str:
         """Document::progressText: "%1% read" for ebooks, else "Page %1 of %2"."""
@@ -654,7 +664,7 @@ class DocumentWrapper(EntryWrapper):
     pageCount = Property(int, lambda self: self._page_count(), notify=pageCountChanged)
     fileType = Property(int, lambda self: FILE_TYPES.get(self._node.file_type, 0), constant=True)
     lastOpenedPage = Property(int, _page, notify=lastOpenedPageChanged)
-    lastOpened = Property("qlonglong", lambda self: _ms(self._node.metadata.last_opened), notify=lastOpenedChanged)
+    lastOpened = Property("qlonglong", _last_opened, notify=lastOpenedChanged)
     textScale = Property(float, lambda self: float(_content(self._node, "textScale", 1.0)),
                          notify=layoutPropertiesChanged)
     lineHeight = Property(float, lambda self: float(_content(self._node, "lineHeight", -1)),
@@ -749,11 +759,12 @@ class DocumentWrapper(EntryWrapper):
 
     @Slot()
     def updateLastOpened(self) -> None:
-        pass
+        """DocumentViewport.open: the document is being read now (lastOpened)."""
+        self._library.set_reading_position(self._node.id, opened_ms=self._library.now_ms())
 
     @Slot()
     def markOpened(self) -> None:
-        pass
+        self._library.document_opened(self._node.id)
 
     @Slot(int, result=bool)
     def isNotepage(self, page: int) -> bool:
@@ -851,8 +862,74 @@ class Library(QObject):
         self._retired: list[EntryWrapper] = []
         self._ready = False
         self._exports: dict[str, float] = {}       # document id -> export progress, 0..1
+        # Reading positions (lastOpenedPage, lastOpened) not in the tree yet, by document id:
+        # shown at once, saved to the cloud shortly after the document is closed.
+        self._reading: dict[str, dict[str, int]] = {}
+        self._unsaved: set[str] = set()
+        self._open: set[str] = set()               # documents a DocumentViewport shows
+        self._save_timer = QTimer(self, singleShot=True, interval=1500)
+        self._save_timer.timeout.connect(self.save_reading_positions)
+        # (document id, lastOpenedPage, lastOpened ms or None) -> the cloud (the app sets it).
+        self.save_reading_position: Callable[[str, int, int | None], None] | None = None
         # EntryWrapper.abortExport (the app sets its DocumentExporter's abort).
         self.abort_export: Callable[[str], None] = lambda entry_id: None
+
+    def reading_position(self, doc_id: str) -> dict[str, int]:
+        return self._reading.get(doc_id, {})
+
+    def set_reading_position(self, doc_id: str, page: int | None = None, opened_ms: int | None = None) -> None:
+        """Where a document was left and/or when it was opened. Entries show it at once
+        (the next open starts there, "Page %1 of %2"); the cloud gets it shortly after."""
+        if not isinstance(self.tree.get(doc_id), DocumentNode):
+            return
+        record = self._reading.setdefault(doc_id, {})
+        if page is not None:
+            record["lastOpenedPage"] = max(int(page), 0)
+        if opened_ms is not None:
+            record["lastOpened"] = int(opened_ms)
+        self._unsaved.add(doc_id)
+        entry = self._entries.get(doc_id)
+        if isinstance(entry, DocumentWrapper):
+            entry.reading_position_changed()
+        self._save_timer.start()
+
+    def document_opened(self, doc_id: str) -> None:
+        self._open.add(doc_id)
+
+    def document_closed(self, doc_id: str) -> None:
+        self._open.discard(doc_id)
+        self._save_timer.start()
+
+    def save_reading_positions(self, include_open: bool = False) -> None:
+        """Send unsaved reading positions to the cloud: of closed documents only (saving
+        refreshes the library, which an open document would reload for), unless
+        `include_open` (quitting)."""
+        for doc_id in sorted(self._unsaved):
+            if doc_id in self._open and not include_open:
+                continue
+            self._unsaved.discard(doc_id)
+            node, record = self.tree.get(doc_id), self._reading.get(doc_id, {})
+            if not isinstance(node, DocumentNode) or not record or self.save_reading_position is None:
+                continue
+            page = record.get("lastOpenedPage", node.metadata.last_opened_page)
+            opened = record.get("lastOpened")
+            if page != node.metadata.last_opened_page or opened is not None:
+                self.save_reading_position(doc_id, page, opened)
+
+    def _settle_reading_positions(self) -> None:
+        """Forget local reading positions the tree now has (saved, or newer from elsewhere)."""
+        for doc_id, record in list(self._reading.items()):
+            node = self.tree.get(doc_id)
+            if node is None:
+                del self._reading[doc_id]
+                self._unsaved.discard(doc_id)
+                continue
+            if doc_id in self._unsaved:
+                continue
+            raw = node.metadata.raw
+            if (record.get("lastOpenedPage", raw.get("lastOpenedPage")) == raw.get("lastOpenedPage")
+                    and str(record.get("lastOpened", raw.get("lastOpened"))) == str(raw.get("lastOpened"))):
+                del self._reading[doc_id]
 
     def export_progress(self, entry_id: str) -> float | None:
         """How far the export of `entry_id` is (0..1), or None if it is not being exported."""
@@ -887,9 +964,16 @@ class Library(QObject):
         `reset`: a different library replaces this one (logging out), nothing was deleted."""
         old = self.tree
         self.tree = tree
+        self._settle_reading_positions()
         for node in tree.nodes.values():
             entry = self._entries.get(node.id)
-            if entry is not None and entry.node is not node:
+            if entry is None or entry.node is node:
+                continue
+            if node.hash and node.hash == entry.node.hash:
+                # The same version of the item (every sync rebuilds every node): nothing to
+                # announce. Announcing it made an open document reload its page.
+                entry._node = node
+            else:
                 entry.update(node)
         gone = [i for i in self._entries if i not in tree]
         # Wrappers of removed entries are freed one change later: views drop their
@@ -1114,6 +1198,12 @@ class LibraryController(QObject):
     def _unsupported(self, what: str) -> None:
         log.info("%s: not available in this client", what)
 
+    def _unavailable(self, what: str, message: str) -> None:
+        """A change the UI offers but this client cannot make yet: say so, rather than
+        nothing happening."""
+        self._unsupported(what)
+        self.library.errorMessage.emit(message)
+
     @Slot(str, str, result=str)
     def createCollection(self, parent_id: str, name: str) -> str:
         self.submit(f"Creating {name}", lambda sync, _: sync.create_folder(name, parent_id or ROOT_ID),
@@ -1141,7 +1231,8 @@ class LibraryController(QObject):
     @Slot(str, str, result=str)
     @Slot(str, str, bool, result=str)
     def cloneEntry(self, entry_id: str, collection_id: str, clean: bool = False) -> str:
-        self._unsupported("cloneEntry")
+        # Copy, then Paste, in the library (NavigatorSelection.paste).
+        self._unavailable("cloneEntry", "Copying documents is not available on Linux yet")
         return ""
 
     @Slot("QStringList", str)
@@ -1179,7 +1270,10 @@ class LibraryController(QObject):
 
     @Slot(str, int)
     def setLastOpenedPage(self, document_id: str, page: int) -> None:
-        pass
+        """DocumentViewport.close (where the document was left), and the Tags view before
+        it opens a tagged page."""
+        self.library.set_reading_position(document_id, page=page)
+        self.library.document_closed(document_id)
 
     @Slot(str, int)
     def setOrientation(self, document_id: str, orientation: int) -> None:
@@ -1228,11 +1322,11 @@ class LibraryController(QObject):
 
     @Slot(str, "QStringList", "QStringList")
     def setEntryTags(self, entry_id: str, tags: list, keep_tags: list) -> None:
-        self._unsupported("setEntryTags")
+        self._unavailable("setEntryTags", "Editing tags is not available on Linux yet")
 
     @Slot(str, "QVariantList", "QStringList", "QStringList")
     def setPageTags(self, entry_id: str, pages: list, tags: list, keep_tags: list) -> None:
-        self._unsupported("setPageTags")
+        self._unavailable("setPageTags", "Editing tags is not available on Linux yet")
 
     @Slot(str, int, result="QStringList")
     def tagsForPage(self, entry_id: str, page: int) -> list:
