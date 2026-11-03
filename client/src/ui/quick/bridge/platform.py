@@ -504,11 +504,16 @@ class PlatformHelpers(QObject):
     @Slot(str, str, int, str, bool, "QVariantList", result=bool)
     def exportFile(self, file_path: str, document_id: str, export_type: int, password: str = "",
                    keep_password: bool = False, pages: list | None = None) -> bool:
-        if self._export is None or int(export_type) != PlatformHelpers.ExportType["ExportPdf"]:
+        """ExportDialog's performExport: `file_path` is the file (one PDF) or folder the
+        dialog chose, as a URL; `pages` the page indexes, when exporting a selection.
+        Starts the export in the background (`export(path, id, kind, pages)`)."""
+        kind = {int(PlatformHelpers.ExportType["ExportPdf"]): "pdf",
+                int(PlatformHelpers.ExportType["ExportRmBundle"]): "rmdoc"}.get(int(export_type))
+        if self._export is None or kind is None:
             self.errorMessage.emit("This export format is not available on Linux")
             return False
-        return bool(self._export(QUrl(file_path).toLocalFile() if file_path.startswith("file:") else file_path,
-                                 document_id, [int(p) for p in pages] if pages else None))
+        path = QUrl(file_path).toLocalFile() if str(file_path).startswith("file:") else str(file_path)
+        return bool(self._export(path, document_id, kind, [int(p) for p in pages] if pages else None))
 
     @Slot(result=int)
     def topLevelWindowCount(self) -> int:

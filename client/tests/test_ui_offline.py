@@ -200,6 +200,8 @@ class PageMappingTests(DemoCase):
         bare = make_node("x", Metadata("Bare"), Content.parse({"fileType": "pdf"}),
                          files={"x.pdf": "h", "x/b.rm": "h", "x/a.rm": "h"})
         self.assertEqual([p.pdf_page for p in document_pages(bare, pdf_page_count=3)], [0, 1, 2])
+        # Distinct ids: the viewer opens pages by id (the tablet assigns real ones later).
+        self.assertEqual([p.page_id for p in document_pages(bare, pdf_page_count=2)], ["pdf-page-0", "pdf-page-1"])
         self.assertEqual([p.page_id for p in document_pages(bare)], ["a", "b"])
 
     def test_start_and_cover_page(self):
@@ -1215,6 +1217,8 @@ class ExportTests(DemoCase):
             export_pdf(DocumentPages(self.source, empty), self.dir / "x.pdf")
         with self.assertRaises(OSError):
             export_pdf(DocumentPages(self.source, self.doc("Sketchbook")), self.dir / "missing-dir" / "x.pdf")
+        with self.assertRaisesRegex(ValueError, "no such pages"):
+            export_pdf(DocumentPages(self.source, self.doc("Sketchbook")), self.dir / "x.pdf", indexes=[5])
         self.assertEqual(export_file_name('a/b:c*?"d', ".pdf"), "a_b_c___d.pdf")
         self.assertEqual(export_file_name(" . ", ".rmdoc"), "document.rmdoc")
 

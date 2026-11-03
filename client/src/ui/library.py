@@ -239,18 +239,34 @@ class PageRef:
     template: str = ""           # template name ("P Lines small"); "" / "Blank" = plain paper
 
 
+def unlisted_page_id(pdf_page: int) -> str:
+    """The id this client gives page `pdf_page` of a document without a page list.
+
+    A PDF or EPUB uploaded without one (this client's imports, and other uploaders') gets
+    its page list, with CRDT page ids, from the tablet the first time it is opened there.
+    Until then the viewer still needs an id per page (DocumentViewport opens pages by id),
+    so pages are named after their PDF page. These ids are never written to the cloud.
+    """
+    return f"pdf-page-{pdf_page}"
+
+
+def has_page_list(doc: Document) -> bool:
+    return any(not p.deleted for p in doc.content.pages)
+
+
 def document_pages(doc: Document, pdf_page_count: int | None = None,
                    pagedata: list[str] | None = None) -> list[PageRef]:
     """Live pages in reading order with their stroke file, PDF page and template.
 
     Documents without a page list (never opened on a tablet) fall back to one page
-    per PDF page, or per .rm file for notebooks. Templates come from .content; older
-    (formatVersion 1) documents list them in .pagedata, one line per page.
+    per PDF page (ids from unlisted_page_id), or per .rm file for notebooks. Templates
+    come from .content; older (formatVersion 1) documents list them in .pagedata, one
+    line per page.
     """
     live: list[Page] = [p for p in doc.content.pages if not p.deleted]
     if not live:
         if pdf_page_count:
-            live = [Page(id="", redirect=i) for i in range(pdf_page_count)]
+            live = [Page(id=unlisted_page_id(i), redirect=i) for i in range(pdf_page_count)]
         else:
             ids = sorted(name[len(doc.id) + 1:-3] for name in doc.files
                          if name.startswith(f"{doc.id}/") and name.endswith(".rm"))

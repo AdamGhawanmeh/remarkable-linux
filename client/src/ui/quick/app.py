@@ -37,6 +37,7 @@ from ..library import LibrarySource
 from ..workers import Account, Mutator, Syncer
 from . import assets
 from .bridge import Singletons, register_types, use_singletons
+from .bridge.exporter import DocumentExporter
 from .bridge.images import DragIconImageProvider, ThumbnailImageProvider
 from .bridge.importer import DocumentImporter
 from .bridge.library import DocumentSelection, DocumentSync, Library, LibraryController
@@ -91,6 +92,10 @@ class QuickApp:
         self.sync_on_login = True
         self._online = False             # Screen Share started for this log-in
         store = SettingsStore(config_dir / "settings.ini" if config_dir else None)
+        # ExportDialog -> PlatformHelpers.exportFile; results show as the app's notifications.
+        self.exporter = DocumentExporter(source, self.library,
+                                         notify=lambda message: self.singletons.platform_helpers.errorMessage.emit(message))
+        self.library.abort_export = self.exporter.abort
         self.singletons = Singletons(
             library=self.library,
             controller=LibraryController(self.library, self.mutator.run),
@@ -98,7 +103,8 @@ class QuickApp:
             document_sync=DocumentSync(),
             screen_share=ScreenShareClient(liveview_factory),
             settings=Settings(store), ark_settings=ArkTokensSettings(),
-            platform_helpers=PlatformHelpers(store), platform_app=PlatformApp(on_logout=self.logout),
+            platform_helpers=PlatformHelpers(store, export=self.exporter.export),
+            platform_app=PlatformApp(on_logout=self.logout),
             # Offline there is no logging in: the cached library is all there is.
             authentication=Authentication(self.auth.is_paired or source.cached_only, login=self.login),
             user_info=UserInfo(),
@@ -155,6 +161,7 @@ class QuickApp:
     def _forget_library(self) -> None:          # on the Account worker thread
         self.syncer.wait()
         self.mutator.wait()
+        self.exporter.wait()
         self.source.forget()
         shutil.rmtree(self.cache_dir / "thumbnails", ignore_errors=True)
 
@@ -259,6 +266,7 @@ class QuickApp:
         self.singletons.screen_share.shutdown()
         self.account.wait(60000)
         self.mutator.wait(120000)
+        self.exporter.wait(120000)          # an export the user started still gets written
         self.syncer.wait(5000)
         for provider in (self.thumbnails, self.icons):
             if provider is not None:

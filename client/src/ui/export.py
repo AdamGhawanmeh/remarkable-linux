@@ -28,7 +28,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import BinaryIO, Callable, Sequence
 
 from pypdf import PageObject, PdfReader, PdfWriter
 from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject,
@@ -137,17 +137,19 @@ def _paint_layer(painter: QPainter, layer: str, content: PageContent,
 
 
 def _draw_layers(pages: DocumentPages, reader: PdfReader | None, background_scale: float,
-                 progress: Callable[[int, int], None] | None) -> tuple[bytes, list[_Placed]]:
-    """Draw every page's layers as consecutive pages of one PDF (fonts are shared)."""
+                 progress: Callable[[int, int], None] | None,
+                 indexes: Sequence[int]) -> tuple[bytes, list[_Placed]]:
+    """Draw the layers of the pages at `indexes` as consecutive pages of one PDF (fonts
+    are shared)."""
     buffer = QBuffer()
     buffer.open(QIODevice.OpenModeFlag.WriteOnly)
     writer = QPdfWriter(buffer)
     writer.setResolution(PAGE_DPI)
     painter = QPainter()
     placed: list[_Placed] = []
-    count = len(pages.pages)
+    count = len(indexes)
     try:
-        for index in range(count):
+        for done, index in enumerate(indexes, 1):
             content = pages.content(index)
             bounds = content.bounds("page")
             x, y, w, h = bounds
@@ -169,7 +171,7 @@ def _draw_layers(pages: DocumentPages, reader: PdfReader | None, background_scal
                 painter.restore()
             placed.append(_Placed(bounds, content.frame(), source, drawn))
             if progress is not None:
-                progress(index + 1, count)
+                progress(done, count)
     finally:
         if painter.isActive():
             painter.end()
@@ -299,15 +301,22 @@ def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO) -
 
 def export_pdf(pages: DocumentPages, path: str | Path, *,
                progress: Callable[[int, int], None] | None = None,
-               background_scale: float = BACKGROUND_SCALE) -> Path:
-    """Write every page of `pages` to a PDF at `path`; returns the path."""
+               background_scale: float = BACKGROUND_SCALE,
+               indexes: Sequence[int] | None = None) -> Path:
+    """Write every page of `pages`, or those at `indexes` in that order, to a PDF at
+    `path`; returns the path. `progress(done, total)` follows each page drawn; whatever
+    it raises stops the export before anything is written."""
     path = Path(path)
     if not pages.pages:
         raise ValueError("document has no pages")
+    if indexes is None:
+        indexes = range(len(pages.pages))
+    elif not indexes or not all(0 <= i < len(pages.pages) for i in indexes):
+        raise ValueError(f"no such pages: {list(indexes)} (the document has {len(pages.pages)})")
     if not path.parent.is_dir():
         raise FileNotFoundError(f"no such folder: {path.parent}")
     reader = _open_source(pages.pdf_path) if pages.pdf is not None else None
-    layers, placed = _draw_layers(pages, reader, background_scale, progress)
+    layers, placed = _draw_layers(pages, reader, background_scale, progress, indexes)
     partial = path.with_name(path.name + ".part")
     try:
         with open(partial, "wb") as out:

@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import shiboken6
 from PySide6.QtCore import QPoint, QRectF, QSize, QSizeF
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtPdf import QPdfDocument
@@ -71,7 +72,8 @@ class PdfFile:
         return image
 
     def close(self) -> None:
-        self.doc.close()
+        if shiboken6.isValid(self.doc):     # at exit Qt may have deleted it first
+            self.doc.close()
 
 
 def pdf_target_rect(page_size: QSizeF) -> QRectF:

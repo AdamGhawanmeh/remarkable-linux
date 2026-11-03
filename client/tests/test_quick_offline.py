@@ -19,7 +19,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent / "src"), str(HERE)]
 
-from PySide6.QtCore import QEventLoop, QMetaObject, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, qVersion
+from PySide6.QtCore import (Q_ARG, QEventLoop, QMetaObject, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer,
+                            QUrl, qVersion)
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
 from PySide6.QtWidgets import QApplication
 
@@ -31,7 +32,7 @@ configure(app)
 
 from core.models import ROOT_ID, TRASH_ID
 from core.sync import SyncClient
-from demo_library import build_demo_cloud
+from demo_library import build_demo_cloud, demo_id, make_pdf, ms
 from fakecloud import paired_auth
 from ui.library import LibrarySource
 from ui.quick import bridge
@@ -486,6 +487,247 @@ class QuickAppTests(unittest.TestCase):
         QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(90, 68))
         wait(400)
         self.assertEqual(model.property("filter"), int(library.LibraryView.Filter["Documents"]))
+
+
+class ImportExportTests(unittest.TestCase):
+    """Documents imported from this computer open in the viewer at once, and documents
+    export through ExportDialog's PlatformHelpers.exportFile, over the fake cloud."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        tmp = cls.dir = Path(cls.tmp.name)
+        cls.cloud = build_demo_cloud()
+        # Uploaded by another client with no page list and no page count (a real
+        # library has two such PDFs): the viewer counts the pages itself.
+        cls.bare = demo_id("bare upload")
+        cls.cloud.put_item(cls.bare, {"visibleName": "Bare upload", "parent": "", "type": "DocumentType",
+                                      "lastModified": ms(3)}, {"fileType": "pdf"},
+                           {f"{cls.bare}.pdf": make_pdf("Bare", [["one"], ["two"], ["three"]])})
+        cls.source = LibrarySource(SyncClient(paired_auth(tmp / "auth", cls.cloud), tmp / "cache"))
+        cls.source.refresh()
+        cls.app = QuickApp(cls.source, tmp / "cache", config_dir=tmp)
+        cls.app.load()
+        cls.app.start(sync=False)
+        wait(800)
+        cls.window = cls.app.window
+        cls.window.resize(1270, 875)
+        cls.notices: list[str] = []
+        cls.app.singletons.platform_helpers.errorMessage.connect(cls.notices.append)
+        cls.out = tmp / "exports"
+        cls.out.mkdir()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.app.shutdown()
+        del cls.window
+        gc.collect()
+        cls.app.engine.deleteLater()
+        wait(50)
+        cls.tmp.cleanup()
+
+    def tearDown(self):
+        self.close_document()
+
+    def wait_for(self, condition, ms=8000):
+        for _ in range(ms // 100):
+            if condition():
+                return True
+            wait(100)
+        return condition()
+
+    def qml(self, prefix: str) -> QObject:
+        return next(o for o in self.window.findChildren(QObject) if o.metaObject().className().startswith(prefix))
+
+    def scene_views(self) -> list:
+        views, todo = [], [self.window.contentItem()]
+        while todo:
+            item = todo.pop()
+            if isinstance(item, scene.SceneView) and item.isVisible():
+                views.append(item)
+            todo.extend(item.childItems())
+        return views
+
+    def import_file(self, path: Path) -> str:
+        importer, done = self.app.singletons.importer, []
+        importer.finished.connect(done.append)
+        importer.failed.connect(done.append)
+        try:
+            importer.importFromUrls([QUrl.fromLocalFile(str(path))], "")
+            self.assertTrue(self.wait_for(lambda: done))
+        finally:
+            importer.finished.disconnect(done.append)
+            importer.failed.disconnect(done.append)
+        return next(d.id for d in self.app.library.tree.documents() if d.name == path.stem)
+
+    def open_document(self, doc_id: str, page_id: str | None = None):
+        """DocumentView.open, as main.qml's onOpenEntry calls it: the page's SceneView once
+        it has loaded (or failed to)."""
+        entry = self.app.library.entryForId(doc_id)
+        QMetaObject.invokeMethod(self.qml("DocumentView_"), "open", Q_ARG("QVariant", entry))
+
+        def loaded():
+            return next((v for v in self.scene_views() if v.property("status") == 2
+                         and (page_id is None or v.property("pageId") == page_id)), None)
+        self.assertTrue(self.wait_for(lambda: loaded() is not None),
+                        [(v.property("pageId"), v.property("status")) for v in self.scene_views()])
+        return loaded()
+
+    def close_document(self):
+        """Back to the library, as ActionManager does (documentView.hide())."""
+        if self.qml("DocumentView_").property("visible"):
+            QMetaObject.invokeMethod(self.qml("DocumentView_"), "hide")
+            self.assertTrue(self.wait_for(lambda: not self.scene_views()))
+
+    def export(self, target: Path, doc_id: str, kind: str = "ExportPdf", pages=None) -> bool:
+        helpers = self.app.singletons.platform_helpers
+        export_type = int(platform.PlatformHelpers.ExportType[kind])
+        url = QUrl.fromLocalFile(str(target)).toString()
+        if pages is None:
+            return helpers.exportFile(url, doc_id, export_type)
+        return helpers.exportFile(url, doc_id, export_type, "", False, pages)
+
+    def wait_exported(self, *doc_ids: str) -> None:
+        entries = [self.app.library.entryForId(i) for i in doc_ids]
+        self.assertTrue(self.wait_for(lambda: not any(e.property("isExporting") for e in entries), 30000))
+
+    def test_imported_pdf_opens_at_once(self):
+        path = self.dir / "Field notes.pdf"
+        path.write_bytes(make_pdf("Field notes", [["alpha " * 8] * 30, ["beta"] * 2, ["gamma"]]))
+        doc_id = self.import_file(path)
+        node = self.app.library.tree.get(doc_id)
+        self.assertEqual(node.content.pages, [])                 # the tablet adds the page list later
+        self.assertEqual(node.page_count, 3)                     # counted when it was imported
+        self.assertTrue(self.source.sync.blobs.has(node.files[f"{doc_id}.pdf"]))   # no download to open it
+        entry = self.app.library.entryForId(doc_id)
+        self.assertEqual(entry.property("pageCount"), 3)
+        self.assertEqual([entry.idForPage(i) for i in range(3)], ["pdf-page-0", "pdf-page-1", "pdf-page-2"])
+        self.assertEqual(entry.pageForId("pdf-page-2"), 2)
+        self.assertEqual(entry.property("redirectionPageMap"), [0, 1, 2])
+        self.assertFalse(entry.isNotepage(0))
+
+        view = self.open_document(doc_id, "pdf-page-0")
+        self.assertEqual(view.property("pageStatus"), scene.PAGE_READY)
+        self.assertFalse(self.qml("DocumentViewport").property("isLoading"))
+        self.assertTrue(self.wait_for(lambda: view._image is not None))
+        image = view._image
+        dark = sum(QColor(image.pixel(x, y)).lightness() < 128
+                   for x in range(0, image.width(), 3) for y in range(0, image.height(), 3))
+        self.assertGreater(dark, 20)                             # the PDF's text, not blank paper
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "setCurrentPage", Q_ARG("QVariant", 2))
+        view = next(v for v in self.scene_views() if v.property("pageId") == "pdf-page-2")
+        self.assertTrue(self.wait_for(lambda: view.property("pageStatus") == scene.PAGE_READY))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_pdf_without_page_count_takes_it_from_the_pdf(self):
+        entry = self.app.library.entryForId(self.bare)
+        self.assertEqual(entry.property("pageCount"), 0)
+        self.open_document(self.bare)
+        self.assertTrue(self.wait_for(lambda: entry.property("pageCount") == 3))
+        # The viewport reopens the page through the id it has now.
+        view = self.open_document(self.bare, "pdf-page-0")
+        self.assertEqual(view.property("pageStatus"), scene.PAGE_READY)
+        self.assertEqual(entry.property("subtext"), "Page 1 of 3")
+        self.assertEqual(entry.idForPage(2), "pdf-page-2")
+
+    def epub(self) -> str:
+        """An EPUB imported from this computer: no PDF rendition until a tablet makes one."""
+        import zipfile
+        path = self.dir / "Pocket book.epub"
+        if not path.exists():
+            with zipfile.ZipFile(path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip")
+                zf.writestr("META-INF/container.xml", "<container/>")
+            return self.import_file(path)
+        return next(d.id for d in self.app.library.tree.documents() if d.name == "Pocket book")
+
+    def test_epub_without_rendition_says_why_instead_of_loading(self):
+        view = self.open_document(self.epub())
+        self.assertEqual(view.property("pageStatus"), scene.PAGE_LOAD_ERROR)
+        self.assertIn("no PDF rendition yet", view.property("pageStatusDetails"))
+        self.assertFalse(self.qml("DocumentViewport").property("isLoading"))
+
+    def test_export_imported_and_synced_documents(self):
+        from pypdf import PdfReader
+        path = self.dir / "Trip plan.pdf"
+        path.write_bytes(make_pdf("Trip plan", [["day one"], ["day two"]]))
+        imported, paper = self.import_file(path), demo_id("Research paper")
+        entry = self.app.library.entryForId(imported)
+
+        # One document: the file ExportDialog's save dialog chose (here without .pdf).
+        self.assertTrue(self.export(self.out / "mine", imported))
+        self.assertTrue(entry.property("isExporting"))
+        self.assertEqual(entry.property("status"), int(library.EntryWrapper.Status.Exporting))
+        self.wait_exported(imported)
+        self.assertEqual(entry.property("status"), int(library.EntryWrapper.Status.Ok))
+        self.assertEqual(len(PdfReader(self.out / "mine.pdf").pages), 2)
+        self.assertIn(f"Exported to {self.out / 'mine.pdf'}", self.notices)
+
+        # Several documents: the folder its folder dialog chose, one file each.
+        folder = self.out / "batch"
+        folder.mkdir()
+        self.assertTrue(self.export(folder, imported))
+        self.assertTrue(self.export(folder, paper))
+        self.wait_exported(imported, paper)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["Research paper.pdf", "Trip plan.pdf"])
+        exported = PdfReader(folder / "Research paper.pdf")
+        self.assertEqual(len(exported.pages), 3)                  # 2 PDF pages + the inserted note page
+        self.assertIn("/RMLayer", exported.pages[0]["/Resources"]["/XObject"])   # its ink, over the PDF page
+        self.assertTrue(self.export(folder, paper))               # again: next to the first, not over it
+        self.wait_exported(paper)
+        self.assertTrue((folder / "Research paper 2.pdf").exists())
+
+        # Pages picked in the page overview, in page order.
+        self.assertTrue(self.export(self.out / "picked.pdf", paper, pages=[2, 0]))
+        self.wait_exported(paper)
+        picked = PdfReader(self.out / "picked.pdf")
+        self.assertEqual([round(float(p.mediabox.height)) for p in picked.pages],
+                         [round(float(exported.pages[i].mediabox.height)) for i in (0, 2)])
+
+        # Export as rM file: a .rmdoc in the chosen folder.
+        import zipfile
+        self.assertTrue(self.export(self.out, imported, "ExportRmBundle"))
+        self.wait_exported(imported)
+        with zipfile.ZipFile(self.out / "Trip plan.rmdoc") as zf:
+            self.assertIn(f"{imported}.pdf", zf.namelist())
+
+    def test_export_problems_are_reported(self):
+        notices = len(self.notices)
+        self.assertFalse(self.export(self.out / "no-such-folder" / "x.pdf", demo_id("Sketchbook")))
+        self.assertFalse(self.export(self.out, demo_id("Sketchbook"), "ExportPng"))
+        self.assertIn("no such folder", self.notices[notices])
+        self.assertEqual(self.notices[notices + 1], "This export format is not available on Linux")
+        epub = self.epub()                                         # nothing to draw yet: fails in the worker
+        self.assertTrue(self.export(self.out / "epub.pdf", epub))
+        self.wait_exported(epub)
+        self.assertIn('Unable to export "Pocket book": ValueError: document has no pages', self.notices)
+        self.assertEqual(self.app.library.entryForId(epub).property("status"), int(library.EntryWrapper.Status.Ok))
+        self.assertFalse((self.out / "epub.pdf").exists())
+
+    def test_abort_export(self):
+        import threading
+        from ui.workers import _Job
+        exporter = self.app.exporter
+        sketch, notes = demo_id("Sketchbook"), demo_id("Meeting notes")
+        gate = threading.Event()
+        exporter.worker.pool.start(_Job(lambda: gate.wait(10)))   # hold the export thread
+        try:
+            self.assertTrue(self.export(self.out / "running.pdf", sketch))
+            self.assertTrue(self.export(self.out / "queued.pdf", notes))
+            entries = [self.app.library.entryForId(i) for i in (sketch, notes)]
+            self.assertTrue(all(e.property("isExporting") for e in entries))
+            entries[1].abortExport()                              # queued: dropped
+            self.assertFalse(entries[1].property("isExporting"))
+            entries[0].abortExport()                              # running: stops at its next step
+        finally:
+            gate.set()
+        self.wait_exported(sketch, notes)
+        wait(200)
+        self.assertEqual(list(self.out.glob("running.pdf*")) + list(self.out.glob("queued.pdf*")), [])
+        self.assertEqual(entries[0].property("status"), int(library.EntryWrapper.Status.Ok))
+        self.assertTrue(self.export(self.out / "after.pdf", sketch))   # the exporter still works
+        self.wait_exported(sketch)
+        self.assertTrue((self.out / "after.pdf").exists())
 
 
 class LoginTests(unittest.TestCase):

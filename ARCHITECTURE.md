@@ -99,9 +99,10 @@ and return types), enum values, and the QML module/name each type is registered
 under (e.g. `TriangleItem` → `com.remarkable.Triangle`, `LinkProviderWrapper` →
 `LinkProvider`, `scene::ParagraphStyle` → `ParagraphStyle`). 50 types are bridged:
 
-- *Hand-written* (`bridge/library.py`, `platform.py`, `importer.py`, `screenshare.py`):
-  the library facade, `LibraryView`/`LibraryNavigator`/`LibrarySearch`, entry wrappers,
-  `LibraryController` (→ Module 6 writes), `DocumentImporter`, `Settings`
+- *Hand-written* (`bridge/library.py`, `platform.py`, `importer.py`, `exporter.py`,
+  `screenshare.py`): the library facade, `LibraryView`/`LibraryNavigator`/`LibrarySearch`,
+  entry wrappers, `LibraryController` (→ Module 6 writes), `DocumentImporter`,
+  `DocumentExporter` (`PlatformHelpers.exportFile` → Module 5 export), `Settings`
   (persisted to `~/.config/remarkable-linux/settings.ini`), `ScreenShareClient`
   (→ Module 7), `Authentication` (→ Module 1, below), ...
 
@@ -151,6 +152,30 @@ then minutes/hours/days/30-day months/365-day years, `round`); `whatsNewJson` =
 `:/misc/whatsnew_desktop.json`; language names `QLocale::nativeLanguageName` with the
 first letter capitalised; 33 handwriting-conversion languages; `UserInfo.featureToggles
 .clientEdit` (notebook editing, off here).
+
+**Documents without a page list.** DocumentViewport opens pages by id
+(`goToPageId(document.idForPage(n))`), and SceneView loads nothing without one. A PDF or
+EPUB uploaded from a computer has no page list until a tablet opens it (§3.3: our imports
+too). The client therefore numbers such pages `pdf-page-<n>` (`ui.library.unlisted_page_id`,
+never written to the cloud), and the wrapper and the viewer share one page list. The count
+comes from `.content`'s `pageCount`, which our imports fill in with pypdf. Other uploaders
+can leave it at 0: then SceneView opens the first page and gives the document the PDF's
+page count (`learn_pdf_page_count`). A document with nothing to draw (an imported EPUB
+before the tablet adds its PDF rendition) ends in `Page.LoadError` with the reason as the
+diagnostic line, never in endless loading dots. Checked on the real library: 3 PDFs have
+no page list (`pageCount` 11, 0 and 0). All 3 open, and the two counted by the viewer
+have 2 and 413 pages.
+
+**Export.** `ExportDialog` calls `PlatformHelpers.exportFile(url, id, format[, …, pages])`
+with the file its save dialog chose (one PDF) or a folder (several documents, or
+"Export as rM file"), which gets `<name>.pdf`/`<name>.rmdoc` per document, never over an
+existing file. `DocumentExporter` runs the exports one after another on `workers.Exporter`
+(`ui/export.py`). While an export runs, its entry reads `Entry.Exporting` with
+`exportProgress`, as in the app: the grid shows the progress bar and an × that calls
+`abortExport()`. It then turns `Ok`, which shows the app's checkmark, and the notification
+shows the path. A failed or cancelled export passes through `Unknown`, so no checkmark
+appears, and a failure shows the reason in the notification. PNG and SVG report "This
+export format is not available on Linux".
 
 **Image providers.** `arkicon` (the Ark SVG icons) and `rmthumb` (page thumbnails) are
 rendered in Python, but Qt Quick calls an asynchronous provider and its responses on its

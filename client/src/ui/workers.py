@@ -164,12 +164,22 @@ class PageRenderer(QObject):
         return self.pool.waitForDone(msecs)
 
 
+class ExportCancelled(Exception):
+    """Raised inside an export job once Exporter.cancel() was called."""
+
+
 class Exporter(QObject):
-    """Exports a document to PDF or .rmdoc in the background, one at a time."""
+    """Exports a document to PDF or .rmdoc in the background, one at a time.
+
+    Every job ends with exactly one of finished, failed or cancelled: an error nobody
+    expected (pypdf raises all kinds on unusual PDFs) is reported as a failure too,
+    rather than leaving the export running forever.
+    """
 
     progress = Signal(int, int)      # pages done, total
     finished = Signal(str)           # written path
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, source: LibrarySource, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -177,26 +187,41 @@ class Exporter(QObject):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self.running = False
+        self._cancel = threading.Event()
 
-    def export(self, kind: str, doc: Document, path: str) -> bool:
+    def export(self, kind: str, doc: Document, path: str, pages: list[int] | None = None) -> bool:
+        """Export `doc` (only the pages at indexes `pages`, for a PDF, if given)."""
         if self.running:
             return False
         self.running = True
+        cancel = self._cancel = threading.Event()
+
+        def report(done: int, total: int) -> None:
+            if cancel.is_set():
+                raise ExportCancelled()
+            emit_from_worker(self, lambda: self.progress.emit(done, total))
 
         def job():
             try:
+                if cancel.is_set():
+                    raise ExportCancelled()
                 if kind == "pdf":
-                    pages = DocumentPages(self.source, doc)     # own PDF handle for this thread
+                    document = DocumentPages(self.source, doc)     # own PDF handle for this thread
                     try:
-                        result = export_pdf(pages, path, progress=lambda done, total: emit_from_worker(
-                            self, lambda: self.progress.emit(done, total)))
+                        result = export_pdf(document, path, progress=report, indexes=pages)
                     finally:
-                        pages.close()
+                        document.close()
                 elif kind == "rmdoc":
                     result = self.source.export_rmdoc(doc, path)
                 else:
                     raise ValueError(f"unknown export format {kind!r}")
-            except EXPECTED_ERRORS as err:
+            except ExportCancelled:
+                self.running = False
+                emit_from_worker(self, self.cancelled.emit)
+                return
+            except Exception as err:
+                if not isinstance(err, EXPECTED_ERRORS):
+                    log.exception("exporting %s to %s", doc.id, path)
                 self.running = False
                 emit_from_worker(self, lambda: self.failed.emit(f"{type(err).__name__}: {err}"))
                 return
@@ -204,6 +229,11 @@ class Exporter(QObject):
             emit_from_worker(self, lambda: self.finished.emit(str(result)))
         self.pool.start(_Job(job))
         return True
+
+    def cancel(self) -> None:
+        """Stop the running export at its next page (a PDF's pages are drawn before
+        anything is written, so nothing is left behind)."""
+        self._cancel.set()
 
     def wait(self, msecs: int = 60000) -> bool:
         return self.pool.waitForDone(msecs)

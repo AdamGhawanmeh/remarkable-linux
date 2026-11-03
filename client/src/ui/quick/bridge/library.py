@@ -29,7 +29,7 @@ from PySide6.QtCore import (Property, QCoreApplication, QObject, QPointF, QSizeF
 from core.models import (ROOT_ID, TRASH_ID, Document as DocumentNode, DocumentTree, FileType, Node,
                          unique_name)
 
-from ...library import document_tags
+from ...library import PageRef, document_pages, document_tags, has_page_list, pdf_name
 
 log = logging.getLogger("rm.ui.quick.library")
 
@@ -470,6 +470,7 @@ class EntryWrapper(QObject):
         super().__init__(library)
         self._node = node
         self._library = library
+        self._status_override: int | None = None
 
     @property
     def node(self) -> Node:
@@ -500,19 +501,27 @@ class EntryWrapper(QObject):
     def _progress_text(self) -> str:
         return ""
 
+    def _export_progress(self) -> float | None:
+        return self._library.export_progress(self._node.id)
+
+    def _status(self) -> int:
+        if self._status_override is not None:
+            return self._status_override
+        return int(EntryWrapper.Status.Exporting) if self._export_progress() is not None else _OK
+
     id = Property(str, lambda self: self._node.id, constant=True)
     parentId = Property(str, lambda self: self._node.parent_id, notify=parentIdChanged)
-    status = Property(int, lambda self: _OK, notify=statusChanged)
+    status = Property(int, _status, notify=statusChanged)
     statusAdditionalText = Property(str, lambda self: "", notify=statusAdditionalTextChanged)
     syncProgress = Property(float, lambda self: 0.0, notify=syncProgressChanged)
-    exportProgress = Property(float, lambda self: 0.0, notify=exportProgressChanged)
+    exportProgress = Property(float, lambda self: self._export_progress() or 0.0, notify=exportProgressChanged)
     subtext = Property(str, lambda self: self._subtext(), notify=subtextChanged)
     progressText = Property(str, lambda self: self._progress_text(), notify=progressTextChanged)
     lastModifiedText = Property(str, lambda self: self._last_modified_text(), notify=lastModifiedTextChanged)
     createdText = Property(str, lambda self: relative_time(self._now() - _ms(self._node.metadata.created_time))
                            if self._node.metadata.created_time else "", notify=createdTextChanged)
     createdTime = Property("qlonglong", lambda self: _ms(self._node.metadata.created_time), notify=createdTimeChanged)
-    isExporting = Property(bool, lambda self: False, notify=statusChanged)
+    isExporting = Property(bool, lambda self: self._export_progress() is not None, notify=statusChanged)
     isDownloading = Property(bool, lambda self: False, notify=statusChanged)
     isExcludedFromSync = Property(bool, lambda self: False, notify=excludedFromSyncChanged)
     isNew = Property(bool, _is_new, notify=isNewChanged)
@@ -535,7 +544,7 @@ class EntryWrapper(QObject):
 
     @Slot()
     def abortExport(self) -> None:
-        pass
+        self._library.abort_export(self._node.id)
 
     @Slot(result=str)
     def fullPathName(self) -> str:
@@ -601,10 +610,16 @@ class DocumentWrapper(EntryWrapper):
     pageTagsChanged = Signal()
     viewBackgroundFilterChanged = Signal()
 
+    def __init__(self, node: Node, library: "Library") -> None:
+        super().__init__(node, library)
+        self._refs: list[PageRef] | None = None
+        self._pdf_pages: tuple[str, int] | None = None     # (PDF blob hash, pages the viewer found)
+
     def update(self, node: Node) -> None:
-        old = self._node.page_count
+        old = self._page_count()
+        self._refs = None
         super().update(node)
-        self.pageCountChanged.emit(node.page_count, old)
+        self.pageCountChanged.emit(self._page_count(), old)
         for signal in (self.lastOpenedChanged, self.layoutPropertiesChanged, self.orientationChanged,
                        self.zoomModeChanged, self.customZoomChanged, self.templatesChanged, self.pageMapChanged,
                        self.documentMetadataChanged, self.sizeInBytesChanged, self.redirectionPageMapChanged,
@@ -618,7 +633,7 @@ class DocumentWrapper(EntryWrapper):
 
     def _progress_text(self) -> str:
         """Document::progressText: "%1% read" for ebooks, else "Page %1 of %2"."""
-        pages = self._node.page_count
+        pages = self._page_count()
         if FILE_TYPES.get(self._node.file_type) == 3:
             if pages <= 1:
                 return "0% read"
@@ -636,7 +651,7 @@ class DocumentWrapper(EntryWrapper):
         value = self._node.content.raw.get("documentMetadata")
         return value if isinstance(value, dict) else {}
 
-    pageCount = Property(int, lambda self: self._node.page_count, notify=pageCountChanged)
+    pageCount = Property(int, lambda self: self._page_count(), notify=pageCountChanged)
     fileType = Property(int, lambda self: FILE_TYPES.get(self._node.file_type, 0), constant=True)
     lastOpenedPage = Property(int, _page, notify=lastOpenedPageChanged)
     lastOpened = Property("qlonglong", lambda self: _ms(self._node.metadata.last_opened), notify=lastOpenedChanged)
@@ -679,8 +694,8 @@ class DocumentWrapper(EntryWrapper):
     loadErrorType = Property(int, lambda self: 0, notify=loadErrorChanged)
     loadErrorDescription = Property(str, lambda self: "", notify=loadErrorChanged)
     sizeInBytes = Property("qlonglong", lambda self: self._node.content.size_in_bytes, notify=sizeInBytesChanged)
-    redirectionPageMap = Property("QVariantList", lambda self: [p.redirect if p.redirect is not None else -1
-                                                                for p in self._node.content.pages if not p.deleted],
+    redirectionPageMap = Property("QVariantList", lambda self: [p.pdf_page if p.pdf_page is not None else -1
+                                                                for p in self._pages()],
                                   notify=redirectionPageMapChanged)
     pageTags = Property("QVariantList", lambda self: list(_content(self._node, "pageTags", [])),
                         notify=pageTagsChanged)
@@ -690,8 +705,40 @@ class DocumentWrapper(EntryWrapper):
     isImported = Property(bool, lambda self: FILE_TYPES.get(self._node.file_type) in (2, 3), constant=True)
 
     # -- pages --
+    def _pages(self) -> list[PageRef]:
+        """The pages as the viewer loads them (ui.library.document_pages): the page list,
+        or, for a PDF or EPUB without one (imported, not opened on a tablet yet), one page
+        per PDF page. The PDF's page count is .content's pageCount, which this client's
+        imports set; other uploaders may leave it at 0, and then it is the count the
+        viewer found when it opened the PDF (learn_pdf_page_count)."""
+        if self._refs is None:
+            count = (self._found_pdf_pages() or self._node.page_count) if pdf_name(self._node) else 0
+            self._refs = document_pages(self._node, count or None)
+        return self._refs
+
+    def _found_pdf_pages(self) -> int:
+        pdf = self._node.files.get(pdf_name(self._node) or "")
+        return self._pdf_pages[1] if self._pdf_pages and self._pdf_pages[0] == pdf else 0
+
+    def _page_count(self) -> int:
+        return self._node.page_count if has_page_list(self._node) else len(self._pages())
+
+    def learn_pdf_page_count(self, count: int) -> None:
+        """The viewer opened the PDF of a document without a page list and found `count`
+        pages: number the pages by that from now on."""
+        name = pdf_name(self._node)
+        if has_page_list(self._node) or name is None or count <= 0 or self._found_pdf_pages() == count:
+            return
+        old = self._page_count()
+        self._pdf_pages, self._refs = (self._node.files[name], int(count)), None
+        if self._page_count() != old:
+            self.pageCountChanged.emit(self._page_count(), old)
+            for signal in (self.redirectionPageMapChanged, self.subtextChanged, self.progressTextChanged,
+                           self.pageMapChanged):
+                signal.emit()
+
     def _page_ids(self) -> list[str]:
-        return self._node.content.page_ids
+        return [p.page_id for p in self._pages()]
 
     def _page_tag_map(self) -> dict[str, list[str]]:
         tags: dict[str, list[str]] = {}
@@ -714,8 +761,8 @@ class DocumentWrapper(EntryWrapper):
         inserted into a PDF or EPUB."""
         if FILE_TYPES.get(self._node.file_type) not in (2, 3):
             return True
-        pages = [p for p in self._node.content.pages if not p.deleted]
-        return 0 <= page < len(pages) and pages[page].redirect is None
+        pages = self._pages()
+        return 0 <= page < len(pages) and pages[page].pdf_page is None
 
     @Slot(result="QVariantList")
     def getPageTags(self) -> list:
@@ -759,13 +806,13 @@ class DocumentWrapper(EntryWrapper):
 
     @Slot(int, result=str)
     def templateForPage(self, page: int) -> str:
-        pages = [p for p in self._node.content.pages if not p.deleted]
+        pages = self._pages()
         return pages[page].template if 0 <= page < len(pages) else ""
 
     @Slot(int, result=bool)
     def hasContentsOnPage(self, page: int) -> bool:
-        ids = self._page_ids()
-        return 0 <= page < len(ids) and f"{self._node.id}/{ids[page]}.rm" in self._node.files
+        pages = self._pages()
+        return 0 <= page < len(pages) and pages[page].rm_name is not None
 
     @Slot(int, result=str)
     def idForPage(self, page: int) -> str:
@@ -803,6 +850,34 @@ class Library(QObject):
         self._entries: dict[str, EntryWrapper] = {}
         self._retired: list[EntryWrapper] = []
         self._ready = False
+        self._exports: dict[str, float] = {}       # document id -> export progress, 0..1
+        # EntryWrapper.abortExport (the app sets its DocumentExporter's abort).
+        self.abort_export: Callable[[str], None] = lambda entry_id: None
+
+    def export_progress(self, entry_id: str) -> float | None:
+        """How far the export of `entry_id` is (0..1), or None if it is not being exported."""
+        return self._exports.get(entry_id)
+
+    def set_export_progress(self, entry_id: str, progress: float | None, ok: bool = True) -> None:
+        """The export of `entry_id` reached `progress`, or ended (None; `ok`: its file was
+        written). The entry reads Entry.Exporting while it runs."""
+        was_exporting = entry_id in self._exports
+        if progress is None:
+            self._exports.pop(entry_id, None)
+        else:
+            self._exports[entry_id] = min(max(float(progress), 0.0), 1.0)
+        entry = self._entries.get(entry_id)
+        if entry is None:
+            return
+        entry.exportProgressChanged.emit()
+        if was_exporting != (progress is not None):
+            if progress is None and not ok:
+                # EntryStatusIcon shows its checkmark when Exporting turns Ok; after a
+                # failed or cancelled export, pass through Unknown so that it does not.
+                entry._status_override = int(EntryWrapper.Status.Unknown)
+                entry.statusChanged.emit()
+                entry._status_override = None
+            entry.statusChanged.emit()
 
     def now_ms(self) -> int:
         return _ms(self._now() if self._now else datetime.now(timezone.utc))
@@ -1283,9 +1358,9 @@ class PageSelection(QObject):
         node = self._library.tree.get(self._document) if self._library is not None else None
         return node if isinstance(node, DocumentNode) else None
 
-    def _live_pages(self) -> list:
-        node = self._node()
-        return [p for p in node.content.pages if not p.deleted] if node is not None else []
+    def _live_pages(self) -> list[PageRef]:
+        entry = self._library.entryForId(self._document) if self._library is not None and self._document else None
+        return entry._pages() if isinstance(entry, DocumentWrapper) else []
 
     def _set_pages(self, pages: list[int]) -> None:
         pages = [int(p) for p in pages]
@@ -1325,12 +1400,12 @@ class PageSelection(QObject):
         node = self._node()
         if node is None or FILE_TYPES.get(node.file_type) not in (2, 3):
             return list(self._pages)
-        return [p for p in self._pages if 0 <= p < len(pages) and pages[p].redirect is None]
+        return [p for p in self._pages if 0 <= p < len(pages) and pages[p].pdf_page is None]
 
     pages = Property("QVariantList", lambda self: list(self._pages), lambda self, v: self._set_pages(v),
                      notify=selectionChanged)
     notePages = Property("QVariantList", _note_pages, notify=selectionChanged)
-    pageIds = Property("QStringList", lambda self: [self._live_pages()[p].id for p in self._pages
+    pageIds = Property("QStringList", lambda self: [self._live_pages()[p].page_id for p in self._pages
                                                     if 0 <= p < len(self._live_pages())],
                        lambda self, ids: self.setPageIds(ids), notify=selectionChanged)
     library = Property(QObject, lambda self: self._library, _set_library, notify=libraryChanged)
@@ -1350,7 +1425,7 @@ class PageSelection(QObject):
 
     @Slot("QStringList")
     def setPageIds(self, ids: list) -> None:
-        index = {p.id: i for i, p in enumerate(self._live_pages())}
+        index = {p.page_id: i for i, p in enumerate(self._live_pages())}
         self._set_pages([index[i] for i in ids if i in index])
 
     @Slot(int)

@@ -29,8 +29,10 @@ from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject, QPointF, Q
 from PySide6.QtGui import QImage, QPainter, QTransform
 from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
+from core.models import FileType
 from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH
 
+from ...library import pdf_name
 from ...pages import DocumentPages, PageContent, render_content
 from ...workers import EXPECTED_ERRORS, _Job, emit_from_worker
 from .generated import qml_class
@@ -54,6 +56,15 @@ def set_page_source(provider: Callable[[], object]) -> None:
 def to_scene(rect: QRectF) -> QRectF:
     """ui/pages.py page coordinates -> scene coordinates."""
     return rect.translated(-HALF_WIDTH, 0)
+
+
+def no_pages_reason(node) -> str:
+    """Why a document has nothing to show (PageErrorOverlay's diagnostic line)."""
+    if node.file_type is FileType.EPUB and pdf_name(node) is None:
+        # An EPUB uploaded from a computer: the tablet adds the PDF rendition this
+        # client draws once it has opened the ebook.
+        return "This ebook has no PDF rendition yet: open it once on your reMarkable, then sync"
+    return "This document has no pages"
 
 
 # -- enums and helpers the QML only names -------------------------------------------
@@ -344,15 +355,22 @@ class _SceneView:
             self._load()
 
     def _load(self) -> None:
+        """Load the page `pageId` (the first page if the id is empty or unknown: the
+        document's page count may only be known once its PDF is open, see
+        DocumentWrapper.learn_pdf_page_count). Always ends Active or with a page error,
+        never left Updating: DocumentViewport shows its loading dots until then."""
         document, page_id, source = self._get("document"), self._get("pageId"), _source()
         node = getattr(document, "node", None)
-        if node is None or source is None or not page_id:
+        if node is None or source is None:
             return
         self._set("status", 1)  # Updating
 
         def job():
+            pages = None
             try:
                 pages = DocumentPages(source, node)
+                if not pages.pages:
+                    raise ValueError(no_pages_reason(node))
                 ids = [p.page_id for p in pages.pages]
                 content = pages.content(ids.index(page_id) if page_id in ids else 0)
                 frame = content.frame()
@@ -362,7 +380,12 @@ class _SceneView:
                     page_of_pdf = {p.pdf_page: i for i, p in enumerate(pages.pages) if p.pdf_page is not None}
                     links = pdf_links(content.pdf, content.pdf_page, frame, page_of_pdf)
                 result = (pages, content, to_scene(frame), to_scene(bounds), links, None)
-            except EXPECTED_ERRORS as err:
+            except Exception as err:      # anything left unreported would keep the loading dots up
+                if not isinstance(err, EXPECTED_ERRORS):
+                    log.exception("loading page %r of %s", page_id, node.id)
+                    err = RuntimeError(f"{type(err).__name__}: {err}")
+                if pages is not None:
+                    pages.close()
                 result = (None, None, None, None, [], err)
             emit_from_worker(self, lambda: self._loaded.emit(result))
         self._pool.start(_Job(job))
@@ -388,6 +411,11 @@ class _SceneView:
         self._set("awaitingInitialTileSet", False)
         self._set("status", 2)  # Active
         self._render()
+        # Last: when this gives the document its page count, the viewport reopens the
+        # page through its new id, replacing this view.
+        learn = getattr(self._get("document"), "learn_pdf_page_count", None)
+        if learn is not None and pages.pdf is not None:
+            learn(pages.pdf.page_count)
 
     # -- geometry --
     def geometryChange(self, new: QRectF, old: QRectF) -> None:
@@ -501,9 +529,10 @@ class _PagePicker:
     @Slot()
     def resetModel(self) -> None:
         library, doc_id = self._get("library"), self._get("documentId")
-        node = library.tree.get(doc_id) if library is not None and doc_id else None
+        entry = library.entryForId(doc_id) if library is not None and doc_id else None
         self.beginResetModel()
-        self._count = node.page_count if node is not None and not node.is_folder else 0
+        # The document's pageCount: also right for documents without a page list.
+        self._count = int(entry.property("pageCount") or 0) if entry is not None and not entry.node.is_folder else 0
         self.endResetModel()
         self.modelDataChanged.emit()
 
