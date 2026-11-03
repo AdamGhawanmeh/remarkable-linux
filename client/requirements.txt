@@ -1,0 +1,9 @@
+# Tested with PySide6 6.10.3, pypdf 6.21.4, aiortc 1.15.0, websockets 15.0.1 (Python 3.14).
+# PySide6 is pinned to Qt 6.10.3, the Qt reMarkable.exe 3.29 ships: the app's QML runs on
+# the same QML engine and Controls style. Install into client/.venv:
+#   python3 -m venv client/.venv && client/.venv/bin/pip install -r client/requirements.txt
+PySide6==6.10.3      # Qt Quick (the app's QML), QtPdf (PDF rendering), QPdfWriter
+pypdf>=6.0           # PDF export: keeps original PDF pages as vectors
+aiortc>=1.15         # Screen Share: the WebRTC data channel from the tablet
+websockets>=15       # Screen Share: the cloud notifications socket
+pyOpenSSL>=24        # Screen Share: the tablet's DTLS certificate fingerprint

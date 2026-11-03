@@ -1,0 +1,81 @@
+# This repository holds only original code. Everything from reMarkable's app is
+# extracted locally by install.py ("bring your own asset") and must never be committed.
+
+# --- reMarkable's binaries and what is extracted from them -------------------------
+# reMarkable.exe (+ its icon), unpacked from the installer
+/extracted/
+# the carved Qt resource trees + manifest
+/resources/
+# QML, fonts, icons, templates, remarkable.rcc
+/client/src/assets/
+# renders of the app's own interface
+/client/docs/screenshots/
+# local PyInstaller bundles (contain the assets)
+/remarkable-desktop/
+*.exe
+*.dll
+*.msi
+*.7z
+*.dat
+*.rcc
+*.rcc.stamp
+*.qml
+*.qmlc
+*.qm
+qmldir
+*.template
+*.ttf
+*.otf
+*.woff
+*.woff2
+*.ico
+*.png
+*.jpg
+*.svg
+
+# Generated from reMarkable.exe's moc metadata (client/tools/moc_api.py), and any other
+# JSON: tokens and settings (auth.json, config.json), manifests, caches.
+*.json
+
+# --- your account and library ------------------------------------------------------
+# The client keeps these outside the checkout (~/.config/remarkable-linux/,
+# ~/.cache/remarkable-linux/), so they cannot be committed from there; these patterns
+# catch copies or XDG dirs pointed inside it.
+remarkable-linux/
+.config/
+.cache/
+*.token
+settings.ini
+*.rm
+*.rmdoc
+*.pdf
+*.epub
+
+# --- environments, builds, SDKs -----------------------------------------------------
+# downloads, Qt SDK (aqtinstall), the build environment, CMake and PyInstaller trees
+/build/
+# the standalone app: it bundles the extracted assets
+/dist/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+*.so.*
+*.o
+CMakeCache.txt
+CMakeFiles/
+*_autogen/
+# a Qt SDK unpacked inside the checkout (e.g. ~/tools/Qt)
+Qt/
+aqtinstall.log
+*.log
+*.part
+core.[0-9]*
+
+# --- editors and OS -----------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,186 @@
+"""The QML desktop client: the app's own main.qml and QML, hosted by PySide6's QML engine.
+
+    app = QuickApp(source, cache_dir, config_dir=..., liveview_factory=...)
+    app.load()            # registers resources, fonts, translations, types; loads main.qml
+    app.start(sync=True)
+
+Everything on screen is the official QML from the app's resources (qrc:/qml/main.qml and
+what it imports, unmodified), over Python implementations of the app's C++ types
+(bridge/); pages are drawn by this client's renderer inside the app's SceneView
+(bridge/scene.py).
+
+QML warnings are collected in `app.warnings` (and logged), so tests and screenshots can
+assert that every binding resolved.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Callable
+
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QTranslator, QUrl, QtMsgType, qInstallMessageHandler, qVersion
+from PySide6.QtGui import QFontDatabase, QGuiApplication
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+
+from core.models import DocumentTree
+
+from ..library import LibrarySource
+from ..workers import Mutator, Syncer
+from . import assets
+from .bridge import Singletons, register_types, use_singletons
+from .bridge.images import DragIconImageProvider, ThumbnailImageProvider
+from .bridge.importer import DocumentImporter
+from .bridge.library import DocumentSelection, DocumentSync, Library, LibraryController
+from .bridge.platform import (ArkIconProvider, ArkTokensSettings, Authentication, Clipboard, DocumentController,
+                              HandwritingLanguageModel, LanguageSettings, LinkProvider, NetworkClient, PlatformApp,
+                              PlatformHelpers, Settings, SettingsStore, UserInfo)
+from .bridge.scene import Recognizer, set_page_source
+from .bridge.screenshare import ScreenShareClient
+
+log = logging.getLogger("rm.ui.quick")
+MAIN_URL = QUrl("qrc:/qml/main.qml")
+IMPORT_PATHS = ("qrc:/qml", "qrc:/ark-imports")
+TRANSLATION = ":/i18n/translations/reMarkable_{}.qm"
+# qrc files replaced by this client's (path -> file); none: the app's QML runs as shipped.
+OVERRIDES: dict[str, Path] = {}
+# The UI version these QML files are (reMarkable desktop 3.29.0, build 1804).
+APP_VERSION, APP_BUILD = "3.29.0", "1804"
+# Fonts main() adds besides the reMarkable families (assets.FONT_FILES).
+QRC_FONTS = (":/fonts/EBGaramond-Italic-VariableFont_wght.ttf", ":/fonts/EBGaramond-VariableFont_wght.ttf")
+
+
+def prepare() -> None:
+    """What the app's main() sets before creating its QGuiApplication."""
+    QQuickStyle.setStyle("Basic")
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+
+
+def configure(application: QGuiApplication) -> None:
+    """...and after: names, closing behaviour and the light colour scheme."""
+    application.setOrganizationName("remarkable")
+    application.setOrganizationDomain("remarkable.com")
+    application.setQuitOnLastWindowClosed(True)
+    application.styleHints().setColorScheme(Qt.ColorScheme.Light)
+
+
+class QuickApp:
+    def __init__(self, source: LibrarySource, cache_dir: Path, *, config_dir: Path | None = None,
+                 liveview_factory: Callable | None = None, now=None, main: QUrl = MAIN_URL) -> None:
+        self.source = source
+        self.cache_dir = cache_dir
+        self.main = main
+        self.warnings: list[str] = []
+        self.closing = False          # set by shutdown(): bindings torn down with the engine are not errors
+        self.library = Library(now=now)
+        self.mutator = Mutator(source)
+        self.syncer = Syncer(source)
+        store = SettingsStore(config_dir / "settings.ini" if config_dir else None)
+        self.singletons = Singletons(
+            library=self.library,
+            controller=LibraryController(self.library, self.mutator.run),
+            importer=DocumentImporter(self.mutator.run), selection=DocumentSelection(),
+            document_sync=DocumentSync(),
+            screen_share=ScreenShareClient(liveview_factory),
+            settings=Settings(store), ark_settings=ArkTokensSettings(),
+            platform_helpers=PlatformHelpers(store), platform_app=PlatformApp(),
+            authentication=Authentication(logged_in=True), user_info=UserInfo(),
+            network_client=NetworkClient(), document_controller=DocumentController(self.library),
+            clipboard=Clipboard(), language=LanguageSettings(store), link=LinkProvider(),
+            handwriting=HandwritingLanguageModel(), recognizer=Recognizer())
+        self.item_inspector = QObject()
+        s = self.singletons
+        self.engine: QQmlApplicationEngine | None = None
+        self.translator: QTranslator | None = None
+        self.thumbnails: ThumbnailImageProvider | None = None
+        self.icons: ArkIconProvider | None = None
+        # FileImportDialog hands picked files to PlatformHelpers.documentAccepted.
+        s.platform_helpers.documentAccepted.connect(
+            lambda url, name, parent_id, scanned, delete_later: s.importer.importFromUrls([url], parent_id))
+        self.mutator.finished.connect(lambda tree, message: self.set_tree(tree))
+        self.mutator.failed.connect(self.library.errorMessage.emit)
+        self.syncer.started.connect(lambda: s.document_sync.set_state(True))
+        self.syncer.finished.connect(self._synced)
+        self.syncer.failed.connect(self._sync_failed)
+
+    def _synced(self, tree: DocumentTree) -> None:
+        self.set_tree(tree)
+        self.singletons.document_sync.set_state(False)
+        self.singletons.link.set_online(True)
+
+    def _sync_failed(self, message: str) -> None:
+        self.singletons.document_sync.set_state(False, True)
+        self.singletons.link.set_online(False)
+        log.warning("sync failed: %s", message)
+
+    def _message(self, kind, context, message: str) -> None:
+        if self.closing:
+            return
+        if kind in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+            self.warnings.append(message)
+            log.warning("qml: %s", message)
+
+    def load(self) -> QQmlApplicationEngine:
+        assets.register_resources(overrides=OVERRIDES)
+        assets.register_fonts()
+        for font in QRC_FONTS:
+            QFontDatabase.addApplicationFont(font)
+        register_types()
+        set_page_source(lambda: self.source)
+        self.translator = QTranslator()
+        self._translate(self.singletons.language.languageCode)
+        self.singletons.language.on_change = self._language_changed
+        qInstallMessageHandler(self._message)
+        engine = self.engine = QQmlApplicationEngine()
+        for path in IMPORT_PATHS:
+            engine.addImportPath(path)
+        self.icons = ArkIconProvider()
+        self.icons.install(engine, "arkicon")
+        self.thumbnails = ThumbnailImageProvider(self.source, self.library, self.cache_dir)
+        self.thumbnails.install(engine, "rmthumb")
+        engine.addImageProvider("dragicon", DragIconImageProvider())
+        use_singletons(engine, self.singletons)
+        # main() and PlatformApp's context properties.
+        context = engine.rootContext()
+        for name, value in (("dpiScale", 0.48), ("debugBuild", False), ("itemInspector", self.item_inspector),
+                            ("appVersion", APP_VERSION), ("appBuild", APP_BUILD), ("qtVersion", qVersion())):
+            context.setContextProperty(name, value)
+        engine.load(self.main)
+        if not engine.rootObjects():
+            raise RuntimeError(f"{self.main.toString()} failed to load:\n" + "\n".join(self.warnings))
+        return engine
+
+    def _translate(self, code: str) -> None:
+        QCoreApplication.removeTranslator(self.translator)
+        if self.translator.load(TRANSLATION.format(code)):
+            QCoreApplication.installTranslator(self.translator)
+
+    def _language_changed(self, code: str) -> None:
+        self._translate(code)
+        if self.engine is not None:
+            self.engine.retranslate()
+
+    @property
+    def window(self) -> QObject | None:
+        return self.engine.rootObjects()[0] if self.engine and self.engine.rootObjects() else None
+
+    def set_tree(self, tree: DocumentTree) -> None:
+        self.library.set_tree(tree)
+
+    def start(self, sync: bool = True) -> None:
+        self.set_tree(self.source.load_cached())
+        self.singletons.screen_share.start()
+        if sync:
+            self.syncer.refresh()
+
+    def shutdown(self) -> None:
+        self.closing = True
+        self.singletons.screen_share.shutdown()
+        self.mutator.wait(120000)
+        self.syncer.wait(5000)
+        for provider in (self.thumbnails, self.icons):
+            if provider is not None:
+                provider.close()
+        if self.translator is not None:
+            QCoreApplication.removeTranslator(self.translator)

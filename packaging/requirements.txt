@@ -1,0 +1,4 @@
+# Build-only tools, installed into the temporary build environment (build/venv) next to
+# client/requirements.txt. install.py downloads aqtinstall separately, only when it needs a
+# Qt SDK.
+pyinstaller==6.22.3
