@@ -9,9 +9,11 @@ icons, from reMarkable.exe) on this client's library, sync, renderer and Screen 
     client/.venv/bin/python client/run.py --offline  your cached library only, no network, read-only
     client/.venv/bin/python client/run.py --demo     built-in demo library on a fake cloud
 
-The venv runs Qt 6.10.3, the Qt the app ships (see requirements.txt). Without a paired
-device (client/tests/test_auth.py) the demo library is used. The library is cached in
-~/.cache/remarkable-linux/, settings in ~/.config/remarkable-linux/settings.ini.
+The venv runs Qt 6.10.3, the Qt the app ships (see requirements.txt). Not logged in yet
+(no device token in ~/.config/remarkable-linux/auth.json), the app's own log-in screen
+asks for the one-time code from https://my.remarkable.com/device/desktop/connect and then
+syncs your library into the window. The library is cached in ~/.cache/remarkable-linux/,
+settings in ~/.config/remarkable-linux/settings.ini.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ if _MISSING:
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from core.auth import AuthClient  # noqa: E402
-from core.config import AuthStore, cache_dir, config_dir  # noqa: E402
+from core.config import cache_dir, config_dir  # noqa: E402
 from core.sync import SyncClient  # noqa: E402
 from liveview.session import LiveViewService  # noqa: E402
 from ui.library import LibrarySource  # noqa: E402
@@ -53,6 +55,21 @@ def demo_app(workdir: Path) -> QuickApp:
     auth = paired_auth(workdir / "config", build_demo_cloud())
     source = LibrarySource(SyncClient(auth, workdir / "cache"))
     return QuickApp(source, workdir / "cache", config_dir=workdir / "config")
+
+
+def make_app(args: argparse.Namespace, workdir: Path) -> tuple[QuickApp, bool]:
+    """The app run.py starts and whether it syncs. The demo library only when asked for
+    (--demo, --self-test): otherwise your account, and without a device token in auth.json
+    the real app starts on its log-in screen; logging in there opens your library."""
+    if args.demo or args.self_test:
+        return demo_app(workdir), True          # the "sync" talks to the in-memory fake cloud
+    auth = AuthClient()
+    if args.offline and not auth.is_paired:
+        print("Not logged in: showing the cached library only. Run without --offline to log in.")
+    source = LibrarySource(SyncClient(auth), cached_only=args.offline)
+    liveview = None if args.offline else (lambda emit: LiveViewService(auth, emit))
+    quick = QuickApp(source, cache_dir(), config_dir=config_dir(), liveview_factory=liveview)
+    return quick, not args.offline
 
 
 # Qt notices that are not binding errors (the shipped Qt prints them too; ARCHITECTURE.md §2.1).
@@ -95,7 +112,7 @@ def self_test(app: QApplication, quick: QuickApp, seconds: float = 4.0) -> int:
     return 1 if problems else 0
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--offline", action="store_true", help="use the cached library only, no network")
@@ -103,7 +120,11 @@ def main() -> int:
     mode.add_argument("--self-test", action="store_true",
                       help="start on the demo library, check the interface loads, and quit")
     parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
     # websockets logs request headers (the Bearer token) at DEBUG; aioice and aiortc's SCTP every packet.
@@ -118,18 +139,7 @@ def main() -> int:
     configure(app)
 
     with tempfile.TemporaryDirectory(prefix="remarkable-demo-") as tmp:
-        paired = AuthStore().load().is_paired
-        if args.demo or args.self_test or not paired:
-            if not (args.demo or args.self_test):
-                print("No paired device; showing the demo library. Pair with: python3 client/tests/test_auth.py")
-            quick = demo_app(Path(tmp))
-            sync = True            # the "sync" talks to the in-memory fake cloud
-        else:
-            auth = AuthClient()
-            source = LibrarySource(SyncClient(auth), cached_only=args.offline)
-            liveview = None if args.offline else (lambda emit: LiveViewService(auth, emit))
-            quick = QuickApp(source, cache_dir(), config_dir=config_dir(), liveview_factory=liveview)
-            sync = not args.offline
+        quick, sync = make_app(args, Path(tmp))
         quick.load()
         quick.start(sync=sync)
         try:

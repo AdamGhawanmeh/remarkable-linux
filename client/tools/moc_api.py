@@ -77,6 +77,9 @@ TYPES = [
     ("xofm.libs.recovery", "DeviceRecovery", "creatable", "xofm::libs::recovery::DeviceRecovery"),
     ("ark.controls", "FontExtender", "creatable", "ark::controls::FontExtender"),
     ("ark.tokens", "Settings", "singleton", "ark::tokens::Settings"),
+    # Also a com.remarkable singleton (qmlregister(SingletonRegistration) at 0x1400b35cd), so
+    # QML can read its enums (Settings.Prod, Settings.HomeSortOrder): an instance can't.
+    ("com.remarkable", "Settings", "singleton", "Settings"),
     ("", "Settings", "context", "Settings"),
     ("", "", "object", "QmlEntryWrapper"),
     ("", "", "object", "QmlDocumentWrapper"),

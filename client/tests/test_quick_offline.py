@@ -35,6 +35,7 @@ from demo_library import build_demo_cloud
 from fakecloud import paired_auth
 from ui.library import LibrarySource
 from ui.quick import bridge
+from ui.quick import app as quick_app
 from ui.quick.app import QuickApp
 from ui.quick.bridge import images, items, library, platform, scene
 
@@ -100,6 +101,17 @@ CLASSES = {
 NOT_QML = {
     "TaskTracker": {"execute", "onFinished", "onFailed"},
 }
+
+
+def real_warnings(warnings: list[str]) -> list[str]:
+    """QML warnings that are binding errors. Not: the platform's StandardKey notices (Qt
+    warns when a key has several bindings; the shipped Qt 6.10.3 has the same check), and
+    on Qt 6.11 that two of the app's components shadow a base member (RMIconButton.enabled,
+    Background.data), a check the app's Qt does not have."""
+    notices = ["Only binding to one of multiple key bindings"]
+    if tuple(int(x) for x in qVersion().split(".")[:2]) >= (6, 11):
+        notices.append("overrides a member of the base object")
+    return [w for w in warnings if not any(n in w for n in notices)]
 
 
 def wait(ms: int) -> None:
@@ -354,15 +366,7 @@ class QuickAppTests(unittest.TestCase):
                     and n.property("library") is self.app.library and not n.property("filterTags"))
 
     def test_loads_without_binding_errors(self):
-        # Only the platform's StandardKey notices remain (Qt warns when a key has
-        # several bindings; the shipped Qt 6.10.3 has the same check).
-        # Qt 6.11 also notes that two of the app's components shadow a base member
-        # (RMIconButton.enabled, Background.data), a check the app's Qt does not have.
-        notices = ["Only binding to one of multiple key bindings"]
-        if tuple(int(x) for x in qVersion().split(".")[:2]) >= (6, 11):
-            notices.append("overrides a member of the base object")
-        real = [w for w in self.app.warnings if not any(n in w for n in notices)]
-        self.assertEqual(real, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
 
     def test_my_files_lists_the_root(self):
         tree = self.app.library.tree
@@ -482,6 +486,223 @@ class QuickAppTests(unittest.TestCase):
         QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(90, 68))
         wait(400)
         self.assertEqual(model.property("filter"), int(library.LibraryView.Filter["Documents"]))
+
+
+class LoginTests(unittest.TestCase):
+    """Logging in through the app's own LoginWizard (main.qml) with no auth.json, over the
+    fake cloud, then out again: no demo library, no restart."""
+
+    # LogoutConfirmDialog's onAccepted (main.qml) also hides the never-shown downgrade
+    # dialog, so every log-out prints this; the shipped app does the same.
+    LOGOUT_NOTICE = "Trying to close a hidden SheetDialog"
+
+    @classmethod
+    def setUpClass(cls):
+        import time
+        from core.auth import AuthClient
+        from core.config import AuthStore, Settings
+        from fakecloud import AUTH_HOST
+        cls.tmp = tempfile.TemporaryDirectory()
+        tmp = Path(cls.tmp.name)
+        cls.cloud = build_demo_cloud()
+        cls.cloud.codes = {"abcdefgh", "ijklmnop"}
+
+        def network(method, url, headers, body, timeout):
+            if AUTH_HOST in url:
+                time.sleep(0.3)        # as long as a real round trip, so the wizard's sheets animate
+            return cls.cloud(method, url, headers, body, timeout)
+        cls.auth = AuthClient(Settings(), AuthStore(tmp / "config"), network)
+        cls.app = QuickApp(LibrarySource(SyncClient(cls.auth, tmp / "cache")), tmp / "cache", config_dir=tmp)
+        cls.app.load()
+        cls.app.start(sync=True)
+        wait(800)
+        cls.window = cls.app.window
+        cls.window.resize(1270, 875)
+        cls.wizard = next(o for o in cls.window.findChildren(QObject)
+                          if o.metaObject().className().startswith("LoginWizard"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.app.shutdown()
+        del cls.window, cls.wizard
+        gc.collect()
+        cls.app.engine.deleteLater()
+        wait(50)
+        cls.tmp.cleanup()
+
+    def wait_for(self, condition, ms=8000):
+        for _ in range(ms // 100):
+            if condition():
+                return True
+            wait(100)
+        return condition()
+
+    def visible_item(self, prop, value):
+        todo = [self.window.contentItem()]
+        while todo:
+            item = todo.pop()
+            todo.extend(item.childItems())
+            if item.property(prop) != value or item.width() <= 0:
+                continue
+            shown, up = True, item
+            while up is not None and shown:
+                shown, up = up.isVisible() and up.opacity() > 0, up.parentItem()
+            if shown:
+                return item
+        self.fail(f"no visible item with {prop} = {value!r}")
+
+    def click(self, item):
+        from PySide6.QtTest import QTest
+        centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, centre)
+        wait(500)
+
+    def enter_code(self, code):
+        from PySide6.QtTest import QTest
+        field = self.visible_item("placeholderText", "Verification code")
+        field.setProperty("text", "")
+        self.click(field)
+        for ch in code:
+            QTest.keyClick(self.window, getattr(Qt.Key, f"Key_{ch.upper()}"))
+        self.click(self.visible_item("text", "Pair the app"))
+
+    def state(self):
+        return self.wizard.property("state")
+
+    def test_log_in_from_the_wizard_then_out(self):
+        from core.config import AuthStore
+        authn = self.app.singletons.authentication
+        store = AuthStore(Path(self.tmp.name) / "config")
+        # Not paired: the wizard covers an empty window, and nothing has gone to the network.
+        self.assertFalse(authn.property("loggedIn"))
+        self.assertTrue(self.wizard.property("visible"))
+        self.assertEqual(self.state(), "intro")
+        self.assertEqual(self.app.library.tree.documents(), [])
+        self.assertEqual(self.cloud.requests, [])
+
+        opened = []
+        platform.QDesktopServices, saved = type("Desktop", (), {"openUrl": staticmethod(
+            lambda url: opened.append(url.toString()))}), platform.QDesktopServices
+        try:
+            self.click(self.visible_item("text", "Log in"))
+        finally:
+            platform.QDesktopServices = saved
+        self.assertEqual(opened, ["https://my.remarkable.com/device/desktop/connect#desktop"])
+        self.assertEqual(self.state(), "login")
+        # Settings.Prod resolves (com.remarkable's Settings singleton): no environment line.
+        environment = [i for i in self.window.findChildren(QObject)
+                       if str(i.property("text") or "").startswith("<b>Service environment")]
+        self.assertTrue(environment and not any(i.isVisible() for i in environment))
+
+        self.enter_code("wrongcod")
+        self.assertTrue(self.wait_for(lambda: self.state() == "help"))      # "Unable to verify account"
+        self.assertEqual(authn.property("loginResult"), platform.LOGIN_RESULTS["InvalidOneTimeCode"])
+        self.assertFalse(store.load().is_paired)
+        self.click(self.visible_item("text", "Back"))
+
+        self.enter_code("abcdefgh")
+        self.assertEqual(self.state(), "waiting")                             # "Pairing your device"
+        self.assertTrue(self.wait_for(lambda: authn.property("loggedIn")))
+        self.assertTrue(self.wait_for(lambda: len(self.app.library.tree.documents()) > 5))
+        self.assertTrue(self.wait_for(lambda: not self.wizard.property("visible")))
+        saved_state = store.load()
+        self.assertTrue(saved_state.device_token and saved_state.user_token)
+        warnings = len(self.app.warnings)
+
+        # Log out through the app's dialog: device deleted, tokens and library gone, wizard back.
+        dialog = next(o for o in self.window.findChildren(QObject)
+                      if o.metaObject().className().startswith("LogoutConfirmDialog"))
+        QMetaObject.invokeMethod(dialog, "show")
+        wait(500)
+        self.click(self.visible_item("text", "Log out"))
+        self.assertTrue(self.wait_for(lambda: not authn.property("loggedIn")))
+        self.assertTrue(self.wait_for(lambda: self.wizard.property("visible")))
+        self.assertEqual(self.state(), "intro")
+        self.assertEqual(self.app.library.tree.documents(), [])
+        self.assertFalse(store.load().is_paired)
+        self.assertEqual(self.cloud.device_tokens, {"device"})
+        self.assertFalse((Path(self.tmp.name) / "cache" / "blobs").exists())
+        self.assertEqual(real_warnings(self.app.warnings[warnings:]), [self.LOGOUT_NOTICE])
+
+        # Log in again; then the account drops this device: back to the wizard.
+        self.wizard.setProperty("state", "login")       # as "Log in" does, without the browser
+        wait(500)
+        self.enter_code("ijklmnop")
+        self.assertTrue(self.wait_for(lambda: authn.property("loggedIn")))
+        self.assertTrue(self.wait_for(lambda: len(self.app.library.tree.documents()) > 5))
+        self.cloud.revoked = True
+        self.app.syncer.refresh()
+        self.assertTrue(self.wait_for(lambda: not authn.property("loggedIn")))
+        self.assertTrue(self.wait_for(lambda: self.wizard.property("visible")))
+        self.assertEqual(self.state(), "login")                                # code entry, with a notice
+        self.assertEqual(authn.property("loginErrorMessage"), quick_app.LOGGED_OUT_BY_CLOUD)
+        self.assertGreater(len(self.app.library.tree.documents()), 5)         # kept until the next log-in
+        self.assertEqual([w for w in real_warnings(self.app.warnings) if w != self.LOGOUT_NOTICE], [])
+
+    def test_login_results_the_wizard_understands(self):
+        import ssl
+        import urllib.error
+        from core.auth import AuthError, AuthNetworkError, DeviceRevokedError, PairingError
+        results = platform.LOGIN_RESULTS
+
+        def network(reason):
+            try:
+                raise AuthNetworkError("could not reach any auth host") from urllib.error.URLError(reason)
+            except AuthNetworkError as err:
+                return err
+        expired = ssl.SSLCertVerificationError(1, "certificate has expired")
+        expired.verify_code = 10
+        for error, result in (
+                (PairingError("rejected (HTTP 400)", 400), "InvalidOneTimeCode"),
+                (PairingError("rejected (HTTP 502)", 502), "GenericError"),
+                (network(expired), "SslCertificateTimeError"),
+                (network(ssl.SSLError(1, "handshake failure")), "SslHandshakeError"),
+                (network(OSError("Network is unreachable")), "NetworkError"),
+                (DeviceRevokedError("device token rejected"), "GenericError"),
+                (AuthError("You must connect a rM device"), "GenericError")):
+            with self.subTest(error=str(error)):
+                code, message = platform.login_result(error)
+                self.assertEqual(code, results[result])
+                self.assertTrue(message)
+        # LoginWizard replaces the cloud's "no tablet" message by matching its text.
+        self.assertIn("You must connect a rM device", platform.login_result(AuthError("You must connect a rM device"))[1])
+
+    def test_offline_never_logs_in(self):
+        from core.auth import AuthClient
+        from core.config import AuthStore, Settings
+        tmp = Path(self.tmp.name) / "offline"
+        auth = AuthClient(Settings(), AuthStore(tmp), self.cloud)
+        app = QuickApp(LibrarySource(SyncClient(auth, tmp / "cache"), cached_only=True), tmp / "cache")
+        authn = app.singletons.authentication
+        self.assertTrue(authn.property("loggedIn"))     # the cached library, no log-in screen
+        authn.legacyLogin("abcdefgh")
+        self.assertFalse(authn.property("loggedIn"))
+        self.assertEqual(authn.property("loginResult"), platform.LOGIN_RESULTS["NetworkError"])
+        self.assertEqual(authn.property("loginErrorMessage"), quick_app.OFFLINE_LOGIN)
+        self.assertFalse(auth.is_paired)
+        app.shutdown()
+
+    def test_run_py_opens_the_demo_only_when_asked(self):
+        import importlib.util
+        import os
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("run_client", HERE.parent / "run.py")
+        run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run)
+        home = Path(self.tmp.name) / "home"
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(home / "config"),
+                                          "XDG_CACHE_HOME": str(home / "cache")}):
+            quick, sync = run.make_app(run.parse_args([]), home / "demo")
+            self.assertFalse(quick.auth.is_paired)                         # no auth.json
+            self.assertFalse(quick.singletons.authentication.property("loggedIn"))   # -> log-in screen
+            self.assertEqual(quick.source.load_cached().documents(), [])   # not the demo library
+            self.assertTrue(sync)
+            quick.shutdown()
+            demo, _ = run.make_app(run.parse_args(["--demo"]), home / "demo")
+            self.assertTrue(demo.singletons.authentication.property("loggedIn"))
+            self.assertGreater(len(demo.source.refresh().documents()), 5)
+            demo.shutdown()
+        self.assertFalse((home / "config" / "remarkable-linux" / "auth.json").exists())
 
 
 if __name__ == "__main__":

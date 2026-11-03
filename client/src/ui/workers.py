@@ -17,7 +17,7 @@ import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QImage
 
-from core.auth import AuthError
+from core.auth import AuthClient, AuthError, DeviceRevokedError, NotPairedError
 from core.models import Document, DocumentTree
 from core.sync import SyncClient, SyncError
 
@@ -254,11 +254,55 @@ class Mutator(QObject):
         return self.pool.waitForDone(msecs)
 
 
+class Account(QObject):
+    """Logs in and out in the background, one after the other (both call the auth host).
+
+    login(code): pair with the one-time code and fetch the first user token
+    (AuthClient.login). logout(remote): delete this device on the server (unless
+    `remote` is False), forget the tokens, then run `after`, e.g. to clear the library.
+    """
+
+    loggedIn = Signal()
+    loginFailed = Signal(object)     # the AuthError
+    loggedOut = Signal()
+
+    def __init__(self, auth: AuthClient, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.auth = auth
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+
+    def login(self, code: str) -> None:
+        def job():
+            try:
+                self.auth.login(code)
+            except AuthError as err:
+                emit_from_worker(self, lambda: self.loginFailed.emit(err))
+                return
+            emit_from_worker(self, self.loggedIn.emit)
+        self.pool.start(_Job(job))
+
+    def logout(self, remote: bool = True, after: Callable[[], None] = lambda: None) -> None:
+        def job():
+            try:
+                self.auth.unpair(remote=remote)
+                after()
+            except EXPECTED_ERRORS as err:      # e.g. a read-only cache: still logged out here
+                log.error("logging out: %s", err)
+            emit_from_worker(self, self.loggedOut.emit)
+        self.pool.start(_Job(job))
+
+    def wait(self, msecs: int = 60000) -> bool:
+        return self.pool.waitForDone(msecs)
+
+
 class Syncer(QObject):
-    """Runs LibrarySource.refresh() in the background, one at a time."""
+    """Runs LibrarySource.refresh() in the background, one at a time. `unauthorized`
+    (instead of `failed`) means the cloud no longer accepts this client: log in again."""
 
     finished = Signal(object)    # DocumentTree
     failed = Signal(str)
+    unauthorized = Signal(str)
     started = Signal()
 
     def __init__(self, source: LibrarySource, parent: QObject | None = None) -> None:
@@ -277,6 +321,10 @@ class Syncer(QObject):
         def job():
             try:
                 tree: DocumentTree = self.source.refresh()
+            except (DeviceRevokedError, NotPairedError) as err:
+                self.running = False
+                emit_from_worker(self, lambda: self.unauthorized.emit(f"{type(err).__name__}: {err}"))
+                return
             except EXPECTED_ERRORS as err:
                 self.running = False
                 emit_from_worker(self, lambda: self.failed.emit(f"{type(err).__name__}: {err}"))

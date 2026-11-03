@@ -173,6 +173,78 @@ class AuthTests(unittest.TestCase):
         self.store.load()
         self.assertEqual(stat.S_IMODE((self.dir / "auth.json").stat().st_mode), 0o600)
 
+    # -- logging in and out (the app's log-in screen) --
+
+    def test_login_pairs_and_fetches_the_first_user_token(self):
+        self.settings.auth_host = "webapp.example"
+        user = make_jwt({"exp": self.now + 3600})
+        self.t.add("POST", WEBAPP + auth.DEVICE_NEW_PATH, resp(200, "dev"))
+        self.t.add("POST", WEBAPP + auth.USER_NEW_PATH, resp(200, user))
+        c = self.client()
+        self.assertEqual(c.login("abcdefgh"), user)
+        saved = AuthStore(self.dir).load()
+        self.assertEqual((saved.device_token, saved.user_token), ("dev", user))
+        self.assertTrue(AuthClient(self.settings, AuthStore(self.dir), self.t).is_paired)
+
+    def test_failed_login_leaves_no_half_paired_client(self):
+        # The code buys a device token, but the account gives no user token for it.
+        self.settings.auth_host = "webapp.example"
+        self.t.add("POST", WEBAPP + auth.DEVICE_NEW_PATH, resp(200, "dev"))
+        self.t.add("POST", WEBAPP + auth.USER_NEW_PATH, resp(400, "You must connect a rM device"))
+        c = self.client()
+        device_id = c.state.device_id
+        with self.assertRaises(auth.AuthError) as caught:
+            c.login("abcdefgh")
+        self.assertIn("You must connect a rM device", str(caught.exception))
+        saved = AuthStore(self.dir).load()
+        self.assertFalse(c.is_paired or saved.is_paired)
+        self.assertEqual(saved.device_id, device_id)         # the installation keeps its ID
+        # A rejected code: nothing was stored in the first place.
+        self.t.routes[("POST", WEBAPP + auth.DEVICE_NEW_PATH)] = [resp(400, "invalid one-time-code")]
+        with self.assertRaises(PairingError) as caught:
+            c.login("wrongcod")
+        self.assertEqual(caught.exception.status, 400)
+        self.assertFalse(AuthStore(self.dir).load().is_paired)
+
+    def test_network_failure_keeps_its_cause(self):
+        import ssl
+        import urllib.error
+        self.settings.auth_host = "webapp.example"
+        expired = ssl.SSLCertVerificationError(1, "certificate verify failed: certificate has expired")
+        self.t.add("POST", WEBAPP + auth.DEVICE_NEW_PATH, urllib.error.URLError(expired))
+        with self.assertRaises(auth.AuthNetworkError) as caught:
+            self.client().pair("abcdefgh")
+        self.assertIs(caught.exception.__cause__.reason, expired)
+
+    def test_unpair_and_forget(self):
+        self.settings.auth_host = "webapp.example"
+        self.t.add("POST", WEBAPP + auth.DEVICE_NEW_PATH, resp(200, "dev"))
+        self.t.add("POST", WEBAPP + auth.USER_NEW_PATH, resp(200, make_jwt({"exp": self.now + 3600})))
+        self.t.add("POST", WEBAPP + auth.DEVICE_DELETE_PATH, resp(200))
+        c = self.client()
+        c.login("abcdefgh")
+        calls = len(self.t.calls)
+        c.unpair(remote=False)                               # offline: no request at all
+        self.assertEqual(len(self.t.calls), calls)
+        self.assertFalse(c.is_paired or AuthStore(self.dir).load().is_paired)
+        c.login("abcdefgh")
+        c.unpair()
+        self.assertEqual(self.t.calls[-1][1], WEBAPP + auth.DEVICE_DELETE_PATH)
+        self.assertFalse(AuthStore(self.dir).load().is_paired)
+
+    def test_unreadable_auth_file_means_not_paired(self):
+        self.dir.mkdir(parents=True)
+        for content in ("{not json", "[1, 2]", "\udcff", '{"device_token": 7}'):
+            (self.dir / "auth.json").write_text(content, errors="surrogateescape")
+            with self.subTest(content=content):
+                if content.startswith('{"'):                 # valid JSON, wrong type: skipped quietly
+                    state = AuthStore(self.dir).load()
+                else:
+                    with self.assertLogs("rm.config", "WARNING"):
+                        state = AuthStore(self.dir).load()
+                self.assertFalse(state.is_paired)
+                self.assertTrue(state.device_id)
+
 
 if __name__ == "__main__":
     unittest.main()

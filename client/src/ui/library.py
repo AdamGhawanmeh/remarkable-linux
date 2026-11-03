@@ -307,6 +307,12 @@ class LibrarySource:
             return self.sync.load_cached()
         return self.sync.refresh()
 
+    def forget(self) -> None:
+        """Drop the cached library (logging out)."""
+        self.sync.forget()
+        with self._lock:
+            self._scenes.clear()
+
     def blob(self, doc: Document, name: str) -> bytes:
         return self.sync.get_blob(doc.files[name], name, cached_only=self.cached_only)
 

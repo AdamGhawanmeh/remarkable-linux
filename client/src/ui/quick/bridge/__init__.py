@@ -93,6 +93,8 @@ SINGLETONS = (("library", LIBRARY, "Library", Library), ("controller", LIBRARY, 
               ("document_sync", REMARKABLE, "DocumentSync", DocumentSync),
               ("screen_share", REMARKABLE, "ScreenShareClient", ScreenShareClient),
               ("platform_helpers", REMARKABLE, "PlatformHelpers", PlatformHelpers),
+              # Also the "Settings" context property (use_singletons): as a type, QML reads its enums.
+              ("settings", REMARKABLE, "Settings", Settings),
               ("platform_app", REMARKABLE, "PlatformApp", PlatformApp),
               ("authentication", REMARKABLE, "Authentication", Authentication),
               ("user_info", REMARKABLE, "UserInfo", UserInfo),

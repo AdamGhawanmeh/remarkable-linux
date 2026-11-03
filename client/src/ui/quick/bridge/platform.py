@@ -1,7 +1,7 @@
 """com.remarkable platform types, the Settings objects and the arkicon image provider.
 
 Members and enum values are the app's (bridge/qml_api.json). Features this client
-does not have (app updates, What's new, login wizard, scanning, page editing) report
+does not have (app updates, What's new, scanning, page editing) report
 "not available" rather than pretending.
 """
 
@@ -11,9 +11,11 @@ import json
 import logging
 import os
 import platform as _platform
+import ssl
 import sys
 from enum import IntEnum
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, unquote
 
 from PySide6.QtCore import (Property, QByteArray, QCoreApplication, QDate, QFile, QIODevice, QLocale, QObject, QRectF, QSettings,
@@ -23,7 +25,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QImage, QPa
 from .images import AsyncImageProvider
 from PySide6.QtSvg import QSvgRenderer
 
-from core.auth import user_agent
+from core.auth import PAIRING_URL, AuthNetworkError, PairingError, user_agent
 
 log = logging.getLogger("rm.ui.quick.platform")
 
@@ -528,11 +530,17 @@ def _os_version(part: int) -> int:
 
 
 class PlatformApp(QObject):
-    """PlatformApp (XoApp): updates are the distribution's job, so no Sparkle."""
+    """PlatformApp (XoApp): updates are the distribution's job, so no Sparkle. logout()
+    (LogoutConfirmDialog) runs `on_logout`; the dialog waits for Authentication.loggedInChanged."""
+
+    def __init__(self, on_logout: Callable[[], None] | None = None, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.on_logout = on_logout
 
     @Slot()
     def logout(self) -> None:
-        log.info("log out from the client with: rm ~/.config/remarkable-linux/auth.json")
+        if self.on_logout is not None:
+            self.on_logout()
 
     @Slot(str, result=bool)
     def shouldShowWhatsNew(self, version: str) -> bool:
@@ -577,12 +585,50 @@ class PlatformApp(QObject):
         pass
 
 
-class Authentication(QObject):
-    """Pairing is Module 1's (run.py --pair); the QML sees a logged-in client."""
+LOGIN_RESULTS = {"Ok": 0, "DeviceAlreadyConnected": 1, "InvalidOneTimeCode": 2, "SslCertificateTimeError": 3,
+                 "SslHandshakeError": 4, "GenericError": 5, "NetworkError": 6}
+NETWORK_MESSAGE = "Unable to connect to the reMarkable cloud. Check your internet connection and try again."
+# OpenSSL verify codes for a certificate outside its validity period (a wrong clock).
+X509_NOT_YET_VALID, X509_EXPIRED = 9, 10
 
-    LoginResult = IntEnum("LoginResult", {"Ok": 0, "DeviceAlreadyConnected": 1, "InvalidOneTimeCode": 2,
-                                          "SslCertificateTimeError": 3, "SslHandshakeError": 4,
-                                          "GenericError": 5, "NetworkError": 6})
+
+def _ssl_error(error: BaseException) -> ssl.SSLError | None:
+    """The TLS error behind a network failure (urllib wraps it in URLError.reason)."""
+    seen: set[int] = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        for candidate in (error, getattr(error, "reason", None)):
+            if isinstance(candidate, ssl.SSLError):
+                return candidate
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def login_result(error: Exception) -> tuple[int, str]:
+    """Authentication.LoginResult and loginErrorMessage for a failed log-in. LoginWizard
+    shows its own help page for a rejected code and for TLS errors, and the message (in a
+    notification) otherwise; it recognises the cloud's "You must connect a rM device"."""
+    if isinstance(error, PairingError) and error.status is not None and 400 <= error.status < 500:
+        return LOGIN_RESULTS["InvalidOneTimeCode"], str(error)
+    tls = _ssl_error(error)
+    if isinstance(tls, ssl.SSLCertVerificationError) and tls.verify_code in (X509_NOT_YET_VALID, X509_EXPIRED):
+        return LOGIN_RESULTS["SslCertificateTimeError"], str(tls)
+    if tls is not None:
+        return LOGIN_RESULTS["SslHandshakeError"], str(tls)
+    if isinstance(error, AuthNetworkError):
+        return LOGIN_RESULTS["NetworkError"], NETWORK_MESSAGE
+    return LOGIN_RESULTS["GenericError"], f"Unable to log in: {error}"
+
+
+class Authentication(QObject):
+    """Authentication: whether this client is logged in, which main.qml's LoginWizard
+    follows. Logged out, the wizard covers the window and asks for a one-time code;
+    legacyLogin(code) hands it to `login` (QuickApp pairs in the background), which reports
+    back through succeeded() or failed(). The wizard reacts to loggedInChanged, also after
+    a failed attempt (then loginResult says why), so it is emitted every time.
+    """
+
+    LoginResult = IntEnum("LoginResult", LOGIN_RESULTS)
     QEnum(LoginResult)
 
     newLoginSuccess = Signal()
@@ -595,30 +641,62 @@ class Authentication(QObject):
     loginResultChanged = Signal()
     loggedOutFromCloud = Signal()
 
-    def __init__(self, logged_in: bool, parent: QObject | None = None) -> None:
+    def __init__(self, logged_in: bool, login: Callable[[str], None] | None = None,
+                 parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._logged_in = logged_in
+        self._login = login
+        self._result = LOGIN_RESULTS["Ok"]
+        self._message = ""
 
     deviceMissing = Property(bool, lambda self: False, notify=deviceMissingChanged)
     loggedIn = Property(bool, lambda self: self._logged_in, notify=loggedInChanged)
-    loginErrorMessage = Property(str, lambda self: "", notify=loginErrorMessageChanged)
-    loginResult = Property(int, lambda self: 0, notify=loginResultChanged)
+    loginErrorMessage = Property(str, lambda self: self._message, notify=loginErrorMessageChanged)
+    loginResult = Property(int, lambda self: self._result, notify=loginResultChanged)
 
+    def _set(self, logged_in: bool, result: int, message: str) -> None:
+        # Result and message first: LoginWizard reads them when loggedInChanged arrives.
+        if result != self._result:
+            self._result = result
+            self.loginResultChanged.emit()
+        if message != self._message:
+            self._message = message
+            self.loginErrorMessageChanged.emit()
+        self._logged_in = logged_in
+        self.loggedInChanged.emit()
+
+    # -- reported by the app --
+    def succeeded(self) -> None:
+        self._set(True, LOGIN_RESULTS["Ok"], "")
+        self.authTokenChanged.emit()
+        self.newLoginSuccess.emit()
+
+    def failed(self, result: int, message: str) -> None:
+        """A log-in failed, or (logged in) the cloud stopped accepting this client."""
+        self._set(False, result, message)
+
+    def logged_out(self) -> None:
+        self._set(False, LOGIN_RESULTS["Ok"], "")
+
+    # -- called by the QML --
     @Slot()
     def fetchUserToken(self) -> None:
-        pass
+        pass            # the sync fetches user tokens itself, when it needs one
 
     @Slot(str)
     def legacyLogin(self, code: str) -> None:
-        self.userTokenErrorMessageReceived.emit("Pair this client with: python3 run.py --pair")
+        if self._login is None:
+            self.failed(LOGIN_RESULTS["GenericError"], "Logging in is not available here.")
+        else:
+            self._login(code)
 
     @Slot()
     def abortLogin(self) -> None:
-        pass
+        pass            # the app's QML never calls it; a pairing request runs to its end
 
-    @Slot()
-    def refreshAuthToken(self) -> None:
-        pass
+    @Slot(result=bool)
+    def refreshAuthToken(self) -> bool:
+        return self._logged_in
 
 
 class UserInfo(QObject):
@@ -709,8 +787,9 @@ class NetworkClient(QObject):
     userAgentChanged = Signal()
     configurationChanged = Signal()
 
-    loginUrl = Property(str, lambda self: "https://my.remarkable.com/device/desktop/connect",
-                        notify=serviceEnvironmentChanged)
+    # Without the scheme: Values.loginUrl is "https://" + this. The app's is the bare host
+    # (my.remarkable.com); this is the page with the one-time code (LoginWizard adds "#desktop").
+    loginUrl = Property(str, lambda self: PAIRING_URL.removeprefix("https://"), notify=serviceEnvironmentChanged)
     userAgent = Property(QByteArray, lambda self: QByteArray(user_agent().encode()), notify=userAgentChanged)
 
 

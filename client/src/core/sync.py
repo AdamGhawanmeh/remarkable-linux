@@ -540,6 +540,19 @@ class SyncClient:
         with self._busy:
             return self._apply_root(self.fetch_root())
 
+    def forget(self) -> None:
+        """Delete the cached library (blobs, materialised documents, sync state), as logging
+        out does; the cache directory itself and anything else in it stay."""
+        with self._busy:
+            self.blobs.clear()
+            shutil.rmtree(self.documents_dir, ignore_errors=True)
+            self.state_path.unlink(missing_ok=True)
+            with self._lock:
+                self.state = {"docs": {}}
+            self.root = None
+            self.root_index = None
+            self.tree = DocumentTree()
+
     def _apply_root(self, root: RootInfo) -> DocumentTree:
         """Make `root` the current tree and record it in the sync state."""
         self.root = root

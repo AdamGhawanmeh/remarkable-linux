@@ -12,6 +12,7 @@ a half-written token file behind.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -19,6 +20,8 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("rm.config")
 
 APP_DIR_NAME = "remarkable-linux"
 CONFIG_FILE = "config.json"
@@ -136,9 +139,15 @@ class AuthStore:
             if file_mode & 0o077:
                 # Tighten rather than fail: the file is ours, permissions drifted.
                 self.path.chmod(0o600)
-        raw = read_json(self.path)
+        try:
+            raw = read_json(self.path)
+        except (ValueError, UnicodeDecodeError) as err:
+            # Unreadable tokens are no tokens: the client asks to log in again, and the
+            # next pairing replaces the file.
+            log.warning("ignoring %s: %s", self.path, err)
+            raw = {}
         known = {f.name for f in fields(AuthState)}
-        state = AuthState(**{k: v for k, v in raw.items() if k in known})
+        state = AuthState(**{k: v for k, v in raw.items() if k in known and isinstance(v, str)})
         if not state.device_id:
             # deviceID is a stable per-installation UUID, generated once.
             state.device_id = str(uuid.uuid4())

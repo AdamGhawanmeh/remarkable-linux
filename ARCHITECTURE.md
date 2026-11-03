@@ -103,7 +103,30 @@ under (e.g. `TriangleItem` → `com.remarkable.Triangle`, `LinkProviderWrapper` 
   the library facade, `LibraryView`/`LibraryNavigator`/`LibrarySearch`, entry wrappers,
   `LibraryController` (→ Module 6 writes), `DocumentImporter`, `Settings`
   (persisted to `~/.config/remarkable-linux/settings.ini`), `ScreenShareClient`
-  (→ Module 7), ...
+  (→ Module 7), `Authentication` (→ Module 1, below), ...
+
+**Logging in.** Without a device token in `auth.json`, `Authentication.loggedIn` is false and
+main.qml's own `LoginWizard` covers the window: "Log in" opens
+`"https://" + NetworkClient.loginUrl + "#desktop"` (the app's `loginUrl` is the bare host
+`my.remarkable.com`; this client returns `my.remarkable.com/device/desktop/connect`, the page
+that shows the one-time code), `TokenEntryDialog` checks the code is 8 letters and calls
+`legacyLogin(code)`. `QuickApp` pairs in the background (`AuthClient.login`: device/new, then
+the first user token; a failure after pairing forgets the device token again) and reports
+`loginResult`/`loginErrorMessage` before emitting `loggedInChanged`, which the wizard reacts to
+(also on failure): HTTP 4xx from device/new → `InvalidOneTimeCode` (its help page), TLS
+errors → `SslCertificateTimeError`/`SslHandshakeError`, no connection → `NetworkError`. Once
+logged in, the wizard fades out and the sync fills the same window. Sync and Screen Share
+start only when logged in. `PlatformApp.logout()` (LogoutConfirmDialog) deletes the device on
+the server, forgets the tokens and the cached library; a device token the cloud rejects
+(DeviceRevokedError during a sync) shows the wizard again. The demo library is only `--demo`.
+
+**`Settings` is also a `com.remarkable` singleton.** Besides the `Settings` context property,
+the app registers the same class as a singleton named `Settings` in `com.remarkable`
+(`qmlregister(SingletonRegistration)` at 0x1400b35cd; the `ark.tokens` one is at
+0x1405d9a4e). QML resolves capitalised names to imported types before context properties,
+and enum values only through a type, never through an instance (checked on Qt 6.10.3 with a
+C++ `Item`, too). Without the singleton, `Settings.Prod` and `Settings.HomeSortOrder` are
+undefined: the code page showed "Service environment: Prod" and the sort order was not saved.
 - *Reconstructed from their paint code* (`bridge/items.py`, `images.py`):
   `DocumentCover` (0x140602e00: notebook spine `decorationScale·12`, quad-curve right
   corners of radius `decorationScale·18`, PDF dog-ear `decorationScale·40`),

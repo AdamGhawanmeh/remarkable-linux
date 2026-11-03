@@ -110,15 +110,12 @@ dist/remarkable-linux/remarkable-linux --offline  # the cached library only, no 
 dist/remarkable-linux/remarkable-linux --demo     # a built-in demo library, no account needed
 ```
 
-To connect your account, pair this computer once: get a one-time code from
-<https://my.remarkable.com/device/desktop/connect>, then run (it needs only Python's
-standard library, so it works after the build files are removed)
-
-```sh
-python3 client/tests/test_auth.py
-```
-
-Without a paired device the app opens the demo library.
+The first time you start it, the app shows reMarkable's own log-in screen. Click
+**Log in**: your browser opens <https://my.remarkable.com/device/desktop/connect>, which
+shows an 8-letter one-time code. Paste the code into the app and click **Pair the app**.
+Your library then syncs into the same window, and the app stays logged in from then on.
+**Account > Log out** removes this computer from your account and deletes the local
+copy of your library. The demo library opens only with `--demo`.
 
 Your data stays in your home directory, outside the checkout:
 

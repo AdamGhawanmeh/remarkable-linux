@@ -746,7 +746,7 @@ def main() -> int:
     step("Done")
     if decided.launcher:
         info("Start \"reMarkable Linux\" from your applications, or run:")
-    for flags, what in (("", "your library (pair this computer first: python3 client/tests/test_auth.py)"),
+    for flags, what in (("", "your library (the first start asks you to log in)"),
                         ("--demo", "the built-in demo library")):
         info(f"    {APP_BIN.relative_to(REPO)} {flags:<7} {what}")
     return 0

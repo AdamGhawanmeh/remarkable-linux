@@ -4,6 +4,10 @@ Reads: GET root and blobs (rm-filename required). Writes, as the live server is
 understood from the app (ARCHITECTURE.md §3.3): PUT blobs with rm-filename and an
 x-goog-hash CRC-32C that must match ("invalid checksum"), and PUT /sync/v3/root with
 the generation the change is based on; a stale generation is refused with 412.
+
+Auth (ARCHITECTURE.md §3.2): discovery names AUTH_HOST as "webapp"; a one-time code from
+`codes` (None: any code) buys a device token once, a device token a user token; deleted or
+`revoked` devices get HTTP 401.
 """
 
 from __future__ import annotations
@@ -13,10 +17,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from core.auth import AuthClient, HttpResponse
+from core.auth import AuthClient, HttpResponse, decode_jwt_claims
 from core.config import AuthState, AuthStore, Settings
 
 COLLECTION = "80000000"
+AUTH_HOST = "auth.invalid"
+DISCOVERY_URL = "https://internal.cloud.remarkable.com/discovery/v1/endpoints"
 
 
 def make_jwt(claims: dict) -> str:
@@ -64,6 +70,9 @@ class FakeCloud:
         self.conflict_status = 412
         self.before_commit = None            # called on each root PUT: another device syncing
         self.fail_next: list[int] = []       # statuses to answer the next requests with
+        self.codes: set[str] | None = None   # one-time codes still valid (None: any code)
+        self.device_tokens = {"device"}      # paired_auth's
+        self.revoked = False                 # the account no longer accepts this device
 
     # -- content ------------------------------------------------------------
 
@@ -119,9 +128,15 @@ class FakeCloud:
         self.requests.append(path)
         self.hosts.append(host)
         self.calls.append((method, path, dict(headers)))
+        if url == DISCOVERY_URL:
+            return HttpResponse(200, {}, json.dumps({"webapp": AUTH_HOST}).encode())
+        if host == AUTH_HOST:
+            return self._auth(path, headers, body)
         assert headers.get("Authorization", "").startswith("Bearer "), "missing auth"
         if self.fail_next:
             return HttpResponse(self.fail_next.pop(0), {}, b"")
+        if self.revoked:
+            return HttpResponse(401, {}, b"")
         if method == "PUT":
             return self._put(path, headers, body)
         if path == "/sync/v4/root":
@@ -140,6 +155,30 @@ class FakeCloud:
                 return HttpResponse(400, {}, b'{"message":"unexpected \'rm-filename\' http header"}')
             data = self.blobs.get(blob_hash)
             return HttpResponse(200, {}, data) if data is not None else HttpResponse(404, {}, b"")
+        return HttpResponse(404, {}, b"")
+
+    def _auth(self, path: str, headers: dict, body: bytes | None) -> HttpResponse:
+        bearer = headers.get("Authorization", "").removeprefix("Bearer ")
+        if path == "/token/json/2/device/new":
+            code = json.loads(body or b"{}").get("code", "")
+            if self.codes is not None and code not in self.codes:
+                return HttpResponse(400, {}, b"invalid one-time-code")
+            if self.codes is not None:
+                self.codes.discard(code)         # one-time
+            token = f"device-{len(self.device_tokens)}"
+            self.device_tokens.add(token)
+            return HttpResponse(200, {}, token.encode())
+        if path == "/token/json/2/user/new":
+            if self.revoked or bearer not in self.device_tokens:
+                return HttpResponse(401, {}, b"")
+            return HttpResponse(200, {}, make_jwt({"exp": 4_000_000_000, "device": bearer}).encode())
+        if path == "/token/json/3/device/delete":       # with the user token, or the device token
+            try:
+                device = decode_jwt_claims(bearer).get("device", bearer)
+            except ValueError:
+                device = bearer
+            self.device_tokens.discard(device)
+            return HttpResponse(200, {}, b"")
         return HttpResponse(404, {}, b"")
 
     def _put(self, path: str, headers: dict, body: bytes) -> HttpResponse:
@@ -207,6 +246,6 @@ def paired_auth(config_dir: Path, transport, **claims) -> AuthClient:
     """An AuthClient that already holds a long-lived user token (no auth traffic)."""
     store = AuthStore(config_dir)
     store.save(AuthState(device_id="00000000-0000-4000-8000-000000000000",
-                         device_token="device", auth_host="auth.invalid",
+                         device_token="device", auth_host=AUTH_HOST,
                          user_token=make_jwt({"exp": 4_000_000_000, **claims})))
     return AuthClient(Settings(), store, transport)

@@ -61,7 +61,11 @@ class AuthNetworkError(AuthError):
 
 
 class PairingError(AuthError):
-    """The server rejected the one-time code."""
+    """The server rejected the one-time code (`status`: its HTTP status, if it sent one)."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class NotPairedError(AuthError):
@@ -298,11 +302,13 @@ class AuthClient:
             "deviceID": self._state.device_id,
         }
         errors: list[str] = []
+        last_error: OSError | None = None
         for host in self.resolver.candidates():
             try:
                 resp = self._post(host, DEVICE_NEW_PATH, json_body=body)
             except OSError as err:
                 errors.append(f"{host}: {err}")
+                last_error = err
                 continue
             if resp.status == 404:
                 # Wrong host for this service; the code has not been consumed.
@@ -311,7 +317,8 @@ class AuthClient:
             if resp.status >= 400:
                 # Stop here: retrying a rejected code elsewhere could burn it.
                 raise PairingError(
-                    f"{host} rejected the one-time code (HTTP {resp.status}): {resp.text[:200]}")
+                    f"{host} rejected the one-time code (HTTP {resp.status}): {resp.text[:200]}",
+                    resp.status)
             token = resp.text
             if not token:
                 raise PairingError(f"{host} returned an empty device token")
@@ -322,7 +329,26 @@ class AuthClient:
                 self._save()
             log.info("paired via %s, device token %s", host, _mask(token))
             return token
-        raise AuthNetworkError("could not reach any auth host: " + "; ".join(errors))
+        # The cause keeps the socket/TLS error, so callers can tell e.g. a bad clock apart.
+        raise AuthNetworkError("could not reach any auth host: " + "; ".join(errors)) from last_error
+
+    def login(self, one_time_code: str) -> str:
+        """Pair with a one-time code, then fetch the first user token; returns it.
+
+        This is the app's log-in: it succeeds only once the account is usable. If the new
+        device token yields no user token, the device token is forgotten again, so a failed
+        log-in never leaves a half-paired auth.json behind (the next attempt needs a new
+        code anyway).
+        """
+        self.pair(one_time_code)
+        try:
+            return self.fetch_user_token()
+        except ValueError as err:          # not a JWT
+            self.forget()
+            raise AuthError(f"the server sent an invalid user token: {err}") from err
+        except AuthError:
+            self.forget()
+            raise
 
     # -- user token ---------------------------------------------------------
 
@@ -339,6 +365,7 @@ class AuthClient:
             host = self._auth_host()
             delay = 1.0
             last_error = ""
+            last_exception: OSError | None = None
             for attempt in range(USER_TOKEN_RETRIES + 1):
                 if attempt:
                     log.info("retrying user token in %.0fs (attempt %d)", delay, attempt)
@@ -348,6 +375,7 @@ class AuthClient:
                     resp = self._post(host, USER_NEW_PATH, bearer=self._state.device_token)
                 except OSError as err:
                     last_error = str(err)
+                    last_exception = err
                     continue
                 if resp.header(MIGRATE_AUTH_V2_HEADER) is not None:
                     log.info("server signalled auth v2 migration (%s)", MIGRATE_AUTH_V2_HEADER)
@@ -372,7 +400,7 @@ class AuthClient:
                          time.strftime("%F %T", time.localtime(token_expiry(token) or 0)))
                 self._reschedule()
                 return token
-            raise AuthNetworkError(f"exhausted retries fetching user token: {last_error}")
+            raise AuthNetworkError(f"exhausted retries fetching user token: {last_error}") from last_exception
 
     def needs_refresh(self) -> bool:
         token = self._state.user_token
@@ -466,15 +494,23 @@ class AuthClient:
 
     # -- logout -------------------------------------------------------------
 
-    def unpair(self) -> None:
-        """Best-effort server-side device delete, then forget local tokens."""
+    def unpair(self, remote: bool = True) -> None:
+        """Best-effort server-side device delete (unless `remote` is False, e.g. offline),
+        then forget local tokens."""
         self.stop_auto_refresh()
         with self._lock:
-            if self._state.device_token:
+            if remote and self._state.device_token:
                 try:
                     token = self._state.user_token or self._state.device_token
                     resp = self._post(self._auth_host(), DEVICE_DELETE_PATH, bearer=token)
                     log.info("device delete returned HTTP %d", resp.status)
                 except OSError as err:
                     log.warning("device delete failed (%s); clearing local tokens anyway", err)
+            self.forget()
+
+    def forget(self) -> None:
+        """Drop the device and user tokens from memory and auth.json (the device ID stays)."""
+        self.stop_auto_refresh()
+        with self._lock:
             self._state = self.store.clear_tokens()
+            self._stale = False

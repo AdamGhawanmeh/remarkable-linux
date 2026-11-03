@@ -299,20 +299,21 @@ class LiveViewService:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._ready.clear()            # started again after stop(): wait for the new loop
         self._thread = threading.Thread(target=self._run, name="liveview", daemon=True)
         self._thread.start()
         self._ready.wait(10)
 
     def _run(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.set_exception_handler(self._loop_error)
-        self._listener = self.loop.create_task(self._listen())
-        self.loop.call_soon(self._ready.set)
+        self.loop = loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.set_exception_handler(self._loop_error)
+        self._listener = loop.create_task(self._listen())
+        loop.call_soon(self._ready.set)
         try:
-            self.loop.run_forever()
+            loop.run_forever()
         finally:
-            self.loop.close()
+            loop.close()
 
     def _loop_error(self, loop: asyncio.AbstractEventLoop, context: dict) -> None:
         """An exception nobody awaited (e.g. inside aiortc's connect task): end the
@@ -330,6 +331,7 @@ class LiveViewService:
         self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join(timeout)
         self._thread = None
+        self.loop = None               # closed; requests fail fast until start() again
 
     async def _shutdown(self) -> None:
         if self.session is not None:

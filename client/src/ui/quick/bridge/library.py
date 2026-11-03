@@ -108,6 +108,7 @@ class LibraryView(QObject):
         self._ignore_parent = False
         self._filter_tags: list[str] = []
         self._ids: list[str] = []
+        self._staged: bool | None = None     # entryIds taken in a library change, not yet announced
         self._timer = QTimer(self, singleShot=True, interval=0)
         self._timer.timeout.connect(self.updateNow)
 
@@ -116,10 +117,12 @@ class LibraryView(QObject):
         if library is self._library:
             return
         if self._library is not None:
-            self._library.changed.disconnect(self.scheduleUpdateEntries)
+            self._library.changing.disconnect(self._stage)
+            self._library.changed.disconnect(self._library_changed)
         self._library = library
         if library is not None:
-            library.changed.connect(self.scheduleUpdateEntries)
+            library.changing.connect(self._stage)
+            library.changed.connect(self._library_changed)
         self.libraryChanged.emit()
         self.scheduleUpdateEntries()
 
@@ -209,11 +212,31 @@ class LibraryView(QObject):
 
     @Slot()
     def updateNow(self) -> None:
+        if self._take_ids():
+            self.entryIdsChanged.emit()
+
+    def _take_ids(self) -> bool:
         self._timer.stop()
         self._update_root()
         ids = [n.id for n in self._sorted(self._select())] if self._library is not None else []
-        if ids != self._ids:
-            self._ids = ids
+        if ids == self._ids:
+            return False
+        self._ids = ids
+        return True
+
+    # A library change reaches the views in two steps, Library.changing then .changed: views
+    # without a coalescing interval take their new ids in the first and announce them in the
+    # second, so each one's handlers already read the other views' new ids (ContentEntries
+    # joins the folder and document views' lists; one stale list names entries now gone).
+    def _stage(self) -> None:
+        if self._timer.interval() == 0:
+            self._staged = self._take_ids()
+
+    def _library_changed(self) -> None:
+        staged, self._staged = self._staged, None
+        if staged is None:
+            self.scheduleUpdateEntries()
+        elif staged:
             self.entryIdsChanged.emit()
 
     def _update_root(self) -> None:
@@ -769,6 +792,7 @@ class Library(QObject):
     entryImported = Signal(str, str)
     errorMessage = Signal(str)
     readyChanged = Signal(bool)
+    changing = Signal()          # before `changed`: LibraryView takes its new ids
     changed = Signal()
     statusChanged = Signal(str)
 
@@ -777,12 +801,15 @@ class Library(QObject):
         self._now = now
         self.tree = DocumentTree()
         self._entries: dict[str, EntryWrapper] = {}
+        self._retired: list[EntryWrapper] = []
         self._ready = False
 
     def now_ms(self) -> int:
         return _ms(self._now() if self._now else datetime.now(timezone.utc))
 
-    def set_tree(self, tree: DocumentTree) -> None:
+    def set_tree(self, tree: DocumentTree, reset: bool = False) -> None:
+        """Show `tree`. Entries that left it are reported (entriesDeleted, ...) unless
+        `reset`: a different library replaces this one (logging out), nothing was deleted."""
         old = self.tree
         self.tree = tree
         for node in tree.nodes.values():
@@ -790,8 +817,15 @@ class Library(QObject):
             if entry is not None and entry.node is not node:
                 entry.update(node)
         gone = [i for i in self._entries if i not in tree]
-        for i in gone:
-            self._entries.pop(i).deleteLater()
+        # Wrappers of removed entries are freed one change later: views drop their
+        # delegates on a timer, and a delegate whose entry is freed first reads null.
+        for entry in self._retired:
+            entry.deleteLater()
+        self._retired = [self._entries.pop(i) for i in gone]
+        self.changing.emit()
+        if reset:
+            self.changed.emit()
+            return
         added = [i for i in tree.nodes if i not in old]
         trashed = [i for i in tree.nodes if i in old and tree.is_trashed(i) and not old.is_trashed(i)]
         restored = [i for i in tree.nodes if i in old and old.is_trashed(i) and not tree.is_trashed(i)]

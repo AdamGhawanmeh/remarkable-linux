@@ -2,7 +2,13 @@
 
     app = QuickApp(source, cache_dir, config_dir=..., liveview_factory=...)
     app.load()            # registers resources, fonts, translations, types; loads main.qml
-    app.start(sync=True)
+    app.start(sync=True)  # the cached library, then (logged in) Screen Share and a sync
+
+Logging in and out is the app's own flow: logged out (no device token in auth.json), main.qml's
+LoginWizard covers the window and asks for the one-time code from my.remarkable.com; QuickApp
+pairs in the background (AuthClient.login) and, once paired, syncs the library into the same
+window. Log out (LogoutConfirmDialog) deletes this device on the server, the tokens and the
+cached library, and shows the wizard again; so does the cloud rejecting the device token.
 
 Everything on screen is the official QML from the app's resources (qrc:/qml/main.qml and
 what it imports, unmodified), over Python implementations of the app's C++ types
@@ -16,6 +22,7 @@ assert that every binding resolved.
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Callable
 
@@ -27,20 +34,23 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from core.models import DocumentTree
 
 from ..library import LibrarySource
-from ..workers import Mutator, Syncer
+from ..workers import Account, Mutator, Syncer
 from . import assets
 from .bridge import Singletons, register_types, use_singletons
 from .bridge.images import DragIconImageProvider, ThumbnailImageProvider
 from .bridge.importer import DocumentImporter
 from .bridge.library import DocumentSelection, DocumentSync, Library, LibraryController
-from .bridge.platform import (ArkIconProvider, ArkTokensSettings, Authentication, Clipboard, DocumentController,
-                              HandwritingLanguageModel, LanguageSettings, LinkProvider, NetworkClient, PlatformApp,
-                              PlatformHelpers, Settings, SettingsStore, UserInfo)
+from .bridge.platform import (LOGIN_RESULTS, ArkIconProvider, ArkTokensSettings, Authentication, Clipboard,
+                              DocumentController, HandwritingLanguageModel, LanguageSettings, LinkProvider,
+                              NetworkClient, PlatformApp, PlatformHelpers, Settings, SettingsStore, UserInfo,
+                              login_result)
 from .bridge.scene import Recognizer, set_page_source
 from .bridge.screenshare import ScreenShareClient
 
 log = logging.getLogger("rm.ui.quick")
 MAIN_URL = QUrl("qrc:/qml/main.qml")
+OFFLINE_LOGIN = "reMarkable is running offline (--offline). Restart it without --offline to log in."
+LOGGED_OUT_BY_CLOUD = "This app is no longer connected to your reMarkable account. Log in again with a new code."
 IMPORT_PATHS = ("qrc:/qml", "qrc:/ark-imports")
 TRANSLATION = ":/i18n/translations/reMarkable_{}.qm"
 # qrc files replaced by this client's (path -> file); none: the app's QML runs as shipped.
@@ -76,6 +86,10 @@ class QuickApp:
         self.library = Library(now=now)
         self.mutator = Mutator(source)
         self.syncer = Syncer(source)
+        self.auth = source.sync.auth
+        self.account = Account(self.auth)
+        self.sync_on_login = True
+        self._online = False             # Screen Share started for this log-in
         store = SettingsStore(config_dir / "settings.ini" if config_dir else None)
         self.singletons = Singletons(
             library=self.library,
@@ -84,8 +98,10 @@ class QuickApp:
             document_sync=DocumentSync(),
             screen_share=ScreenShareClient(liveview_factory),
             settings=Settings(store), ark_settings=ArkTokensSettings(),
-            platform_helpers=PlatformHelpers(store), platform_app=PlatformApp(),
-            authentication=Authentication(logged_in=True), user_info=UserInfo(),
+            platform_helpers=PlatformHelpers(store), platform_app=PlatformApp(on_logout=self.logout),
+            # Offline there is no logging in: the cached library is all there is.
+            authentication=Authentication(self.auth.is_paired or source.cached_only, login=self.login),
+            user_info=UserInfo(),
             network_client=NetworkClient(), document_controller=DocumentController(self.library),
             clipboard=Clipboard(), language=LanguageSettings(store), link=LinkProvider(),
             handwriting=HandwritingLanguageModel(), recognizer=Recognizer())
@@ -103,6 +119,68 @@ class QuickApp:
         self.syncer.started.connect(lambda: s.document_sync.set_state(True))
         self.syncer.finished.connect(self._synced)
         self.syncer.failed.connect(self._sync_failed)
+        self.syncer.unauthorized.connect(self._unauthorized)
+        self.account.loggedIn.connect(self._logged_in)
+        self.account.loginFailed.connect(self._login_failed)
+        self.account.loggedOut.connect(self._logged_out)
+
+    @property
+    def logged_in(self) -> bool:
+        return self.singletons.authentication._logged_in
+
+    # -- logging in and out ----------------------------------------------------------
+
+    def login(self, code: str) -> None:
+        """Authentication.legacyLogin: pair with the one-time code in the background."""
+        if self.source.cached_only:
+            self.singletons.authentication.failed(LOGIN_RESULTS["NetworkError"], OFFLINE_LOGIN)
+            return
+        self.account.login(code)
+
+    def _logged_in(self) -> None:
+        log.info("logged in")
+        self.singletons.authentication.succeeded()
+        self._go_online(sync=self.sync_on_login)
+
+    def _login_failed(self, error: Exception) -> None:
+        log.warning("log-in failed: %s: %s", type(error).__name__, error)
+        self.singletons.authentication.failed(*login_result(error))
+
+    def logout(self) -> None:
+        """PlatformApp.logout: delete this device on the server and forget the tokens and
+        the cached library ("Logging out will remove all documents from this app")."""
+        self._go_offline()
+        self.account.logout(remote=not self.source.cached_only, after=self._forget_library)
+
+    def _forget_library(self) -> None:          # on the Account worker thread
+        self.syncer.wait()
+        self.mutator.wait()
+        self.source.forget()
+        shutil.rmtree(self.cache_dir / "thumbnails", ignore_errors=True)
+
+    def _logged_out(self) -> None:
+        log.info("logged out")
+        self.library.set_tree(DocumentTree(), reset=True)
+        self.singletons.authentication.logged_out()
+
+    def _unauthorized(self, message: str) -> None:
+        """The cloud rejected the device token (revoked on my.remarkable.com): log in again.
+        The cached library stays until then."""
+        self._sync_failed(message)
+        self._go_offline()
+        self.singletons.authentication.failed(LOGIN_RESULTS["GenericError"], LOGGED_OUT_BY_CLOUD)
+
+    def _go_online(self, sync: bool) -> None:
+        if not self._online:
+            self._online = True
+            self.singletons.screen_share.start()
+        if sync:
+            self.syncer.refresh()
+
+    def _go_offline(self) -> None:
+        if self._online:
+            self._online = False
+            self.singletons.screen_share.shutdown()
 
     def _synced(self, tree: DocumentTree) -> None:
         self.set_tree(tree)
@@ -169,14 +247,17 @@ class QuickApp:
         self.library.set_tree(tree)
 
     def start(self, sync: bool = True) -> None:
+        """Show the cached library; logged in, also start Screen Share and (`sync`) a sync.
+        Logged out, both wait for the log-in, which always syncs (unless sync_on_login is
+        cleared)."""
         self.set_tree(self.source.load_cached())
-        self.singletons.screen_share.start()
-        if sync:
-            self.syncer.refresh()
+        if self.logged_in:
+            self._go_online(sync)
 
     def shutdown(self) -> None:
         self.closing = True
         self.singletons.screen_share.shutdown()
+        self.account.wait(60000)
         self.mutator.wait(120000)
         self.syncer.wait(5000)
         for provider in (self.thumbnails, self.icons):
