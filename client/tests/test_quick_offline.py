@@ -696,7 +696,7 @@ class WorkflowTests(unittest.TestCase):
     def test_export_problems_are_reported(self):
         notices = len(self.notices)
         self.assertFalse(self.export(self.out / "no-such-folder" / "x.pdf", demo_id("Sketchbook")))
-        self.assertFalse(self.export(self.out, demo_id("Sketchbook"), "ExportSvg"))
+        self.assertFalse(self.export(self.out, demo_id("Sketchbook"), "ExportRmHtml"))
         self.assertIn("no such folder", self.notices[notices])
         self.assertEqual(self.notices[notices + 1], "This export format is not available on Linux")
         epub = self.epub()                                         # nothing to draw yet: fails in the worker
@@ -841,6 +841,30 @@ class WorkflowTests(unittest.TestCase):
         self.wait_exported(paper)
         self.assertEqual([p.name for p in (folder / "Research paper 2").iterdir()], ["Research paper - 3.png"])
         self.assertEqual(sorted(p.name for p in folder.iterdir()), ["Research paper", "Research paper 2"])
+
+    def test_export_svg(self):
+        import xml.etree.ElementTree as ET
+        paper, notes = demo_id("Research paper"), demo_id("Meeting notes")
+        folder = self.out / "vector"
+        folder.mkdir()
+        entry = self.app.library.entryForId(paper)
+        self.assertTrue(self.export(folder, paper, "ExportSvg"))
+        self.assertTrue(entry.property("isExporting"))
+        self.wait_exported(paper)
+        self.assertEqual(entry.property("status"), int(library.EntryWrapper.Status.Ok))
+        self.assertIn(f"Exported to {folder / 'Research paper'}", self.notices)
+        files = sorted((folder / "Research paper").iterdir())
+        self.assertEqual([f.name for f in files], [f"Research paper - {n}.svg" for n in (1, 2, 3)])
+        svg = "{http://www.w3.org/2000/svg}"
+        roots = [ET.parse(f).getroot() for f in files]
+        self.assertEqual([r.find(f"{svg}image") is not None for r in roots], [True, False, True])   # PDF pages
+        self.assertEqual(roots[1].get("viewBox"), "0 0 1404 1872")                                   # the note page
+        # A notebook, picked pages: vector only, one file per page.
+        self.assertTrue(self.export(folder, notes, "ExportSvg", pages=[0]))
+        self.wait_exported(notes)
+        only = list((folder / "Meeting notes").iterdir())
+        self.assertEqual([f.name for f in only], ["Meeting notes - 1.svg"])
+        self.assertLess(only[0].stat().st_size, 100_000)
 
     def test_abort_export(self):
         import threading

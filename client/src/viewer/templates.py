@@ -263,33 +263,66 @@ def _repeat_offsets(mode: Any, start: float, step: float, lo: float, hi: float, 
     return list(range(max(0, count)))
 
 
-def paint_template(painter, template: Template, area: tuple[float, float, float, float],
-                   width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT) -> None:
-    """Draw `template` with an active QPainter in page coordinates, covering `area`
-    (x, y, w, h); repeats extend to fill it."""
-    from PySide6.QtCore import QPointF, Qt
-    from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QPainter, QPainterPath, QPen
+@dataclass(frozen=True)
+class TemplatePath:
+    """One path instance of a template, in page coordinates."""
+    commands: tuple[tuple[str, tuple[tuple[float, float], ...]], ...]   # ("M"|"L"|"C"|"Z", points)
+    stroke: tuple[str, int] | None      # ("#rrggbb", alpha 0..255); None: no stroke
+    fill: tuple[str, int] | None
+    stroke_width: float
+    antialiasing: bool
 
+
+@dataclass(frozen=True)
+class TemplateText:
+    text: str
+    size: int            # pixel size, as drawn
+    x: float             # baseline start, page coordinates
+    baseline: float
+
+
+# text_metrics(text, pixel_size) -> (advance width, ascent), in page pixels
+TextMetrics = Callable[[str, int], tuple[float, float]]
+
+
+def _qt_font(size: int):
+    from PySide6.QtGui import QFont
+    font = QFont()
+    font.setFamilies(list(FONT_FAMILIES))
+    font.setPixelSize(max(1, size))
+    return font
+
+
+def qt_text_metrics(text: str, size: int) -> tuple[float, float]:
+    from PySide6.QtGui import QFontMetricsF
+    metrics = QFontMetricsF(_qt_font(size))
+    return metrics.horizontalAdvance(text), metrics.ascent()
+
+
+def _color(value: str | None, default: str | None) -> tuple[str, int] | None:
+    value = value or default
+    if value is None:
+        return None
+    if not re.fullmatch(r"#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", value):
+        raise TemplateError(f"invalid color, expected '#RRGGBB'-style string: {value!r}")
+    # #RRGGBBAA as in the shipped "#00000000"
+    return value[:7].lower(), int(value[7:], 16) if len(value) == 9 else 255
+
+
+def template_shapes(template: Template, area: tuple[float, float, float, float],
+                    width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT,
+                    text_metrics: TextMetrics = qt_text_metrics):
+    """The template's paths and texts, in drawing order and page coordinates, covering
+    `area` (x, y, w, h): repeats extend to fill it. paint_template and template_svg
+    both draw these, so the two cannot differ."""
     ax, ay, aw, ah = area
     budget = [MAX_INSTANCES]
 
-    def color(value: str | None, default: str | None) -> QColor | None:
-        value = value or default
-        if value is None:
-            return None
-        if not re.fullmatch(r"#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", value):
-            raise TemplateError(f"invalid color, expected '#RRGGBB'-style string: {value!r}")
-        if len(value) == 9:            # #RRGGBBAA as in the shipped "#00000000"
-            c = QColor(value[:7])
-            c.setAlpha(int(value[7:], 16))
-            return c
-        return QColor(value)
-
-    def draw_path(item: dict, env: dict, ox: float, oy: float) -> None:
+    def path(item: dict, env: dict, ox: float, oy: float) -> TemplatePath:
         data = item.get("data") or []
         if not data:
             raise TemplateError("path 'data' is empty or missing")
-        path, i = QPainterPath(), 0
+        commands, i = [], 0
         args = {"M": 2, "L": 2, "C": 6, "Z": 0}
         while i < len(data):
             cmd = data[i]
@@ -298,36 +331,19 @@ def paint_template(painter, template: Template, area: tuple[float, float, float,
             values = [evaluate(v, env) for v in data[i + 1:i + 1 + args[cmd]]]
             if len(values) != args[cmd]:
                 raise TemplateError(f"path command {cmd!r} needs {args[cmd]} values")
-            pts = [QPointF(ox + values[j], oy + values[j + 1]) for j in range(0, len(values), 2)]
-            if cmd == "M":
-                path.moveTo(pts[0])
-            elif cmd == "L":
-                path.lineTo(pts[0])
-            elif cmd == "C":
-                path.cubicTo(*pts)
-            else:
-                path.closeSubpath()
+            commands.append((cmd, tuple((ox + values[j], oy + values[j + 1]) for j in range(0, len(values), 2))))
             i += 1 + args[cmd]
-        stroke = color(item.get("strokeColor"), "#000000")
-        fill = color(item.get("fillColor"), None)
-        if (stroke is None or stroke.alpha() == 0) and (fill is None or fill.alpha() == 0):
+        stroke = _color(item.get("strokeColor"), "#000000")
+        fill = _color(item.get("fillColor"), None)
+        if (stroke is None or stroke[1] == 0) and (fill is None or fill[1] == 0):
             raise TemplateError("illegal combination of 'strokeColor' and 'fillColor', path is fully invisible")
-        # "antialiasing": false keeps 1-px features (dots) crisp at native size; when
-        # downscaled it would make them alias into moiré bands, so it is honoured
-        # only at >= 1 device pixel per page pixel.
-        native = abs(painter.worldTransform().determinant()) >= 1.0
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing,
-                              bool(item.get("antialiasing", True)) or not native)
-        if stroke is not None and stroke.alpha():
-            painter.setPen(QPen(stroke, float(item.get("strokeWidth", 1))))
-        else:
-            painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(fill) if fill is not None and fill.alpha() else Qt.BrushStyle.NoBrush)
-        painter.drawPath(path)
+        return TemplatePath(tuple(commands), stroke if stroke is not None and stroke[1] else None,
+                            fill if fill is not None and fill[1] else None,
+                            float(item.get("strokeWidth", 1)), bool(item.get("antialiasing", True)))
 
-    def draw_text(item: dict, env: dict, ox: float, oy: float) -> None:
-        text = item.get("text")
-        if not text:
+    def text(item: dict, env: dict, ox: float, oy: float) -> TemplateText:
+        value = item.get("text")
+        if not value:
             raise TemplateError("'text' property cannot be empty")
         size = evaluate(item.get("fontSize", 0), env)
         if size <= 0:
@@ -335,18 +351,14 @@ def paint_template(painter, template: Template, area: tuple[float, float, float,
         position = item.get("position")
         if not position:
             raise TemplateError("'position' is empty or missing")
-        font = QFont()
-        font.setFamilies(list(FONT_FAMILIES))
-        font.setPixelSize(max(1, round(size)))
-        metrics = QFontMetricsF(font)
-        local = dict(env, textWidth=metrics.horizontalAdvance(text))
+        pixels = max(1, round(size))
+        advance, ascent = text_metrics(value, pixels)
+        local = dict(env, textWidth=advance)
         x, y = evaluate(position.get("x", 0), local), evaluate(position.get("y", 0), local)
-        painter.setFont(font)
-        painter.setPen(QColor("#000000"))
-        painter.drawText(QPointF(ox + x, oy + y + metrics.ascent()), text)
+        return TemplateText(value, pixels, ox + x, oy + y + ascent)
 
-    def draw_items(items, env: dict, ox: float, oy: float) -> None:
-        for item in items:
+    def items(entries, env: dict, ox: float, oy: float):
+        for item in entries:
             kind = item.get("type")
             if kind == "group":
                 box = item.get("boundingBox")
@@ -367,19 +379,144 @@ def paint_template(painter, template: Template, area: tuple[float, float, float,
                             raise TemplateError(f"template {template.name!r} repeats too many times")
                         ix, iy = bx + c * bw, by + r * bh
                         child_env = dict(env, parentX=ix, parentY=iy, parentWidth=bw, parentHeight=bh)
-                        draw_items(children, child_env, ix, iy)
+                        yield from items(children, child_env, ix, iy)
             elif kind == "path":
-                draw_path(item, env, ox, oy)
+                yield path(item, env, ox, oy)
             elif kind == "text":
-                draw_text(item, env, ox, oy)
+                yield text(item, env, ox, oy)
             else:
                 raise TemplateError(f"unknown item type {kind!r}")
 
+    yield from items(template.items, template_environment(template, width, height), 0.0, 0.0)
+
+
+def paint_template(painter, template: Template, area: tuple[float, float, float, float],
+                   width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT) -> None:
+    """Draw `template` with an active QPainter in page coordinates, covering `area`
+    (x, y, w, h); repeats extend to fill it."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen
+
+    def qcolor(value: tuple[str, int]) -> QColor:
+        color = QColor(value[0])
+        color.setAlpha(value[1])
+        return color
+
     painter.save()
     try:
-        draw_items(template.items, template_environment(template, width, height), 0.0, 0.0)
+        for shape in template_shapes(template, area, width, height):
+            if isinstance(shape, TemplateText):
+                painter.setFont(_qt_font(shape.size))
+                painter.setPen(QColor("#000000"))
+                painter.drawText(QPointF(shape.x, shape.baseline), shape.text)
+                continue
+            path = QPainterPath()
+            for cmd, pts in shape.commands:
+                points = [QPointF(*p) for p in pts]
+                if cmd == "M":
+                    path.moveTo(points[0])
+                elif cmd == "L":
+                    path.lineTo(points[0])
+                elif cmd == "C":
+                    path.cubicTo(*points)
+                else:
+                    path.closeSubpath()
+            # "antialiasing": false keeps 1-px features (dots) crisp at native size; when
+            # downscaled it would make them alias into moiré bands, so it is honoured
+            # only at >= 1 device pixel per page pixel.
+            native = abs(painter.worldTransform().determinant()) >= 1.0
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, shape.antialiasing or not native)
+            painter.setPen(QPen(qcolor(shape.stroke), shape.stroke_width) if shape.stroke else Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(qcolor(shape.fill)) if shape.fill else Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
     finally:
         painter.restore()
+
+
+def _num(value: float) -> str:
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def _svg_paint(attr: str, value: tuple[str, int] | None) -> str:
+    if value is None:
+        return f' {attr}="none"'
+    opacity = f' {attr}-opacity="{value[1] / 255:.4g}"' if value[1] < 255 else ""
+    return f' {attr}="{value[0]}"{opacity}'
+
+
+def _outside(shape: TemplatePath, area: tuple[float, float, float, float]) -> bool:
+    """Whether a path cannot touch `area`: a path lies within the box of its points
+    (Bézier curves within their control points), grown by the pen."""
+    xs = [x for _, pts in shape.commands for x, _ in pts]
+    ys = [y for _, pts in shape.commands for _, y in pts]
+    if not xs:
+        return True
+    pad = shape.stroke_width / 2 + 1 if shape.stroke else 0.0
+    ax, ay, aw, ah = area
+    return max(xs) + pad < ax or min(xs) - pad > ax + aw or max(ys) + pad < ay or min(ys) - pad > ay + ah
+
+
+def template_svg(template: Template, area: tuple[float, float, float, float],
+                 width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT,
+                 text_metrics: TextMetrics = qt_text_metrics) -> list[str]:
+    """The template as SVG elements in page coordinates (one group), drawn as
+    paint_template draws it: QPen's square caps and bevel joins, QPainterPath's even-odd
+    fill, and a zero stroke width as Qt's one-pixel cosmetic pen. Everything is
+    antialiased (an SVG has no native pixel size).
+
+    Kept small: consecutive paths of one style share a group that carries the style;
+    outlines in an opaque colour share one <path> (translucent ones would darken where
+    they cross, as separate paths do); paths wholly outside `area` (repeats run past the
+    page) are left out."""
+    from xml.sax.saxutils import escape, quoteattr
+
+    out = [f'<g id="template" data-name={quoteattr(template.name)}>']
+    pending: tuple[tuple, list[str]] | None = None
+
+    def attributes(style: tuple) -> str:
+        stroke, fill, stroke_width = style
+        if stroke is None:
+            text = ' stroke="none"'
+        else:
+            cosmetic = ' vector-effect="non-scaling-stroke"' if stroke_width == 0 else ""
+            text = (_svg_paint("stroke", stroke) + f' stroke-width="{_num(stroke_width or 1)}"'
+                    f' stroke-linecap="square" stroke-linejoin="bevel"{cosmetic}')
+        return text + _svg_paint("fill", fill) + (' fill-rule="evenodd"' if fill is not None else "")
+
+    def flush() -> None:
+        nonlocal pending
+        if pending is None:
+            return
+        style, data = pending
+        stroke, fill, _ = style
+        if len(data) == 1 or (fill is None and stroke is not None and stroke[1] == 255):
+            out.append(f'<path d="{" ".join(data)}"{attributes(style)}/>')
+        else:
+            out.append(f'<g{attributes(style)}>')
+            out.extend(f'<path d="{d}"/>' for d in data)
+            out.append("</g>")
+        pending = None
+
+    for shape in template_shapes(template, area, width, height, text_metrics):
+        if isinstance(shape, TemplateText):
+            flush()
+            families = ", ".join(f"'{f}'" if " " in f else f for f in FONT_FAMILIES)
+            out.append(f'<text x="{_num(shape.x)}" y="{_num(shape.baseline)}" font-family="{families}" '
+                       f'font-size="{shape.size}" fill="#000000">{escape(shape.text)}</text>')
+            continue
+        if _outside(shape, area):
+            continue
+        data = " ".join(cmd + "".join(f" {_num(x)} {_num(y)}" for x, y in pts) for cmd, pts in shape.commands)
+        style = (shape.stroke, shape.fill, shape.stroke_width)
+        if pending is not None and pending[0] == style:
+            pending[1].append(data)
+        else:
+            flush()
+            pending = (style, [data])
+    flush()
+    out.append("</g>")
+    return out
 
 
 def parse_pagedata(data: bytes) -> list[str]:

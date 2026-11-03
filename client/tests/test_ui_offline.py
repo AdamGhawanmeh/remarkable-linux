@@ -6,12 +6,17 @@ Run: python3 -m unittest discover -s client/tests -p 'test_*offline.py'
 
 from __future__ import annotations
 
+import base64
 import gc
 import io
+import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,11 +47,12 @@ from ui.pages import (PDF_PX_PER_PT, DocumentPages, PageContent, PdfFile, cover_
 from ui.theme import Colors, icon_image  # noqa: E402
 from ui.workers import Exporter, PageRenderer, Syncer, ThumbnailService  # noqa: E402
 from ui import export as export_module  # noqa: E402
-from ui.export import PDF_FILTER, RMDOC_FILTER, export_file_name, export_pdf  # noqa: E402
+from ui.export import PDF_FILTER, RMDOC_FILTER, export_file_name, export_pdf, export_svg, page_svg  # noqa: E402
 from viewer.renderer import render_image  # noqa: E402
 from viewer.rm_parser import parse  # noqa: E402
 from viewer.templates import (TemplateError, TemplateLibrary, _repeat_offsets, compile_expression,  # noqa: E402
-                              default_library, evaluate, paint_template, parse_pagedata, parse_template)
+                              default_library, evaluate, paint_template, parse_pagedata, parse_template,
+                              template_svg)
 
 CLOUD = build_demo_cloud()          # built once: generating handwriting/PDFs takes a moment
 
@@ -1242,6 +1248,156 @@ class ExportTests(DemoCase):
         offline.export("rmdoc", self.doc("Sketchbook"), str(self.dir / "o"))
         settle(offline.pool)
         self.assertTrue(results[-1].startswith("SyncError"))        # empty offline cache: reported, not raised
+
+
+# --------------------------------------------------------------------- SVG export
+
+SVG = "{http://www.w3.org/2000/svg}"
+
+
+def svg_image(svg: str, size: QSize) -> QImage:
+    """`svg` drawn by Qt's SVG renderer onto white, at `size` pixels."""
+    from PySide6.QtCore import QByteArray, QRectF
+    from PySide6.QtGui import QPainter
+    from PySide6.QtSvg import QSvgRenderer
+    renderer = QSvgRenderer(QByteArray(svg.encode()))
+    image = QImage(size, QImage.Format.Format_RGB32)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    renderer.render(painter, QRectF(0, 0, size.width(), size.height()))
+    painter.end()
+    return image
+
+
+def differing(a: QImage, b: QImage, threshold: int = 96, step: int = 3) -> float:
+    """Fraction of sampled pixels whose colour differs by more than `threshold` (0-255)."""
+    a, b = a.convertToFormat(QImage.Format.Format_RGB32), b.convertToFormat(QImage.Format.Format_RGB32)
+    assert a.size() == b.size(), (a.size(), b.size())
+    off = n = 0
+    for y in range(0, a.height(), step):
+        for x in range(0, a.width(), step):
+            pa, pb = a.pixel(x, y), b.pixel(x, y)
+            n += 1
+            off += max(abs(((pa >> s) & 255) - ((pb >> s) & 255)) for s in (0, 8, 16)) > threshold
+    return off / n
+
+
+def template_named(name: str):
+    template = default_library().get(name)
+    assert template is not None, name
+    return template
+
+
+class SvgTemplateTests(unittest.TestCase):
+    def svg(self, template, area=(0, 0, 1404, 1872)) -> str:
+        x, y, w, h = area
+        return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x} {y} {w} {h}" width="{w}" height="{h}">'
+                + "".join(template_svg(template, area)) + "</svg>")
+
+    def test_draws_like_painting(self):
+        # Lines, grid, dots (filled squares), curves and fills (piano), text (checklist, planner).
+        for name in ("P Lines small", "P Grid medium", "P Dots S", "P Piano sheet medium", "P Checklist"):
+            template = template_named(name)
+            painted = template_image(template)
+            drawn = svg_image(self.svg(template), painted.size())
+            self.assertLess(differing(painted, drawn), 0.003, template.name)
+
+    def test_compact(self):
+        lines = ET.fromstring(self.svg(template_named("P Lines small")))
+        paths = lines.findall(f".//{SVG}path")
+        self.assertEqual(len(paths), 1)                                   # every rule in one path
+        self.assertEqual(paths[0].get("d").count("M"), 37)                # 0, 52, ... 1872
+        self.assertEqual((paths[0].get("stroke-linecap"), paths[0].get("fill")), ("square", "none"))
+        dots = self.svg(template_named("P Dots S"))
+        self.assertLess(len(dots), 120_000)
+        group = ET.fromstring(dots).find(f"{SVG}g/{SVG}g")                # the dots share their style
+        self.assertEqual(group.get("fill-rule"), "evenodd")
+        self.assertGreater(len(group), 1000)
+        for path in ET.fromstring(dots).iter(f"{SVG}path"):              # repeats past the page are left out
+            values = [float(v) for v in path.get("d").split() if v not in "MLCZ"]
+            xs, ys = values[0::2], values[1::2]
+            self.assertTrue(max(xs) >= -2 and min(xs) <= 1406 and max(ys) >= -2 and min(ys) <= 1874)
+
+    def test_translucent_lines_stay_separate(self):
+        # Merged, crossing translucent lines would not darken where they cross, as Qt draws them.
+        template = parse_template(json.dumps({"name": "cross", "formatVersion": 1, "items": [
+            {"type": "path", "data": ["M", 0, 50, "L", 100, 50], "strokeColor": "#00000080"},
+            {"type": "path", "data": ["M", 50, 0, "L", 50, 100], "strokeColor": "#00000080"}]}))
+        root = ET.fromstring(self.svg(template, (0, 0, 100, 100)))
+        group = root.find(f"{SVG}g/{SVG}g")
+        self.assertEqual((len(group), group.get("stroke-opacity")), (2, "0.502"))
+
+
+class SvgExportTests(DemoCase):
+    def content(self, name: str, index: int) -> PageContent:
+        pages = DocumentPages(self.source, self.doc(name))
+        self.addCleanup(pages.close)
+        return pages.content(index)
+
+    def test_notebook_page(self):
+        content = self.content("Sketchbook", 0)
+        root = ET.fromstring(page_svg(content))
+        self.assertEqual((root.get("viewBox"), root.get("width"), root.get("height")), ("0 0 1404 1872", "1404", "1872"))
+        ids = [child.get("id") for child in root]
+        self.assertEqual(ids[:3], ["paper", "template", "layer-0"])     # paper, template, then the ink
+        strokes = root.findall(f"{SVG}g[@id='layer-0']/{SVG}g")
+        self.assertEqual({g.get("stroke") for g in strokes} >= {"#000000", "#304ae0", "#c23132"}, True)
+        highlighter = next(g for g in strokes if g.get("data-tool").startswith("highlighter"))
+        self.assertEqual(highlighter.get("style"), "mix-blend-mode:darken")
+        widths = {float(line.get("stroke-width")) for g in strokes for line in g}
+        self.assertGreater(len(widths), 3)                                # widths follow the pen
+        self.assertIsNone(root.find(f".//{SVG}image"))                    # no raster part
+
+    def test_typed_text(self):
+        root = ET.fromstring(page_svg(self.content("Meeting notes", 1)))
+        texts = ["".join(t.itertext()) for t in root.iter(f"{SVG}text")]
+        self.assertIn("Action items", texts)
+
+    def test_annotated_pdf_page(self):
+        content = self.content("Research paper", 0)
+        root = ET.fromstring(page_svg(content))
+        image = root.find(f"{SVG}image")
+        frame = content.frame()
+        self.assertEqual([float(image.get(k)) for k in ("x", "width")],
+                         [round(frame.x(), 2), round(frame.width(), 2)])  # the PDF page at 226 DPI
+        self.assertTrue(image.get("href").startswith("data:image/png;base64,"))
+        png = QImage.fromData(base64.b64decode(image.get("href").split(",", 1)[1]))
+        self.assertEqual((png.width(), png.height()), (round(frame.width()), round(frame.height())))
+        self.assertEqual([c.get("id") for c in root][:3], ["paper", "pdf-page", "layer-0"])   # ink above the page
+        self.assertIsNone(root.find(f"{SVG}g[@id='template']"))
+
+    def test_draws_like_the_viewer(self):
+        for name, index in (("Research paper", 1), ("Meeting notes", 0), ("Old draft", 0)):
+            content = self.content(name, index)
+            viewer = render_content(content, 1.0, "page")
+            self.assertLess(differing(viewer, svg_image(page_svg(content), viewer.size())), 0.005, name)
+
+    @unittest.skipUnless(shutil.which("rsvg-convert"), "needs rsvg-convert (librsvg)")
+    def test_highlighters_blend_like_the_viewer(self):
+        # Qt's SVG renderer ignores mix-blend-mode; librsvg, like browsers, honours it.
+        content = self.content("Research paper", 0)                      # highlighter over PDF text
+        svg, png = self.dir / "page.svg", self.dir / "page.png"
+        svg.write_text(page_svg(content))
+        subprocess.run(["rsvg-convert", "-o", str(png), str(svg)], check=True)
+        viewer = render_content(content, 1.0, "page")
+        self.assertLess(differing(viewer, QImage(str(png))), 0.002)
+
+    def test_export_folder(self):
+        pages = DocumentPages(self.source, self.doc("Research paper"))
+        self.addCleanup(pages.close)
+        steps = []
+        folder = export_svg(pages, self.dir / "Research paper", progress=lambda d, t: steps.append((d, t)))
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         [f"Research paper - {n}.svg" for n in (1, 2, 3)])
+        self.assertEqual(steps, [(1, 3), (2, 3), (3, 3)])
+        picked = export_svg(pages, self.dir / "picked", indexes=[1])
+        self.assertEqual([p.name for p in picked.iterdir()], ["Research paper - 2.svg"])
+
+        def stop(done, total):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):                         # stopped: nothing left behind
+            export_svg(pages, self.dir / "stopped", progress=stop)
+        self.assertEqual(sorted(p.name for p in self.dir.glob("stopped*")), [])
 
 
 # ----------------------------------------------------------------- library changes

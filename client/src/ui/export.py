@@ -1,4 +1,4 @@
-"""Document export: a multi-page PDF or a .rmdoc archive.
+"""Document export: a multi-page PDF, a folder of PNG or SVG pages, or a .rmdoc archive.
 
 Exported pages have each page's faithful bounds (the page frame plus any ink or typed
 text beyond it) on the tablet's 226 DPI grid, and are composed from three layers:
@@ -19,10 +19,16 @@ content parsing or resource renaming, so the cost does not grow with the ink.
 A source PDF that pypdf cannot read (damaged, or encrypted with a password) is
 rasterised into the base layer instead (BACKGROUND_SCALE × 226 DPI), as is a page
 whose size pypdf and QtPdf disagree on, which would misplace the ink.
+
+PNG and SVG pages (export_png, export_svg) get one file per page in a new folder, with
+the same page bounds. A PNG is the viewer's rendering at 226 DPI. An SVG (page_svg) is
+vector: template paths, ink polylines and typed text, over the PDF page as an embedded
+PNG when the page has one.
 """
 
 from __future__ import annotations
 
+import base64
 import io
 import logging
 import os
@@ -36,8 +42,8 @@ from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject, F
 from PySide6.QtCore import QBuffer, QIODevice, QMarginsF, QRectF, QSize, QSizeF
 from PySide6.QtGui import QColor, QPageSize, QPainter, QPdfWriter
 
-from viewer.renderer import paint
-from viewer.templates import paint_template
+from viewer.renderer import paint, qt_measure, svg_scene
+from viewer.templates import paint_template, template_svg
 
 from .pages import PAPER, DocumentPages, PageContent, render_content
 
@@ -328,14 +334,52 @@ def export_pdf(pages: DocumentPages, path: str | Path, *,
     return path
 
 
-def export_png(pages: DocumentPages, folder: str | Path, *,
-               progress: Callable[[int, int], None] | None = None,
-               indexes: Sequence[int] | None = None, scale: float = 1.0) -> Path:
-    """Write every page of `pages`, or those at `indexes`, as PNG images into `folder`
-    (created; it must not exist yet): one "<name> - <n>.png" per page, n counting the
-    document's pages from 1. Pages have the viewer's faithful bounds (the page frame plus
-    any ink beyond it) at `scale` × the tablet's 226 DPI. `progress` as for export_pdf;
-    a failed or stopped export leaves no folder behind."""
+def _num(value: float) -> str:
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def page_svg(content: PageContent, background_scale: float = 1.0) -> str:
+    """One page as an SVG document, in the tablet's page pixels (226 DPI user units): a
+    notebook page is 1404 × 1872, a PDF page its PDF size at 226/72 px per pt, both
+    grown by any ink or text beyond them (the PDF and PNG exports' bounds).
+
+    Bottom to top: white paper; the page template (vector paths), or for a PDF-backed
+    page the PDF page as an embedded PNG at `background_scale` × 226 DPI (no PDF-to-SVG
+    converter is available, so it is the one raster part); the ink, layer by layer, as
+    polylines whose widths follow the pen's recorded width; highlighters blend with
+    mix-blend-mode: darken, as the viewer's Darken composition; typed text as <text>,
+    laid out as the viewer lays it out."""
+    x, y, w, h = content.bounds("page")
+    out = ['<?xml version="1.0" encoding="UTF-8"?>',
+           f'<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="{_num(x)} {_num(y)} {_num(w)} {_num(h)}" '
+           f'width="{_num(w)}" height="{_num(h)}">',
+           f'<rect id="paper" x="{_num(x)}" y="{_num(y)}" width="{_num(w)}" height="{_num(h)}" fill="{PAPER}"/>']
+    if content.has_pdf_page:
+        frame = content.frame()
+        pixels = QSize(max(1, round(frame.width() * background_scale)), max(1, round(frame.height() * background_scale)))
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not content.pdf.render(content.pdf_page, pixels).save(buffer, "PNG"):
+            raise OSError(f"cannot encode PDF page {content.pdf_page + 1}")
+        data = base64.b64encode(bytes(buffer.data())).decode("ascii")
+        out.append(f'<image id="pdf-page" data-page="{content.pdf_page + 1}" x="{_num(frame.x())}" '
+                   f'y="{_num(frame.y())}" width="{_num(frame.width())}" height="{_num(frame.height())}" '
+                   f'preserveAspectRatio="none" href="data:image/png;base64,{data}"/>')
+    elif content.template is not None:
+        out += template_svg(content.template, (x, y, w, h))
+    if content.scene is not None:
+        # One decimal: 0.1 page pixel is 0.011 mm, and the file is a tenth smaller.
+        out += svg_scene(content.scene, background=PAPER, measure=qt_measure, decimals=1)
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
+
+
+def _export_pages(pages: DocumentPages, folder: Path, suffix: str, write: Callable[[PageContent, Path], None],
+                  progress: Callable[[int, int], None] | None, indexes: Sequence[int] | None) -> Path:
+    """One file per page into `folder` (created; it must not exist yet), named
+    "<name> - <n><suffix>" with n counting the document's pages from 1. A failed or
+    stopped export leaves no folder behind."""
     folder = Path(folder)
     if not pages.pages:
         raise ValueError("document has no pages")
@@ -345,16 +389,13 @@ def export_png(pages: DocumentPages, folder: str | Path, *,
         raise ValueError(f"no such pages: {list(indexes)} (the document has {len(pages.pages)})")
     if not folder.parent.is_dir():
         raise FileNotFoundError(f"no such folder: {folder.parent}")
-    stem = Path(export_file_name(pages.doc.name, ".png")).stem
+    stem = Path(export_file_name(pages.doc.name, suffix)).stem
     width = len(str(len(pages.pages)))
     partial = folder.with_name(folder.name + ".part")
     partial.mkdir()
     try:
         for done, index in enumerate(indexes, 1):
-            image = render_content(pages.content(index), scale, "page")
-            target = partial / f"{stem} - {index + 1:0{width}d}.png"
-            if not image.save(str(target), "PNG"):
-                raise OSError(f"cannot write {target.name}")
+            write(pages.content(index), partial / f"{stem} - {index + 1:0{width}d}{suffix}")
             if progress is not None:
                 progress(done, len(indexes))
         os.replace(partial, folder)
@@ -364,6 +405,28 @@ def export_png(pages: DocumentPages, folder: str | Path, *,
         partial.rmdir()
         raise
     return folder
+
+
+def export_png(pages: DocumentPages, folder: str | Path, *,
+               progress: Callable[[int, int], None] | None = None,
+               indexes: Sequence[int] | None = None, scale: float = 1.0) -> Path:
+    """Write every page of `pages`, or those at `indexes`, as PNG images into `folder`
+    (see _export_pages). Pages have the viewer's faithful bounds (the page frame plus any
+    ink beyond it) at `scale` × the tablet's 226 DPI. `progress` as for export_pdf."""
+    def write(content: PageContent, target: Path) -> None:
+        if not render_content(content, scale, "page").save(str(target), "PNG"):
+            raise OSError(f"cannot write {target.name}")
+    return _export_pages(pages, Path(folder), ".png", write, progress, indexes)
+
+
+def export_svg(pages: DocumentPages, folder: str | Path, *,
+               progress: Callable[[int, int], None] | None = None,
+               indexes: Sequence[int] | None = None, background_scale: float = 1.0) -> Path:
+    """Write every page of `pages`, or those at `indexes`, as SVG documents (page_svg)
+    into `folder` (see _export_pages). `progress` as for export_pdf."""
+    def write(content: PageContent, target: Path) -> None:
+        target.write_text(page_svg(content, background_scale), encoding="utf-8")
+    return _export_pages(pages, Path(folder), ".svg", write, progress, indexes)
 
 
 def export_file_name(name: str, suffix: str) -> str:

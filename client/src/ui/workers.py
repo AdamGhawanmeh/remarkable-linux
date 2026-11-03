@@ -22,7 +22,7 @@ from core.models import Document, DocumentTree
 from core.sync import SyncClient, SyncError
 
 from .library import LibrarySource
-from .export import export_pdf, export_png
+from .export import export_pdf, export_png, export_svg
 from .pages import DocumentPages, cover_index, render_content
 
 log = logging.getLogger("rm.ui.workers")
@@ -164,12 +164,17 @@ class PageRenderer(QObject):
         return self.pool.waitForDone(msecs)
 
 
+# Page-drawing export formats: kind -> writer(DocumentPages, path, progress=, indexes=).
+WRITERS = {"pdf": export_pdf, "png": export_png, "svg": export_svg}
+
+
 class ExportCancelled(Exception):
     """Raised inside an export job once Exporter.cancel() was called."""
 
 
 class Exporter(QObject):
-    """Exports a document to PDF, PNG images or .rmdoc in the background, one at a time.
+    """Exports a document to PDF, PNG or SVG images, or .rmdoc, in the background, one
+    at a time.
 
     Every job ends with exactly one of finished, failed or cancelled: an error nobody
     expected (pypdf raises all kinds on unusual PDFs) is reported as a failure too,
@@ -190,7 +195,7 @@ class Exporter(QObject):
         self._cancel = threading.Event()
 
     def export(self, kind: str, doc: Document, path: str, pages: list[int] | None = None) -> bool:
-        """Export `doc` (only the pages at indexes `pages`, for a PDF or PNGs, if given)."""
+        """Export `doc` (only the pages at indexes `pages`, for PDF, PNG or SVG, if given)."""
         if self.running:
             return False
         self.running = True
@@ -205,9 +210,9 @@ class Exporter(QObject):
             try:
                 if cancel.is_set():
                     raise ExportCancelled()
-                if kind in ("pdf", "png"):
+                if kind in WRITERS:
                     document = DocumentPages(self.source, doc)     # own PDF handle for this thread
-                    write = export_pdf if kind == "pdf" else export_png
+                    write = WRITERS[kind]
                     try:
                         result = write(document, path, progress=report, indexes=pages)
                     finally:

@@ -9,7 +9,7 @@
 A native Linux desktop client for your reMarkable library. It runs the official
 reMarkable desktop app's own interface (its QML, fonts and icons, unmodified) on a
 from-scratch Python/Qt implementation of everything underneath: cloud sync, the `.rm`
-notebook renderer, PDF/EPUB viewing, page templates, PDF, PNG and `.rmdoc` export,
+notebook renderer, PDF/EPUB viewing, page templates, PDF, PNG, SVG and `.rmdoc` export,
 imports, folders, moves and the trash, and Screen Share from the tablet. It is a reader
 and organiser: editing pages is not there yet. See
 [Feature status and roadmap](#feature-status-and-roadmap) for exactly what works.
@@ -144,7 +144,7 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 309 offline tests use a fake cloud and synthetic documents; they need no account
+The 319 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
 
 ## Feature status and roadmap
@@ -169,7 +169,7 @@ when you use them.
 | Import | PDF and EPUB, from Import or by dragging files onto the window; imported PDFs open at once |
 | Viewer | Notebooks (`.rm` v3/v5/v6: ink, highlighters, pencils, typed text, page templates), PDFs and EPUBs with your annotations, PDF links, page overview, zoom (Ctrl++, Ctrl+-, Ctrl+0), page turning (Left/Right arrows) |
 | Reading position | Documents reopen at the page you left; synced like the official app |
-| Export | PDF (vector: the original PDF pages, with your ink on top), PNG (one image per page at 226 DPI), `.rmdoc`; whole documents or selected pages, with progress and cancel |
+| Export | PDF (vector: the original PDF pages, with your ink on top), SVG (one file per page: vector ink, templates and typed text; a PDF page underneath as an embedded image), PNG (one image per page at 226 DPI), `.rmdoc`; whole documents or selected pages, with progress and cancel |
 | Screen Share | LiveView of your tablet's screen (Account > Screen Share, or accept the tablet's request) |
 
 ### In progress and known limitations
@@ -181,7 +181,6 @@ when you use them.
 | Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
 | Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |
 | Search in documents | The search bar inside a document opens but does not find anything yet. |
-| SVG export | Not available yet; PDF and PNG are. |
 | EPUBs | Shown through the PDF version your tablet makes of them. An EPUB imported here opens once the tablet has opened it and synced; until then the viewer says so. There is no reflowing, font or margin setting. |
 | Password-protected PDFs | Not supported. |
 | Not on Linux | Converting handwriting to text, the share sheet (Share), scanning documents and in-app updates. |

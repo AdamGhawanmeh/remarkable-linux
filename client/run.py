@@ -36,6 +36,7 @@ _MISSING = [p for p in (HERE / "src" / "ui" / "quick" / "bridge" / "qml_api.json
 if _MISSING:
     sys.exit(f"{_MISSING[0]} is missing: set up the app first with  python3 install.py  (see README.md)")
 
+from PySide6.QtCore import qVersion  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from core.auth import AuthClient  # noqa: E402
@@ -73,7 +74,11 @@ def make_app(args: argparse.Namespace, workdir: Path) -> tuple[QuickApp, bool]:
 
 
 # Qt notices that are not binding errors (the shipped Qt prints them too; ARCHITECTURE.md §2.1).
-KNOWN_NOTICES = ("Only binding to one of multiple key bindings",)
+KNOWN_NOTICES: tuple[str, ...] = ("Only binding to one of multiple key bindings",)
+# Qt 6.11 added a check the app's Qt (6.10.3) does not have: some of the app's components
+# shadow a base member (RMIconButton.enabled, Background.data). The tests ignore it too.
+if tuple(int(x) for x in qVersion().split(".")[:2]) >= (6, 11):
+    KNOWN_NOTICES += ("overrides a member of the base object",)
 APP_MODULES = ("common", "client", "ark", "xofm", "com.remarkable")
 
 

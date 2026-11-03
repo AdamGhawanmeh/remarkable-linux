@@ -176,9 +176,39 @@ existing file. `DocumentExporter` runs the exports one after another on `workers
 shows the path. A failed or cancelled export passes through `Unknown`, so no checkmark
 appears, and a failure shows the reason in the notification. PNG export writes a folder
 named after the document, inside the chosen folder ("Place folder here"), with one
-`<name> - <n>.png` per page at 226 DPI, rendered as the viewer renders it. The binary has a
-`PngExporter`, but its file naming is not recovered, so this naming is our own. SVG reports
-"This export format is not available on Linux".
+`<name> - <n>.png` per page at 226 DPI, rendered as the viewer renders it. SVG export writes
+`<name> - <n>.svg` the same way; the binary's `SvgExporter` writes `%1/%2.svg` (a file per
+item in a folder), but its exact naming is not recovered, so ours matches the PNG export.
+ExportDialog offers PNG and SVG for one document at a time.
+
+**SVG pages** (`ui.export.page_svg`) use the tablet's page pixels as user units, so a
+notebook page is `0 0 1404 1872`. PDF pages are their PDF size at 226/72 px per pt. Both
+grow by any ink beyond them, with the PDF and PNG exports' bounds. Bottom to top:
+- the paper;
+- the template, as vector paths (`templates.template_svg`). It walks the same
+  `template_shapes()` as `paint_template`, with QPen's square caps and bevel joins and
+  QPainterPath's even-odd fill. All 65 templates paint byte-identically after that
+  split.
+- or, for a PDF page, the PDF page as an embedded PNG at 226 DPI. QtPdf only rasterises,
+  and no PDF-to-SVG converter is a dependency, so this is the one raster part.
+- the ink, as `renderer.svg_scene` (shared with `render_svg`): a group per layer, then
+  per stroke. Each run of constant width and opacity is one polyline, at the widths the
+  pen recorded. Highlighters use `mix-blend-mode: darken`.
+- typed text as `<text>`, wrapped with the viewer's Qt font metrics.
+
+Templates stay small: consecutive shapes of one style share a styled group. Opaque
+outlines share one path; translucent ones stay separate, since crossings must compound.
+Shapes outside the page are dropped. That took "Dots small" from 293 KB to about 95 KB.
+
+Checked with librsvg (`rsvg-convert` 2.62, which honours mix-blend-mode, as browsers do)
+against the viewer:
+- every demo page: at most 0.13 % of pixels differ by more than 96/255;
+- 32 pages of the user's library (23 notebook, 9 annotated PDF): at most 0.04 %.
+
+Notebook pages came to a median 98 KB as SVG, against 182 KB as PNG. Annotated PDF pages
+came to 413 KB against 307 KB, because the embedded page image is base64-encoded. Qt's
+own SVG renderer ignores mix-blend-mode and lays text out differently, so the in-suite
+parity test uses it only on pages without highlighters or text.
 
 **Turning pages.** DocumentViewport turns a page by setting `currentPage` first, which
 re-fits `viewportScale` onto the outgoing SceneView, and then creating a new SceneView.

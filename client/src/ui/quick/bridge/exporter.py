@@ -1,7 +1,7 @@
 """DocumentExporter: what PlatformHelpers.exportFile starts (ExportDialog.qml's
 performExport, from Export... and Export as rM file): documents written to PDF, with
-their ink and typed text over the original pages (ui/export.py), to PNG images (one
-per page, in a folder named after the document), or to a .rmdoc archive,
+their ink and typed text over the original pages (ui/export.py), to PNG or SVG pages
+(one file per page, in a folder named after the document), or to a .rmdoc archive,
 in the background and one after another (workers.Exporter).
 
 ExportDialog hands over a file (one document as PDF: its save dialog) or a folder (several
@@ -28,16 +28,17 @@ from ...workers import Exporter
 
 log = logging.getLogger("rm.ui.quick.exporter")
 
-SUFFIXES = {"pdf": ".pdf", "rmdoc": ".rmdoc", "png": ""}     # png: a folder of images
+SUFFIXES = {"pdf": ".pdf", "rmdoc": ".rmdoc", "png": "", "svg": ""}     # png, svg: a folder of pages
+FOLDER_KINDS = ("png", "svg")
 
 
 def export_target(target: str | Path, name: str, kind: str) -> Path:
     """The file to write for document `name`: inside `target` if it is a folder (named
     after the document, never over an existing file), else `target` itself with the
-    format's suffix. PNG images go into a new folder named after the document, inside
-    the folder ExportDialog chose ("Place folder here")."""
+    format's suffix. PNG and SVG pages go into a new folder named after the document,
+    inside the folder ExportDialog chose ("Place folder here")."""
     target, suffix = Path(target), SUFFIXES[kind]
-    if kind == "png":
+    if kind in FOLDER_KINDS:
         if not target.is_dir():
             raise FileNotFoundError(f"no such folder: {target}")
         base = export_file_name(name, "")
@@ -91,7 +92,7 @@ class DocumentExporter(QObject):
         except (OSError, ValueError, KeyError) as err:
             self.notify(f"Unable to export \"{node.name}\": {err}")
             return False
-        pages = sorted({int(p) for p in pages}) if pages and kind in ("pdf", "png") else None
+        pages = sorted({int(p) for p in pages}) if pages and kind != "rmdoc" else None
         self._queue.append(_Request(document_id, kind, path, pages))
         log.info("exporting %s as %s to %s", document_id, kind, path)
         self.library.set_export_progress(document_id, 0.0)

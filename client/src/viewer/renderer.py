@@ -374,19 +374,20 @@ def _svg_font(font: TextFont) -> str:
     return f'font-family="{families}" font-size="{font.size:g}"{weight}{style}'
 
 
-def render_svg(scene: PageScene, *, background: str | None = "#ffffff",
-               include_hidden: bool = False, crop: str = "page") -> str:
-    x, y, w, h = render_bounds(scene, crop)
-    lines = layout_text(scene)
+def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: bool = False,
+              measure: Measure = estimate_width, decimals: int = 2) -> list[str]:
+    """The scene's SVG elements in page coordinates: one group per visible layer, bottom
+    to top, holding a group per stroke (tool, colour, caps, highlighter blending) with a
+    polyline per run of constant width and opacity; then the typed text. `background` is
+    what eraser strokes paint with; `measure` lays out the text (qt_measure: as the
+    viewer wraps it); `decimals` is the precision of stroke coordinates."""
+    lines = layout_text(scene, measure)
     offsets = stroke_offsets(scene, lines)
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x:g} {y:g} {w:g} {h:g}" '
-           f'width="{w:g}" height="{h:g}">']
-    if background:
-        out.append(f'<rect x="{x:g}" y="{y:g}" width="{w:g}" height="{h:g}" fill="{background}"/>')
+    out = []
     for index, layer in enumerate(_visible_layers(scene, include_hidden)):
         out.append(f'<g id="layer-{index}" data-name={quoteattr(layer.name)}>')
         for stroke in layer.strokes:
-            style = stroke_style(stroke, background or "#ffffff")
+            style = stroke_style(stroke, background)
             if style is None:
                 continue
             cap = "square" if style.square_cap else "round"
@@ -394,7 +395,7 @@ def render_svg(scene: PageScene, *, background: str | None = "#ffffff",
             out.append(f'<g data-tool="{stroke.tool.name.lower()}" stroke="{style.color}" '
                        f'fill="none" stroke-linecap="{cap}" stroke-linejoin="round"{blend}>')
             for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0))):
-                coords = " ".join(f"{px:.2f},{py:.2f}" for px, py in run.points)
+                coords = " ".join(f"{px:.{decimals}f},{py:.{decimals}f}" for px, py in run.points)
                 opacity = run.opacity * style.alpha
                 attr = f' stroke-opacity="{opacity:.4g}"' if opacity < 1 else ""
                 out.append(f'<polyline points="{coords}" stroke-width="{run.width:g}"{attr}/>')
@@ -412,6 +413,18 @@ def render_svg(scene: PageScene, *, background: str | None = "#ffffff",
                 out.append(f'<text x="{line.x:.2f}" y="{line.baseline:.2f}" '
                            f'xml:space="preserve">{spans}</text>')
         out.append("</g>")
+    return out
+
+
+def render_svg(scene: PageScene, *, background: str | None = "#ffffff",
+               include_hidden: bool = False, crop: str = "page",
+               measure: Measure = estimate_width) -> str:
+    x, y, w, h = render_bounds(scene, crop, measure=measure)
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x:g} {y:g} {w:g} {h:g}" '
+           f'width="{w:g}" height="{h:g}">']
+    if background:
+        out.append(f'<rect x="{x:g}" y="{y:g}" width="{w:g}" height="{h:g}" fill="{background}"/>')
+    out += svg_scene(scene, background=background or "#ffffff", include_hidden=include_hidden, measure=measure)
     out.append("</svg>")
     return "\n".join(out)
 
@@ -525,5 +538,5 @@ def render_image(scene: PageScene, *, scale: float = 1.0, background: str = "#ff
 
 
 __all__ = ["PALETTE_ARGB", "Run", "StrokeStyle", "TextFont", "TextLine", "layout_text",
-           "paint", "render_bounds", "render_image", "render_svg", "stroke_runs",
+           "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
            "stroke_style", "PAGE_WIDTH", "PAGE_HEIGHT"]
