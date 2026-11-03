@@ -39,7 +39,7 @@ X11 sessions on Debian/Ubuntu may also need `libxcb-cursor0` for Qt.
 ## Quick start
 
 ```sh
-git clone <repository-url> remarkable-linux && cd remarkable-linux && ./install.sh
+git clone https://github.com/AdamGhawanmeh/remarkable-linux.git && cd remarkable-linux && ./install.sh
 ```
 
 `install.sh` asks first, then works unattended for a few minutes:
