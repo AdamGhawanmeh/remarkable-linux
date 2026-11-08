@@ -161,6 +161,7 @@ when you use them.
 | Interface | The official desktop app's own QML, fonts, icons and translations, unmodified (1:1 UI) |
 | Log in | The app's log-in wizard with a one-time code from my.remarkable.com; **Log out** removes this computer from your account |
 | Cloud sync | Your library from reMarkable's cloud (sync v3/v4); documents download on demand |
+| Sync status | Settings > Cloud > **Check sync** runs the official app's checks (network, log-in, internet, then a full sync) with its messages; sync progress ("Syncing (3 of 10)"), "No cloud connection" while the network is down, and "Unable to sync" when a sync fails |
 | Offline cache | The cached library opens at once, also without a network; `--offline` never connects or writes |
 | Library | My files and folders, Notebooks, PDFs, Ebooks, Favorites, Trash, sort orders, grid and list views, thumbnails |
 | Search | Title search across the library (Ctrl+F) |

@@ -31,16 +31,17 @@ from PySide6.QtGui import QFontDatabase, QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
+from core.auth import AuthError, AuthNetworkError
 from core.models import DocumentTree
 
 from ..library import LibrarySource
-from ..workers import Account, Mutator, Syncer
+from ..workers import Account, InternetCheck, Mutator, Syncer
 from . import assets
 from .bridge import Singletons, register_types, use_singletons
 from .bridge.exporter import DocumentExporter
 from .bridge.images import DragIconImageProvider, ThumbnailImageProvider
 from .bridge.importer import DocumentImporter
-from .bridge.library import DocumentSelection, DocumentSync, Library, LibraryController
+from .bridge.library import DocumentSelection, DocumentSync, Library, LibraryController, SyncStatus
 from .bridge.platform import (LOGIN_RESULTS, ArkIconProvider, ArkTokensSettings, Authentication, Clipboard,
                               DocumentController, HandwritingLanguageModel, LanguageSettings, LinkProvider,
                               NetworkClient, PlatformApp, PlatformHelpers, Settings, SettingsStore, UserInfo,
@@ -76,9 +77,20 @@ def configure(application: QGuiApplication) -> None:
     application.styleHints().setColorScheme(Qt.ColorScheme.Light)
 
 
+def sync_failure_status(error: Exception | None) -> SyncStatus:
+    """rmsync::Status for a failed sync. Network failures inside the sync itself arrive
+    as SyncError after its retries, and get the app's general failure text."""
+    if isinstance(error, (OSError, AuthNetworkError)):
+        return SyncStatus.ConnectivityFailure
+    if isinstance(error, AuthError):
+        return SyncStatus.AuthenticationFailure
+    return SyncStatus.Failed
+
+
 class QuickApp:
     def __init__(self, source: LibrarySource, cache_dir: Path, *, config_dir: Path | None = None,
-                 liveview_factory: Callable | None = None, now=None, main: QUrl = MAIN_URL) -> None:
+                 liveview_factory: Callable | None = None, now=None, main: QUrl = MAIN_URL,
+                 network_information=None) -> None:
         self.source = source
         self.cache_dir = cache_dir
         self.main = main
@@ -88,8 +100,10 @@ class QuickApp:
         self.mutator = Mutator(source)
         self.syncer = Syncer(source)
         self.auth = source.sync.auth
+        self.internet = InternetCheck(self.auth)
         self.account = Account(self.auth)
         self.sync_on_login = True
+        self._check_waiting = False      # "Check sync" asked for a sync while one was running
         self._online = False             # Screen Share started for this log-in
         store = SettingsStore(config_dir / "settings.ini" if config_dir else None)
         # ExportDialog -> PlatformHelpers.exportFile; results show as the app's notifications.
@@ -110,7 +124,7 @@ class QuickApp:
             authentication=Authentication(self.auth.is_paired or source.cached_only, login=self.login),
             user_info=UserInfo(),
             network_client=NetworkClient(), document_controller=DocumentController(self.library),
-            clipboard=Clipboard(), language=LanguageSettings(store), link=LinkProvider(),
+            clipboard=Clipboard(), language=LanguageSettings(store), link=LinkProvider(information=network_information),
             handwriting=HandwritingLanguageModel(), recognizer=Recognizer())
         self.item_inspector = QObject()
         s = self.singletons
@@ -123,13 +137,21 @@ class QuickApp:
             lambda url, name, parent_id, scanned, delete_later: s.importer.importFromUrls([url], parent_id))
         self.mutator.finished.connect(lambda tree, message: self.set_tree(tree))
         self.mutator.failed.connect(self.library.errorMessage.emit)
-        self.syncer.started.connect(lambda: s.document_sync.set_state(True))
+        self.syncer.started.connect(lambda: s.document_sync.set_status(SyncStatus.Syncing))
+        self.syncer.progress.connect(s.document_sync.set_progress)
         self.syncer.finished.connect(self._synced)
         self.syncer.failed.connect(self._sync_failed)
         self.syncer.unauthorized.connect(self._unauthorized)
         self.account.loggedIn.connect(self._logged_in)
         self.account.loginFailed.connect(self._login_failed)
         self.account.loggedOut.connect(self._logged_out)
+        # Settings > Cloud > "Check sync".
+        checker = s.document_sync.syncChecker
+        checker.online = lambda: s.link.isOnline
+        checker.paired = lambda: self.logged_in and not self.source.cached_only
+        checker.check_internet = self.internet.start
+        checker.request_sync = self._sync_for_check
+        self.internet.finished.connect(checker.internet_checked)
 
     def _save_reading_position(self, doc_id: str, page: int, opened_ms: int | None) -> None:
         """Library.save_reading_position: lastOpenedPage/lastOpened to the cloud, as the app
@@ -181,7 +203,7 @@ class QuickApp:
     def _unauthorized(self, message: str) -> None:
         """The cloud rejected the device token (revoked on my.remarkable.com): log in again.
         The cached library stays until then."""
-        self._sync_failed(message)
+        self._sync_failed(message, SyncStatus.AuthenticationFailure)
         self._go_offline()
         self.singletons.authentication.failed(LOGIN_RESULTS["GenericError"], LOGGED_OUT_BY_CLOUD)
 
@@ -199,13 +221,26 @@ class QuickApp:
 
     def _synced(self, tree: DocumentTree) -> None:
         self.set_tree(tree)
-        self.singletons.document_sync.set_state(False)
-        self.singletons.link.set_online(True)
+        self.singletons.document_sync.set_status(SyncStatus.Completed)
+        self._run_waiting_check()
 
-    def _sync_failed(self, message: str) -> None:
-        self.singletons.document_sync.set_state(False, True)
-        self.singletons.link.set_online(False)
+    def _sync_failed(self, message: str, status: SyncStatus | None = None) -> None:
+        self.singletons.document_sync.set_status(
+            sync_failure_status(self.syncer.last_error) if status is None else status, message)
         log.warning("sync failed: %s", message)
+        self._run_waiting_check()
+
+    def _sync_for_check(self) -> None:
+        """The full sync "Check sync" asks for; while one runs, it follows that one, as
+        the app's requestFullSync queues behind the running sync."""
+        if not self.syncer.refresh():
+            self._check_waiting = True
+
+    def _run_waiting_check(self) -> None:
+        if self._check_waiting:
+            self._check_waiting = False
+            if self.logged_in and not self.closing:
+                self.syncer.refresh()
 
     def _message(self, kind, context, message: str) -> None:
         if self.closing:
@@ -267,7 +302,8 @@ class QuickApp:
         cleared)."""
         self.set_tree(self.source.load_cached())
         if self.logged_in:
-            self._go_online(sync)
+            # Offline (cached_only) a "sync" would only reload the cache just shown.
+            self._go_online(sync and not self.source.cached_only)
 
     def shutdown(self) -> None:
         self.closing = True
@@ -277,6 +313,7 @@ class QuickApp:
         self.mutator.wait(120000)
         self.exporter.wait(120000)          # an export the user started still gets written
         self.syncer.wait(5000)
+        self.internet.wait(5000)
         for provider in (self.thumbnails, self.icons):
             if provider is not None:
                 provider.close()

@@ -26,6 +26,7 @@ from typing import Any, Callable
 from PySide6.QtCore import (Property, QCoreApplication, QObject, QPointF, QSizeF, Qt, QTimer, Signal, Slot,
                             QEnum)
 
+from core.auth import CERTIFICATE_TIME_ERROR, HANDSHAKE_FAILED, http_error_name
 from core.models import (ROOT_ID, TRASH_ID, Document as DocumentNode, DocumentTree, FileType, Node,
                          unique_name)
 
@@ -1335,33 +1336,206 @@ class LibraryController(QObject):
 
 
 class ProgressCounts(dict):
-    """xofm::libs::syncinterface::ProgressCounts as the QML reads it."""
+    """xofm::libs::syncinterface::ProgressCounts as the QML reads it: entries transferred
+    of those scheduled, progress, and the state text ("Syncing", "" when not syncing)."""
 
     def __init__(self, transferred: int = 0, scheduled: int = 0, progress: float = 0.0, state: str = "") -> None:
         super().__init__(transferred=transferred, scheduled=scheduled, progress=progress, state=state)
 
 
+class SyncStatus(IntEnum):
+    """rmsync::Status, what DocumentSync.syncStatusChanged carries. The QML treats
+    "status > 2" as a failure (LibraryHelpers). Values are the keys of
+    DocumentSyncInterface's status-text table (0x140120d90); the names are ours."""
+    Syncing = 0
+    Completed = 1
+    Aborted = 2
+    Failed = 3
+    StorageFailure = 4
+    UpdateRequired = 5
+    LibraryFailure = 6
+    AuthenticationFailure = 7
+    ConnectivityFailure = 8
+    StorageFull = 9
+
+
+SYNC_CONTEXT = "xofm::libs::syncinterface::DocumentSyncInterface"
+# The long text of each status, the one the sync checker shows (same table).
+SYNC_STATUS_TEXT = {
+    SyncStatus.Syncing: "Syncing...",
+    SyncStatus.Completed: "Sync completed successfully.",
+    SyncStatus.Aborted: "Sync was aborted.",
+    SyncStatus.Failed: "Failure during sync. Check your network and try again.",
+    SyncStatus.StorageFailure: "Failure during sync due to problems with storage. Contact support if the problem "
+                               "persists.",
+    SyncStatus.UpdateRequired: "Unable to sync. Ensure the software is updated to the latest version to resume syncing.",
+    SyncStatus.LibraryFailure: "Sync failure due to problems with the document library. Contact support if the "
+                               "problem persists.",
+    SyncStatus.AuthenticationFailure: "Unable to sync due to authentication problems. Check pairing status in Account "
+                                      "settings.",
+    SyncStatus.ConnectivityFailure: "Unable to sync due to connectivity problems. Check your connection and try again.",
+    SyncStatus.StorageFull: "Unable to sync. Storage is full, try emptying the trash or deleting some notebooks.",
+}
+
+# The checker's statuses: text and icon, never a detail. The app shows all of its texts
+# in English whatever the language: its CheckerStatus constants and the status table are
+# built by static initialisers (0x1400075d0-0x140007a3d), before main() installs any
+# translator, and what it translates later goes through Checker::tr, a context its .qm
+# files do not have (they file these strings under DocumentSyncInterface).
+CHECKING_INTERNET = ("Checking internet connection...", "wifi_3")
+WAITING_FOR_SYNC = ("Waiting for sync", "cloud_download")
+SYNCING = (SYNC_STATUS_TEXT[SyncStatus.Syncing], "cloud_download")
+SYNC_COMPLETED = (SYNC_STATUS_TEXT[SyncStatus.Completed], "checkmark")
+NOT_ON_WIFI = ("You're not connected to Wi-Fi", "wifi_x")
+NOT_PAIRED_APP = ("You're not connected to the cloud. Check if your app is paired to a reMarkable account.", "cloud_x")
+NOT_PAIRED_TABLET = ("You're not connected to the cloud. Check if your paper tablet is paired to a reMarkable "
+                     "account.", "cloud_x")
+NO_INTERNET = ("Unable to connect to the Internet. \nCheck your network settings and try again.", "wifi_x")
+NO_INTERNET_TABLET = ("You're connected to Wi-Fi, but not the internet.\nCheck your Wi-Fi settings and try again.",
+                      "wifi_x")
+SYNC_NOT_STARTED = ("Unable to sync. \nTry restarting if the problem persists", "cloud_x")
+NOT_SYNCING = ("Not syncing.\nTry restarting if the problem persists", "cloud_x")
+# What replaces the internet error's text for http::Error 6 and 7.
+CLOCK_PROBLEM = ("There might be an issue with the date/time information on your device. Please check System time "
+                 "and try again")
+INSECURE_CONNECTION = ("Unable to establish a secure connection to our servers. Please try again, or connect to a "
+                       "different network")
+SYNC_PROGRESS = "%1 (%2 of %3)"
+
+
+def checker_status(status: tuple[str, str] = ("", ""), detail: str = "") -> dict:
+    """CheckerStatus as the QML reads it (status.text/.detail/.icon) from (text, icon)."""
+    text, icon = status
+    return {"text": text, "detail": detail, "icon": f"qrc:/ark/icons/{icon}" if icon else ""}
+
+
+def internet_error_status(code: int | None, on_tablet: bool) -> dict:
+    """checker.cpp's internetUnavailableStatus (0x140152950): what a failed GET
+    /discovery/v1/endpoints shows. `code` is the app's http::Error for a request that got
+    no answer (None after an HTTP error status): a certificate time error and a failed TLS
+    handshake have their own texts, any other code is appended as "({:?})", its name
+    quoted."""
+    text, icon = NO_INTERNET_TABLET if on_tablet else NO_INTERNET
+    if code == CERTIFICATE_TIME_ERROR:
+        text = CLOCK_PROBLEM
+    elif code == HANDSHAKE_FAILED:
+        text = INSECURE_CONNECTION
+    elif code is not None:
+        text += f'("{http_error_name(code)}")'
+    return checker_status((text, icon))
+
+
 class SyncChecker(QObject):
-    """DocumentSync.syncChecker (CheckSyncDialog): this client checks by syncing."""
+    """xofm::libs::syncinterface::Checker (checker.cpp), DocumentSync.syncChecker: the
+    "Check sync" button of Settings > Cloud (CheckSyncDialog).
+
+    startCheck() checks that the network is up (LinkProvider) and the app is logged in,
+    GETs /discovery/v1/endpoints to check the internet connection, asks for a full sync
+    and follows it to the end; the sync must start within 10 s. Like the app, the checker
+    also follows every other sync (DocumentSync feeds it each status and progress), so the
+    dialog shows how the last sync went and says "There was an issue with your last sync"
+    after a failed one.
+
+    QuickApp provides the hooks: `online()`, `paired()`, `check_internet()` (a background
+    request that ends in internet_checked(ok, code)) and `request_sync()`."""
+
+    Idle, CheckInternetConnection, WaitingForSync, Syncing, Success, Error = range(6)
+    TIMEOUT_MS = 10000          # the app constructs its Checker with 10000 ms
 
     changed = Signal()
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._device = True
+        self._state = self.Idle
+        self._status = checker_status()
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.TIMEOUT_MS)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._timed_out)
+        self.online: Callable[[], bool] = lambda: True
+        self.paired: Callable[[], bool] = lambda: False
+        self.check_internet: Callable[[], None] = lambda: self.internet_checked(False, None)
+        self.request_sync: Callable[[], None] = lambda: None
 
-    error = Property(bool, lambda self: False, notify=changed)
-    running = Property(bool, lambda self: False, notify=changed)
-    status = Property("QVariantMap", lambda self: {"text": "", "detail": "", "icon": ""}, notify=changed)
+    error = Property(bool, lambda self: self._state == self.Error, notify=changed)
+    running = Property(bool, lambda self: self._state not in (self.Idle, self.Success, self.Error), notify=changed)
+    status = Property("QVariantMap", lambda self: dict(self._status), notify=changed)
 
     def _set_device(self, value: bool) -> None:
-        self._device = bool(value)
+        if self._device != bool(value):
+            self._device = bool(value)
+            self.changed.emit()
 
     onDevice = Property(bool, lambda self: self._device, _set_device, notify=changed)
 
+    @property
+    def state(self) -> int:
+        return self._state
+
+    def _set(self, state: int, status: dict) -> None:
+        if (state, status) != (self._state, self._status):
+            log.debug("sync check: state %d -> %d, %r", self._state, state, status["text"])
+            self._state, self._status = state, status
+            self.changed.emit()
+
+    def _fail(self, status: dict) -> None:
+        self._timer.stop()
+        self._set(self.Error, status)
+
     @Slot()
     def startCheck(self) -> None:
-        pass
+        if self.running:
+            log.info("sync check: start check called when running")
+            return
+        self._timer.stop()
+        self._set(self.Idle, checker_status())
+        if not self.online():
+            self._fail(checker_status(NOT_ON_WIFI))
+        elif not self.paired():
+            self._fail(checker_status(NOT_PAIRED_TABLET if self._device else NOT_PAIRED_APP))
+        else:
+            self._set(self.CheckInternetConnection, checker_status(CHECKING_INTERNET))
+            self.check_internet()
+
+    def internet_checked(self, ok: bool, code: int | None = None) -> None:
+        """The reply to GET /discovery/v1/endpoints (InternetCheck.finished)."""
+        if not ok:
+            self._fail(internet_error_status(code, self._device))
+            return
+        log.info("sync check: got ok reply from internet check")
+        self._set(self.WaitingForSync, checker_status(WAITING_FOR_SYNC))
+        if not self._timer.isActive():
+            self._timer.start()
+        self.request_sync()
+
+    def sync_status_changed(self, status: int, detail: str = "") -> None:
+        """Every DocumentSync.syncStatusChanged, checking or not (as the app connects it)."""
+        self._timer.stop()
+        if status == SyncStatus.Syncing:
+            self._set(self.Syncing, checker_status(SYNCING))
+        elif status == SyncStatus.Completed:
+            self._set(self.Success, checker_status(SYNC_COMPLETED))
+        else:
+            text = SYNC_STATUS_TEXT.get(status, SYNC_STATUS_TEXT[SyncStatus.Failed])
+            self._fail(checker_status((text, "cloud_x"), detail))
+
+    def progress_changed(self, counts: dict) -> None:
+        """Every DocumentSync.progressCountsChanged: while a sync runs, "Syncing (3 of 10)"."""
+        if self._state != self.Syncing:
+            return
+        text = SYNCING[0]
+        if counts.get("scheduled", 0) > 0:
+            text = (SYNC_PROGRESS.replace("%1", counts.get("state", ""))
+                    .replace("%2", str(counts.get("transferred", 0))).replace("%3", str(counts["scheduled"])))
+        self._set(self.Syncing, checker_status((text, SYNCING[1])))
+
+    def _timed_out(self) -> None:
+        log.info("sync check: got timeout in state: %d", self._state)
+        if self._state == self.WaitingForSync:
+            self._fail(checker_status(SYNC_NOT_STARTED))
+        elif self._state == self.Syncing:
+            self._fail(checker_status(NOT_SYNCING))
 
 
 class DocumentSync(QObject):
@@ -1380,12 +1554,26 @@ class DocumentSync(QObject):
         self._failure = False
         self._counts = ProgressCounts()
         self._checker = SyncChecker(self)
+        self.syncStatusChanged.connect(self._checker.sync_status_changed)
+        self.progressCountsChanged.connect(self._checker.progress_changed)
 
-    def set_state(self, syncing: bool, failure: bool = False) -> None:
-        self._syncing, self._failure = syncing, failure
-        self._counts = ProgressCounts(state="syncing" if syncing else ("failed" if failure else "idle"),
-                                      progress=0.0 if syncing else 1.0)
-        self.syncStatusChanged.emit(1 if syncing else (2 if failure else 0), "")
+    def set_status(self, status: SyncStatus, detail: str = "") -> None:
+        """A sync started (Syncing), ended (Completed) or failed (any status above Aborted)."""
+        self._syncing = status == SyncStatus.Syncing
+        self._failure = status > SyncStatus.Aborted
+        self._counts = (ProgressCounts(state=tr(SYNC_CONTEXT, "Syncing")) if self._syncing
+                        else ProgressCounts(progress=1.0))
+        self.syncStatusChanged.emit(int(status), detail)
+        self.progressCountsChanged.emit(dict(self._counts))
+
+    def set_progress(self, transferred: int, scheduled: int, throttled: bool = False) -> None:
+        """The running sync's progress (onSyncProgressChanged, 0x140120780): entries
+        transferred of scheduled; the state text is "Syncing (throttled)" while the cloud
+        slows it down."""
+        if not self._syncing:
+            return
+        self._counts = ProgressCounts(transferred, scheduled, transferred / scheduled if scheduled else 0.0,
+                                      tr(SYNC_CONTEXT, "Syncing (throttled)" if throttled else "Syncing"))
         self.progressCountsChanged.emit(dict(self._counts))
 
     isSyncing = Property(bool, lambda self: self._syncing, notify=syncStatusChanged)

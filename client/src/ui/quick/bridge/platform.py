@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote
 from PySide6.QtCore import (Property, QByteArray, QCoreApplication, QDate, QFile, QIODevice, QLocale, QObject, QRectF, QSettings,
                             QSize, QSizeF, QUrl, Qt, Signal, Slot, QEnum)
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QImage, QPainter
+from PySide6.QtNetwork import QNetworkInformation
 
 from .images import AsyncImageProvider
 from PySide6.QtSvg import QSvgRenderer
@@ -383,28 +384,47 @@ class LanguageSettings(QObject):
         return self.nativeLanguageName(code)
 
 
+def network_information() -> QNetworkInformation | None:
+    """QNetworkInformation with a reachability backend, loaded as LinkProviderQt6 loads it
+    (linkprovider-qt6.cpp): None, logged, when no backend can be."""
+    if not QNetworkInformation.loadBackendByFeatures(QNetworkInformation.Feature.Reachability):
+        log.warning("QNetworkInformation: failed to load any backend")
+        log.warning("Backends available: %s", ", ".join(QNetworkInformation.availableBackends()))
+        return None
+    information = QNetworkInformation.instance()
+    log.info("QNetworkInformation, backend: %s", information.backendName())
+    return information
+
+
 class LinkProvider(QObject):
-    """`LinkProvider` in QML (LinkProviderWrapper): whether the cloud is reachable, as
-    the last sync found it (main.qml shows "No cloud connection" when it is not)."""
+    """`LinkProvider` in QML (LinkProviderWrapper over LinkProviderQt6): the network link
+    as QNetworkInformation sees it. Reachability Local, Site or Online is Online; Unknown,
+    Disconnected or no backend at all is Offline (0x14074d4c0). main.qml shows "No cloud
+    connection" when it is not Online, and the sync check says "You're not connected to
+    Wi-Fi". `information` stands in for QNetworkInformation (tests)."""
 
     Availability = IntEnum("Availability", {"Offline": 0, "Connecting": 1, "Online": 2})
     QEnum(Availability)
+    ONLINE = (QNetworkInformation.Reachability.Local, QNetworkInformation.Reachability.Site,
+              QNetworkInformation.Reachability.Online)
 
     availabilityChanged = Signal(int)
     meteredConnectionStatus = Signal(bool)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, information=None) -> None:
         super().__init__(parent)
-        self._availability = 2
+        self._information = information if information is not None else network_information()
+        if self._information is not None:
+            self._information.reachabilityChanged.connect(lambda _: self.availabilityChanged.emit(self._availability()))
 
-    def set_online(self, online: bool) -> None:
-        availability = 2 if online else 0
-        if availability != self._availability:
-            self._availability = availability
-            self.availabilityChanged.emit(availability)
+    def _availability(self) -> int:
+        if self._information is None:
+            log.debug("network backend not loaded")
+            return 0
+        return 2 if self._information.reachability() in self.ONLINE else 0
 
-    isOnline = Property(bool, lambda self: self._availability == 2, notify=availabilityChanged)
-    availability = Property(int, lambda self: self._availability, notify=availabilityChanged)
+    isOnline = Property(bool, lambda self: self._availability() == 2, notify=availabilityChanged)
+    availability = Property(int, lambda self: self._availability(), notify=availabilityChanged)
     connectionIsMetered = Property(bool, lambda self: False, constant=True)
 
 

@@ -20,8 +20,9 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent / "src"), str(HERE)]
 
 from PySide6.QtCore import (Q_ARG, QEventLoop, QMetaObject, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer,
-                            QUrl, qVersion)
+                            QUrl, Signal, qVersion)
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
+from PySide6.QtNetwork import QNetworkInformation
 from PySide6.QtWidgets import QApplication
 
 from ui.quick.app import configure, prepare
@@ -892,6 +893,293 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue((self.out / "after.pdf").exists())
 
 
+class FakeNetwork(QObject):
+    """Stands in for QNetworkInformation (LinkProvider's `information`)."""
+
+    reachabilityChanged = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._reachability = QNetworkInformation.Reachability.Online
+
+    def reachability(self):
+        return self._reachability
+
+    def set(self, reachability) -> None:
+        self._reachability = reachability
+        self.reachabilityChanged.emit(reachability)
+
+
+class SyncCheckTests(unittest.TestCase):
+    """Settings > Cloud > "Check sync" (the app's CheckSyncDialog) over the fake cloud, as
+    reMarkable.exe's Checker does it: the network, the log-in, the internet check, the
+    sync it asks for, and what the dialog then says."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        tmp = Path(cls.tmp.name)
+        cls.cloud = build_demo_cloud()
+        cls.source = LibrarySource(SyncClient(paired_auth(tmp / "auth", cls.cloud), tmp / "cache"))
+        cls.source.refresh()
+        cls.network = FakeNetwork()
+        cls.app = QuickApp(cls.source, tmp / "cache", config_dir=tmp, network_information=cls.network)
+        cls.app.load()
+        cls.app.start(sync=False)
+        wait(800)
+        cls.window = cls.app.window
+        cls.window.resize(1270, 875)
+        cls.checker = cls.app.singletons.document_sync.syncChecker
+        cls.settings, cls.dialog = (next(o for o in cls.window.findChildren(QObject)
+                                         if o.metaObject().className().startswith(name))
+                                    for name in ("GeneralSettings", "CheckSyncDialog"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.app.shutdown()
+        del cls.window, cls.settings, cls.dialog
+        gc.collect()
+        cls.app.engine.deleteLater()
+        wait(50)
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.texts: list[str] = []
+        self.checker.changed.connect(self._record)
+
+    def tearDown(self):
+        self.checker.changed.disconnect(self._record)
+        for dialog in (self.dialog, self.settings):
+            if dialog.property("visible"):
+                QMetaObject.invokeMethod(dialog, "hide")
+        wait(300)
+        self.assertTrue(self.wait_for(lambda: not self.checker.running and not self.app.syncer.running))
+
+    def _record(self):
+        text = self.checker.property("status")["text"]
+        if text and (not self.texts or self.texts[-1] != text):
+            self.texts.append(text)
+
+    wait_for = WorkflowTests.wait_for
+
+    def find_visible(self, prop, value):
+        todo = [self.window.contentItem()]
+        while todo:
+            item = todo.pop()
+            todo.extend(item.childItems())
+            if item.property(prop) != value or item.width() <= 0:
+                continue
+            shown, up = True, item
+            while up is not None and shown:
+                shown, up = up.isVisible() and up.opacity() > 0, up.parentItem()
+            if shown:
+                return item
+        return None
+
+    def click(self, item):
+        from PySide6.QtTest import QTest
+        centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, centre)
+
+    def click_check_sync(self):
+        """General settings > Cloud ("Check sync"), then the dialog's "Check sync" button."""
+        if not self.dialog.property("visible"):
+            QMetaObject.invokeMethod(self.settings, "show")
+            self.assertTrue(self.wait_for(lambda: self.find_visible("text", "Cloud") is not None))
+            self.click(self.find_visible("text", "Cloud"))
+            self.assertTrue(self.wait_for(lambda: self.dialog.property("visible")))
+        self.assertTrue(self.wait_for(lambda: self.find_visible("text", "Check sync") is not None))
+        self.click(self.find_visible("text", "Check sync"))
+
+    def status(self):
+        return self.checker.property("status")
+
+    def check_texts(self) -> list[str]:
+        """What the dialog said from the start of the check on."""
+        return self.texts[self.texts.index("Checking internet connection..."):]
+
+    def add_document(self, name: str) -> None:
+        doc = demo_id(name)
+        self.cloud.put_item(doc, {"visibleName": name, "parent": "", "type": "DocumentType", "lastModified": ms(0)},
+                            {"fileType": "pdf"}, {f"{doc}.pdf": make_pdf(name, [["one"]])})
+
+    def test_check_sync_checks_the_connection_then_syncs(self):
+        requests = len(self.cloud.requests)
+        statuses, counts = [], []
+        document_sync = self.app.singletons.document_sync
+        document_sync.syncStatusChanged.connect(lambda status, detail: statuses.append(status))
+        document_sync.progressCountsChanged.connect(counts.append)
+        self.add_document("Arrived from the tablet")
+        self.click_check_sync()
+        self.assertTrue(self.checker.running)
+        self.assertTrue(self.wait_for(lambda: self.checker.state == library.SyncChecker.Success))
+        self.assertEqual(self.check_texts(), ["Checking internet connection...", "Waiting for sync", "Syncing...",
+                                              "Syncing (0 of 1)", "Syncing (1 of 1)", "Sync completed successfully."])
+        self.assertEqual(self.status(), {"text": "Sync completed successfully.", "detail": "",
+                                         "icon": "qrc:/ark/icons/checkmark"})
+        self.assertFalse(self.checker.property("error"))
+        # The internet check first, then a full sync from the root.
+        made = self.cloud.requests[requests:]
+        self.assertEqual(made[0], "/discovery/v1/endpoints")
+        self.assertTrue(any(path.startswith("/sync/") for path in made[1:]))
+        self.assertEqual(statuses, [library.SyncStatus.Syncing, library.SyncStatus.Completed])
+        # ProgressCounts as the app's SyncNotification reads them ("Syncing (1 of 1)").
+        self.assertEqual(counts[-2], {"transferred": 1, "scheduled": 1, "progress": 1.0, "state": "Syncing"})
+        self.assertEqual(counts[-1]["state"], "")
+        # The dialog shows it, and the button is back.
+        self.assertIsNotNone(self.find_visible("message", "Sync completed successfully."))
+        self.assertIsNotNone(self.find_visible("text", "Check sync"))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_no_network(self):
+        requests = len(self.cloud.requests)
+        self.network.set(QNetworkInformation.Reachability.Disconnected)
+        try:
+            self.assertFalse(self.app.singletons.link.property("isOnline"))
+            self.assertTrue(self.wait_for(lambda: self.find_visible("message", "No cloud connection")))  # main.qml
+            self.click_check_sync()
+            self.assertTrue(self.wait_for(lambda: self.checker.property("error")))
+            self.assertEqual(self.status(), {"text": "You're not connected to Wi-Fi", "detail": "",
+                                             "icon": "qrc:/ark/icons/wifi_x"})
+            self.assertEqual(self.cloud.requests[requests:], [])
+        finally:
+            self.network.set(QNetworkInformation.Reachability.Online)
+        self.assertTrue(self.wait_for(lambda: self.find_visible("message", "No cloud connection") is None))
+
+    def test_no_internet(self):
+        import socket
+        import urllib.error
+        transport = self.app.auth.transport
+
+        def offline(method, url, headers, body, timeout):
+            raise urllib.error.URLError(socket.gaierror(-3, "Temporary failure in name resolution"))
+        self.app.auth.transport = offline
+        try:
+            self.click_check_sync()
+            self.assertTrue(self.wait_for(lambda: self.checker.property("error")))
+        finally:
+            self.app.auth.transport = transport
+        text = 'Unable to connect to the Internet. \nCheck your network settings and try again.("Host not found error")'
+        self.assertEqual(self.status(), {"text": text, "detail": "", "icon": "qrc:/ark/icons/wifi_x"})
+        self.assertFalse(self.app.syncer.running)
+        self.assertIsNotNone(self.find_visible(
+            "text", "There was an issue with your last sync. Click 'Check sync' to try again."))
+
+    def test_failed_sync(self):
+        statuses = []
+        self.app.singletons.document_sync.syncStatusChanged.connect(lambda status, detail: statuses.append(status))
+        self.cloud.fail_next = [400]
+        self.click_check_sync()
+        self.assertTrue(self.wait_for(lambda: self.checker.property("error")))
+        self.assertEqual(self.status()["text"], "Failure during sync. Check your network and try again.")
+        self.assertEqual(self.status()["icon"], "qrc:/ark/icons/cloud_x")
+        self.assertIn("HTTP 400", self.status()["detail"])
+        # A failure (status > 2) is what the app's own "Unable to sync" notification waits for.
+        self.assertEqual(statuses, [library.SyncStatus.Syncing, library.SyncStatus.Failed])
+        # Checking again once the cloud answers clears it.
+        self.click_check_sync()
+        self.assertTrue(self.wait_for(lambda: self.checker.state == library.SyncChecker.Success))
+
+    def test_a_sync_running_when_the_check_asks_for_one(self):
+        """While a sync runs the dialog hides its button (the checker follows that sync), so
+        one can only be running when a sync starts during the internet check: the check's
+        own full sync then runs after it, as the app queues it."""
+        import threading
+        internet, sync, transport = threading.Event(), threading.Event(), self.app.auth.transport
+
+        def slow(method, url, headers, body, timeout):
+            (sync if "/sync/" in url else internet).wait(10)
+            return transport(method, url, headers, body, timeout)
+        self.app.auth.transport = slow
+        try:
+            self.click_check_sync()
+            self.assertTrue(self.wait_for(lambda: self.checker.state == library.SyncChecker.CheckInternetConnection))
+            requests = len(self.cloud.requests)
+            self.app.syncer.refresh()
+            self.assertEqual(self.checker.state, library.SyncChecker.Syncing)
+            internet.set()
+            self.assertTrue(self.wait_for(lambda: self.checker.state == library.SyncChecker.WaitingForSync))
+            sync.set()
+            self.assertTrue(self.wait_for(lambda: self.checker.state == library.SyncChecker.Success
+                                          and not self.app.syncer.running))
+        finally:
+            self.app.auth.transport = transport
+        roots = [p for p in self.cloud.requests[requests:] if p in ("/sync/v3/root", "/sync/v4/root")]
+        self.assertEqual(len(roots), 2)          # the running sync, then the one the check asked for
+        self.assertEqual(self.check_texts(), ["Checking internet connection...", "Syncing...", "Waiting for sync",
+                                              "Sync completed successfully.", "Syncing...",
+                                              "Sync completed successfully."])
+
+    def test_the_sync_must_start_in_time(self):
+        request_sync = self.checker.request_sync
+        self.checker.request_sync = lambda: None
+        self.checker._timer.setInterval(300)
+        try:
+            self.click_check_sync()
+            self.assertTrue(self.wait_for(lambda: self.checker.state == library.SyncChecker.WaitingForSync))
+            self.assertEqual(self.status()["text"], "Waiting for sync")
+            self.assertTrue(self.wait_for(lambda: self.checker.property("error")))
+        finally:
+            self.checker.request_sync = request_sync
+            self.checker._timer.setInterval(library.SyncChecker.TIMEOUT_MS)
+        self.assertEqual(self.status(), {"text": "Unable to sync. \nTry restarting if the problem persists",
+                                         "detail": "", "icon": "qrc:/ark/icons/cloud_x"})
+
+    def test_offline_the_app_is_not_connected_to_the_cloud(self):
+        cloud = build_demo_cloud()
+        tmp = Path(self.tmp.name) / "offline"
+        source = LibrarySource(SyncClient(paired_auth(tmp / "auth", cloud), tmp / "cache"), cached_only=True)
+        app = QuickApp(source, tmp / "cache", network_information=FakeNetwork())
+        app.start()
+        self.assertFalse(app.syncer.running)              # nothing to sync offline
+        checker = app.singletons.document_sync.syncChecker
+        checker.setProperty("onDevice", False)              # as CheckSyncDialog sets it
+        checker.startCheck()
+        self.assertTrue(checker.property("error"))
+        self.assertEqual(checker.property("status")["text"],
+                         "You're not connected to the cloud. Check if your app is paired to a reMarkable account.")
+        self.assertEqual(cloud.requests, [])
+        app.shutdown()
+
+    def test_internet_errors_as_the_app_names_them(self):
+        import http.client
+        import socket
+        import ssl
+        import urllib.error
+        from core.auth import http_error_code
+
+        def cert(verify_code):
+            err = ssl.SSLCertVerificationError(1, "certificate verify failed")
+            err.verify_code = verify_code
+            return urllib.error.URLError(err)
+        codes = {urllib.error.URLError(socket.gaierror(-2, "Name or service not known")): 2,
+                 http.client.IncompleteRead(b"partial"): 5,
+                 cert(10): 6, cert(9): 6, cert(20): 7,
+                 urllib.error.URLError(ssl.SSLError(1, "handshake failure")): 7,
+                 TimeoutError("timed out"): 10, ConnectionRefusedError(111, "Connection refused"): 10}
+        self.assertEqual({type(getattr(e, "reason", e)).__name__ + str(c): http_error_code(e) for e, c in codes.items()},
+                         {type(getattr(e, "reason", e)).__name__ + str(c): c for e, c in codes.items()})
+        status = library.internet_error_status
+        self.assertTrue(status(6, False)["text"].startswith("There might be an issue with the date/time information"))
+        self.assertTrue(status(7, False)["text"].startswith("Unable to establish a secure connection"))
+        self.assertTrue(status(10, False)["text"].endswith('try again.("Unspecified network error")'))
+        # An answer with an HTTP error status has no error code: the text alone.
+        self.assertEqual(status(None, True)["text"],
+                         "You're connected to Wi-Fi, but not the internet.\nCheck your Wi-Fi settings and try again.")
+
+    def test_link_follows_reachability_as_the_app_maps_it(self):
+        R = QNetworkInformation.Reachability
+        network = FakeNetwork()
+        link = platform.LinkProvider(information=network)
+        changes = []
+        link.availabilityChanged.connect(changes.append)
+        for reachability, online in ((R.Local, True), (R.Site, True), (R.Online, True),
+                                     (R.Unknown, False), (R.Disconnected, False)):
+            network.set(reachability)
+            self.assertEqual(link.property("isOnline"), online, reachability)
+            self.assertEqual(changes[-1], 2 if online else 0)
+
+
 class LoginTests(unittest.TestCase):
     """Logging in through the app's own LoginWizard (main.qml) with no auth.json, over the
     fake cloud, then out again: no demo library, no restart."""
@@ -1141,7 +1429,6 @@ class LoginTests(unittest.TestCase):
         env = {"_PYI_PARENT_PROCESS_LEVEL": "1"}
         run.release_bundle_environment(env, None)            # not frozen: no bundle, nothing changes
         self.assertEqual(env, {"_PYI_PARENT_PROCESS_LEVEL": "1"})
-
 
 
 if __name__ == "__main__":

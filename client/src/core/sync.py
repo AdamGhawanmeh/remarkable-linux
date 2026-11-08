@@ -404,6 +404,7 @@ class SyncClient:
         self.root: RootInfo | None = None
         self.tree = DocumentTree()
         self.root_index: Index | None = None
+        self.throttled = False                # the cloud answered 429 during this refresh
 
     # -- transport ------------------------------------------------------------
 
@@ -433,6 +434,7 @@ class SyncClient:
                 return resp
             if resp.status == 429 or resp.status >= 500:
                 problem = f"HTTP {resp.status}"
+                self.throttled = self.throttled or resp.status == 429
                 retry_after = resp.header("retry-after")
                 if retry_after and retry_after.isdigit():
                     delay = min(max(delay, float(retry_after)), MAX_RETRY_DELAY)
@@ -504,10 +506,14 @@ class SyncClient:
                                                   cached_only=cached_only))
         return make_node(entry.id, metadata, content, hash=entry.hash, files=files)
 
-    def _load_entries(self, entries: list[IndexEntry], cached_only: bool) -> tuple[list, list]:
+    def _load_entries(self, entries: list[IndexEntry], cached_only: bool,
+                      done: Callable[[IndexEntry], None] | None = None) -> tuple[list, list]:
         nodes, failures = [], []
         with ThreadPoolExecutor(max_workers=self._workers()) as pool:
             futures = {pool.submit(self._load_entry, e, cached_only): e for e in entries}
+            if done is not None:
+                for fut, entry in futures.items():
+                    fut.add_done_callback(lambda _, entry=entry: done(entry))
             for fut, entry in futures.items():
                 try:
                     nodes.append(fut.result())
@@ -535,10 +541,15 @@ class SyncClient:
         log.info("loaded %d items from cache (%d missing)", len(nodes), len(failures))
         return self.tree
 
-    def refresh(self) -> DocumentTree:
-        """Fetch the remote tree. Only indexes/metadata not already cached are downloaded."""
+    def refresh(self, progress: Callable[[int, int, bool], None] | None = None) -> DocumentTree:
+        """Fetch the remote tree. Only indexes/metadata not already cached are downloaded.
+
+        `progress(transferred, scheduled, throttled)` follows those downloads entry by entry,
+        as the app's sync reports its ProgressStats; `throttled` once the cloud has answered
+        429 (it is retried)."""
         with self._busy:
-            return self._apply_root(self.fetch_root())
+            self.throttled = False
+            return self._apply_root(self.fetch_root(), progress)
 
     def forget(self) -> None:
         """Delete the cached library (blobs, materialised documents, sync state), as logging
@@ -553,7 +564,8 @@ class SyncClient:
             self.root_index = None
             self.tree = DocumentTree()
 
-    def _apply_root(self, root: RootInfo) -> DocumentTree:
+    def _apply_root(self, root: RootInfo,
+                    progress: Callable[[int, int, bool], None] | None = None) -> DocumentTree:
         """Make `root` the current tree and record it in the sync state."""
         self.root = root
         now = _now(self._clock)
@@ -564,7 +576,20 @@ class SyncClient:
             self.root_index = self.get_index(root.hash, ROOT_INDEX_NAME)
             entries = self.root_index.entries
 
-        nodes, failures = self._load_entries(entries, cached_only=False)
+        done = None
+        if progress is not None:
+            # Entries to download: those whose index is not cached yet.
+            scheduled = {e.id for e in entries if not self.blobs.has(e.hash)}
+            transferred: list[str] = []
+            count = threading.Lock()
+            progress(0, len(scheduled), self.throttled)
+
+            def done(entry: IndexEntry) -> None:
+                if entry.id in scheduled:
+                    with count:
+                        transferred.append(entry.id)
+                        progress(len(transferred), len(scheduled), self.throttled)
+        nodes, failures = self._load_entries(entries, cached_only=False, done=done)
         self.tree = DocumentTree(nodes)
 
         with self._lock:

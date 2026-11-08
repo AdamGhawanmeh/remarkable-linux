@@ -8,6 +8,7 @@ raises across the thread boundary.
 
 from __future__ import annotations
 
+import http.client
 import logging
 import threading
 from pathlib import Path
@@ -17,7 +18,7 @@ import shiboken6
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from PySide6.QtGui import QImage
 
-from core.auth import AuthClient, AuthError, DeviceRevokedError, NotPairedError
+from core.auth import AuthClient, AuthError, DeviceRevokedError, NotPairedError, http_error_code, user_agent
 from core.models import Document, DocumentTree
 from core.sync import SyncClient, SyncError
 
@@ -347,6 +348,7 @@ class Syncer(QObject):
     failed = Signal(str)
     unauthorized = Signal(str)
     started = Signal()
+    progress = Signal(int, int, bool)    # entries transferred, scheduled; throttled
 
     def __init__(self, source: LibrarySource, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -354,6 +356,7 @@ class Syncer(QObject):
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)
         self.running = False
+        self.last_error: Exception | None = None     # why the last sync failed
 
     def refresh(self) -> bool:
         if self.running:
@@ -361,21 +364,55 @@ class Syncer(QObject):
         self.running = True
         self.started.emit()
 
+        def progress(transferred: int, scheduled: int, throttled: bool) -> None:
+            emit_from_worker(self, lambda: self.progress.emit(transferred, scheduled, throttled))
+
         def job():
             try:
-                tree: DocumentTree = self.source.refresh()
+                tree: DocumentTree = self.source.refresh(progress)
             except (DeviceRevokedError, NotPairedError) as err:
-                self.running = False
+                self.running, self.last_error = False, err
                 emit_from_worker(self, lambda: self.unauthorized.emit(f"{type(err).__name__}: {err}"))
                 return
             except EXPECTED_ERRORS as err:
-                self.running = False
+                self.running, self.last_error = False, err
                 emit_from_worker(self, lambda: self.failed.emit(f"{type(err).__name__}: {err}"))
                 return
             self.running = False
             emit_from_worker(self, lambda: self.finished.emit(tree))
         self.pool.start(_Job(job))
         return True
+
+    def wait(self, msecs: int = 60000) -> bool:
+        return self.pool.waitForDone(msecs)
+
+
+class InternetCheck(QObject):
+    """The sync check's internet test (Checker::checkInternetConnection): GET
+    /discovery/v1/endpoints on the gateway, in the background. `finished(ok, code)`: ok
+    unless there was no answer or it was HTTP 400-599 (as the app's Reply judges it);
+    `code` is the app's http::Error for a failure without an answer, else None."""
+
+    finished = Signal(bool, object)
+
+    def __init__(self, auth: AuthClient, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.auth = auth
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(1)
+
+    def start(self) -> None:
+        def job():
+            code = None
+            try:
+                resp = self.auth.transport("GET", self.auth.resolver.discovery_url(), {"User-Agent": user_agent()},
+                                           None, self.auth.settings.http_timeout_s)
+                ok = not 400 <= resp.status <= 599
+            except (OSError, http.client.HTTPException) as err:
+                log.info("internet check failed: %s: %s", type(err).__name__, err)
+                ok, code = False, http_error_code(err)
+            emit_from_worker(self, lambda: self.finished.emit(ok, code))
+        self.pool.start(_Job(job))
 
     def wait(self, msecs: int = 60000) -> bool:
         return self.pool.waitForDone(msecs)

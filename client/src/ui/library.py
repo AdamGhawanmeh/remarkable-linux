@@ -14,6 +14,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Document, DocumentTree, FileType, Folder, Node,
                          Page)
@@ -318,10 +319,11 @@ class LibrarySource:
     def load_cached(self) -> DocumentTree:
         return self.sync.load_cached()
 
-    def refresh(self) -> DocumentTree:
+    def refresh(self, progress: Callable[[int, int, bool], None] | None = None) -> DocumentTree:
+        """Sync the tree (`progress` as SyncClient.refresh). Offline: the cache."""
         if self.cached_only:
             return self.sync.load_cached()
-        return self.sync.refresh()
+        return self.sync.refresh(progress)
 
     def forget(self) -> None:
         """Drop the cached library (logging out)."""

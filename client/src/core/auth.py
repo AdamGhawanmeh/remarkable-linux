@@ -109,6 +109,42 @@ def urllib_transport(method: str, url: str, headers: Mapping[str, str],
         return HttpResponse(err.code, dict(err.headers.items()), err.read())
 
 
+# http::Error of the official app's HTTP library (xofm/libs/http), as its name lookup
+# (0x140309410) prints them; the sync check shows them.
+HTTP_ERRORS = ("Operation cancelled (abort)", "Partial download error", "Host not found error", "Redirection error",
+               "Token failure", "Error during response receipt", "SSL certificate time error",
+               "SSL handshake failed", "Connecting timeout", "Send failed", "Unspecified network error")
+HTTP_ERROR_UNKNOWN = "Unknown error!"
+HOST_NOT_FOUND, RESPONSE_ERROR, CERTIFICATE_TIME_ERROR, HANDSHAKE_FAILED, UNSPECIFIED_NETWORK_ERROR = 2, 5, 6, 7, 10
+# OpenSSL's X509_V_ERR_CERT_NOT_YET_VALID and X509_V_ERR_CERT_HAS_EXPIRED: a wrong clock.
+CERTIFICATE_TIME_ERRORS = (9, 10)
+
+
+def http_error_name(code: int) -> str:
+    return HTTP_ERRORS[code] if 0 <= code < len(HTTP_ERRORS) else HTTP_ERROR_UNKNOWN
+
+
+def http_error_code(error: BaseException) -> int:
+    """The http::Error the official app gives a request that failed without an HTTP status
+    to go by, per its curl backend (0x140344970; the Qt one, 0x140333fc0, agrees): an
+    unresolved host is 2, a failure once the response had begun 5, a certificate not yet
+    valid or expired 6, any other TLS failure 7, and everything else (refused, timed out,
+    unreachable) 10."""
+    import http.client
+    import socket
+    import ssl
+    reason = getattr(error, "reason", error)        # urllib wraps socket and TLS errors
+    if isinstance(reason, socket.gaierror):
+        return HOST_NOT_FOUND
+    if isinstance(reason, http.client.IncompleteRead):
+        return RESPONSE_ERROR
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return CERTIFICATE_TIME_ERROR if reason.verify_code in CERTIFICATE_TIME_ERRORS else HANDSHAKE_FAILED
+    if isinstance(reason, ssl.SSLError):
+        return HANDSHAKE_FAILED
+    return UNSPECIFIED_NETWORK_ERROR
+
+
 def user_agent() -> str:
     # Same shape as the Windows app's "%1/%2 (%3 %4)".
     return f"remarkable-linux/{__version__} (linux {platform.release()})"
@@ -184,9 +220,12 @@ class HostResolver:
         self.transport = transport
         self._discovered: dict[str, Any] | None = None
 
+    def discovery_url(self) -> str:
+        return _host_url(self.settings.default_gateway) + DISCOVERY_PATH
+
     def discover(self) -> dict[str, Any]:
         if self._discovered is None:
-            url = _host_url(self.settings.default_gateway) + DISCOVERY_PATH
+            url = self.discovery_url()
             try:
                 resp = self.transport("GET", url, {"User-Agent": user_agent()},
                                       None, self.settings.http_timeout_s)
