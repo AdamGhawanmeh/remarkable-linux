@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -117,6 +118,51 @@ def self_test(app: QApplication, quick: QuickApp, seconds: float = 4.0) -> int:
     return 1 if problems else 0
 
 
+def restore_system_environment(environ=os.environ, frozen: bool | None = None) -> None:
+    """Give the programs the standalone build starts the user's environment back.
+
+    PyInstaller's bootloader puts the bundle's own libraries (_internal/) first on
+    LD_LIBRARY_PATH, keeping any earlier value in LD_LIBRARY_PATH_ORIG. Everything the app
+    starts inherits it: xdg-open, gio, flatpak and the browser behind the log-in button, the
+    file manager, fc-cache. They then load the bundle's copies of Qt, GLib, OpenSSL... in
+    place of the system's, and any program built against a newer one fails to start (a
+    system Qt 6.11 tool stops with "version `Qt_6.11' not found"), so the browser never
+    opens (GitHub issue #2). The dynamic loader read LD_LIBRARY_PATH for this process when
+    it started, so the app keeps finding its own libraries."""
+    if not (getattr(sys, "frozen", False) if frozen is None else frozen):
+        return
+    original = environ.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original is None:
+        environ.pop("LD_LIBRARY_PATH", None)
+    else:
+        environ["LD_LIBRARY_PATH"] = original
+
+
+# Set by PyInstaller's PySide6 runtime hook (pyi_rth_pyside6) to the bundle's Qt.
+BUNDLE_QT_VARIABLES = ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH")
+# PyInstaller's bootloader marks its own child processes with these.
+BOOTLOADER_PREFIX = "_PYI_"
+
+
+def release_bundle_environment(environ=os.environ, bundle: str | None = None) -> None:
+    """The rest of GitHub issue #2: what else of the bundle's the programs the app starts
+    inherit. PyInstaller's PySide6 runtime hook points QT_PLUGIN_PATH and QML2_IMPORT_PATH
+    at the bundle's Qt (6.10), so a Qt program among them (kde-open, a Qt browser or file
+    manager) loads those plugins into its own, newer Qt: the bundle's Wayland plugin fails
+    and the program falls back to X11, or stops where there is none. And the bootloader's
+    _PYI_* variables make another PyInstaller-built program take itself for a part of this
+    one. This process read QT_PLUGIN_PATH when the QApplication started and
+    QML2_IMPORT_PATH when the QML engine was made, and never starts itself again, so call
+    this after both. The hook overwrote any value of the user's, which is lost."""
+    bundle = getattr(sys, "_MEIPASS", None) if bundle is None else bundle
+    if not bundle:
+        return
+    for name in list(environ):
+        if (name.startswith(BOOTLOADER_PREFIX)
+                or name in BUNDLE_QT_VARIABLES and environ[name].startswith(bundle)):
+            del environ[name]
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = parser.add_mutually_exclusive_group()
@@ -129,6 +175,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main() -> int:
+    restore_system_environment()
     args = parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
@@ -146,6 +193,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="remarkable-demo-") as tmp:
         quick, sync = make_app(args, Path(tmp))
         quick.load()
+        release_bundle_environment()
         quick.start(sync=sync)
         try:
             return self_test(app, quick) if args.self_test else app.exec()

@@ -442,6 +442,7 @@ class PlatformHelpers(QObject):
 
     @Slot(str)
     def openUrl(self, url: str) -> None:
+        log.info("opening %s in the default browser", url)     # run.py -v: the URL, if it does not open
         QDesktopServices.openUrl(QUrl(url))
 
     @Slot(str, result=bool)

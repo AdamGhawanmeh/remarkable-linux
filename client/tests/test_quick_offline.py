@@ -1108,6 +1108,41 @@ class LoginTests(unittest.TestCase):
             demo.shutdown()
         self.assertFalse((home / "config" / "remarkable-linux" / "auth.json").exists())
 
+    def test_standalone_build_gives_launched_programs_the_system_libraries(self):
+        """GitHub issue #2: the browser did not open from the standalone build."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("run_client", HERE.parent / "run.py")
+        run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(run)
+        bundle = "/opt/remarkable-linux/_internal"
+        # What PyInstaller's bootloader leaves when LD_LIBRARY_PATH was unset...
+        env = {"LD_LIBRARY_PATH": bundle, "PATH": "/usr/bin"}
+        run.restore_system_environment(env, frozen=True)
+        self.assertEqual(env, {"PATH": "/usr/bin"})
+        # ...and when the user had one: theirs comes back.
+        env = {"LD_LIBRARY_PATH": f"{bundle}:/opt/lib", "LD_LIBRARY_PATH_ORIG": "/opt/lib"}
+        run.restore_system_environment(env, frozen=True)
+        self.assertEqual(env, {"LD_LIBRARY_PATH": "/opt/lib"})
+        # Running from source changes nothing.
+        env = {"LD_LIBRARY_PATH": "/opt/lib"}
+        run.restore_system_environment(env, frozen=False)
+        self.assertEqual(env, {"LD_LIBRARY_PATH": "/opt/lib"})
+        # Once Qt has read them, the bundle's Qt paths and the bootloader's markers go too
+        # (what a frozen build's xdg-open child got); anyone else's Qt paths stay.
+        internal = "/opt/remarkable-linux/_internal"
+        env = {"QT_PLUGIN_PATH": f"{internal}/PySide6/Qt/plugins", "QML2_IMPORT_PATH": f"{internal}/PySide6/Qt/qml",
+               "_PYI_ARCHIVE_FILE": "/opt/remarkable-linux/remarkable-linux", "_PYI_PARENT_PROCESS_LEVEL": "1",
+               "_PYI_LINUX_PROCESS_NAME": "remarkable-linu", "PATH": "/usr/bin"}
+        run.release_bundle_environment(env, internal)
+        self.assertEqual(env, {"PATH": "/usr/bin"})
+        env = {"QT_PLUGIN_PATH": "/usr/lib64/qt6/plugins"}
+        run.release_bundle_environment(env, internal)
+        self.assertEqual(env, {"QT_PLUGIN_PATH": "/usr/lib64/qt6/plugins"})
+        env = {"_PYI_PARENT_PROCESS_LEVEL": "1"}
+        run.release_bundle_environment(env, None)            # not frozen: no bundle, nothing changes
+        self.assertEqual(env, {"_PYI_PARENT_PROCESS_LEVEL": "1"})
+
+
 
 if __name__ == "__main__":
     unittest.main()
