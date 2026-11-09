@@ -19,17 +19,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from rmfixtures import (  # noqa: E402
-    ROOT, ZERO, block, f_id, f_sub, group_item, header, image_item, images_table, line_item,
-    paragraph_format, points_v1, points_v2, root_text, sample_text_block, scene_tree,
+    ROOT, ZERO, block, f_id, f_sub, group_item, header, image_entries, image_item, image_value, images_table,
+    line_item, paragraph_format, points_v1, points_v2, root_text, sample_text_block, scene_tree,
     text_item, tombstone, tree_node, v5_file, v6_file)
 
+from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from viewer.rm_parser import (  # noqa: E402
     ANCHOR_SENTINEL_START, Anchor, Color, PageScene, ParagraphStyle, Point, RmParseError,
     Stroke, Tool, block_name, parse, parse_file, parse_header)
 from viewer.renderer import (  # noqa: E402
-    LINE_PX, PALETTE_ARGB, estimate_width, layout_text, render_bounds, render_image,
+    LINE_PX, PALETTE_ARGB, estimate_width, image_matrix, image_size, layout_text, render_bounds, render_image,
     render_svg, stroke_offsets, stroke_runs, stroke_style)
 
 # Fonts need an application; a QApplication (not just QGuiApplication) so the UI tests
@@ -274,6 +275,109 @@ class TextAndImageTests(unittest.TestCase):
         self.assertEqual([block_name(t) for t in (0, 5, 7, 13, 14, 15, 16, -1)],
                          ["Conversion", "CrdtLineItem", "RootText", "SceneInfo", "SceneImagesTable",
                           "CrdtImageItem", "Unknown16", "Unknown-1"])
+
+
+
+def image_file(width: int, height: int, color: str = "#ff0000", fmt: str = "PNG") -> bytes:
+    from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+    from PySide6.QtGui import QColor, QImage
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(QColor(color))
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image.save(buffer, fmt)
+    return bytes(data)
+
+
+def placed(x0, y0, x1, y1):
+    """Image corners for the page rectangle x0..x1, y0..y1 (v6 x is centred), as the
+    tablet lists them: top left, top right, bottom right, bottom left."""
+    return [(x0 - 702, y0, 0.0, 0.0), (x1 - 702, y0, 1.0, 0.0), (x1 - 702, y1, 1.0, 1.0), (x0 - 702, y1, 0.0, 1.0)]
+
+
+KEY = bytes(range(16))
+IMAGE_NAME = "0a1b2c3d-0000-4000-8000-000000000001.png"
+
+
+def image_page(*extra: bytes, vertices=None) -> bytes:
+    """A page as the tablet writes one after an image was inserted, then moved: Layer 1,
+    the images table, the first item deleted and its moved replacement."""
+    return v6_file(tree_node(LAYER, "Layer 1"), group_item(ROOT, (0, 13), LAYER),
+                   images_table(image_entries({KEY: IMAGE_NAME})),
+                   image_item(LAYER, (1, 16), deleted=2),
+                   image_item(LAYER, (1, 18), image_value(KEY, vertices or placed(100, 200, 300, 300), move_id=(1, 16)),
+                              left=(1, 17)),
+                   *extra)
+
+
+class ImageItemTests(unittest.TestCase):
+    """Images inserted on the tablet (CrdtImageItem + SceneImagesTable). The fixture
+    builders write the blocks byte for byte as a real tablet page has them."""
+
+    def test_tablet_image_decodes(self):
+        scene = parse(image_page())
+        [image] = scene.placed_images
+        self.assertEqual((image.item_id, image.parent_id, image.image_ref, image.file_name),
+                         ((1, 18), LAYER, KEY, IMAGE_NAME))
+        self.assertEqual(image.vertices, placed(100, 200, 300, 300))
+        self.assertEqual(image.indices, [0, 1, 2, 2, 3, 0])
+        self.assertEqual([(l.name, len(l.images)) for l in scene.layers], [("Layer 1", 1)])
+        self.assertEqual(scene.content_bounds(), (100, 200, 300, 300))
+
+    def test_images_stack_with_strokes_in_file_order(self):
+        below = line_item(LAYER, (1, 2), tool=17, color=0, points=points_v2([(0, 0, 0, 0, 2, 255)]))
+        above = line_item(LAYER, (1, 30), tool=17, color=0, points=points_v2([(1, 1, 0, 0, 2, 255)]))
+        data = v6_file(tree_node(LAYER, "Layer 1"), group_item(ROOT, (0, 13), LAYER), below,
+                       images_table(image_entries({KEY: IMAGE_NAME})),
+                       image_item(LAYER, (1, 18), image_value(KEY, placed(0, 0, 10, 10))), above)
+        layer = parse(data).layers[0]
+        self.assertEqual([type(item).__name__ for item in layer.items()], ["Stroke", "ImageItem", "Stroke"])
+
+    def test_undecodable_image_is_kept_but_not_drawn(self):
+        data = v6_file(images_table(), image_item(LAYER, (1, 1), value=b"\x05unknown"))
+        with self.assertLogs("rm.viewer.parser", "WARNING"):
+            scene = parse(data)
+        self.assertEqual([i.value for i in scene.images], [b"\x05unknown"])
+        self.assertEqual(scene.placed_images, [])
+        render_image(scene)                                  # nothing to draw, nothing breaks
+
+    def test_image_drawn_where_the_tablet_put_it(self):
+        scene = parse(image_page())
+        scene.placed_images[0].data = image_file(20, 10)
+        image = render_image(scene)
+        red, white = QColor("#ff0000").rgb(), QColor("#ffffff").rgb()
+        for x, y in ((105, 205), (200, 250), (295, 295)):
+            self.assertEqual(image.pixel(x, y), red, (x, y))
+        for x, y in ((95, 250), (305, 250), (200, 195), (200, 305)):
+            self.assertEqual(image.pixel(x, y), white, (x, y))
+
+    def test_image_without_its_file_is_not_drawn(self):
+        image = render_image(parse(image_page()))
+        self.assertEqual(image.pixel(200, 250), QColor("#ffffff").rgb())
+
+    def test_image_in_svg(self):
+        scene = parse(image_page())
+        scene.placed_images[0].data = image_file(20, 10)
+        root = ET.fromstring(render_svg(scene))
+        [element] = root.iter("{http://www.w3.org/2000/svg}image")
+        self.assertEqual((element.get("width"), element.get("height")), ("20", "10"))
+        self.assertEqual(element.get("transform"), "matrix(10 0 0 10 100 200)")
+        self.assertTrue(element.get("href").startswith("data:image/png;base64,"))
+
+    def test_rotated_and_jpeg_images(self):
+        # Turned a quarter clockwise: the image's top edge runs down the page.
+        scene = parse(image_page(vertices=[(400 - 702, 100, 0, 0), (400 - 702, 300, 1, 0),
+                                           (300 - 702, 300, 1, 1), (300 - 702, 100, 0, 1)]))
+        jpeg = image_file(40, 20, fmt="JPG")
+        self.assertEqual(image_size(jpeg), (40, 20))
+        self.assertEqual(image_size(image_file(7, 3)), (7, 3))
+        a, b, c, d, e, f = image_matrix(scene, scene.placed_images[0], 40, 20)
+        corner = lambda px, py: (a * px + c * py + e, b * px + d * py + f)
+        self.assertEqual([tuple(round(v, 6) for v in corner(*p)) for p in ((0, 0), (40, 0), (0, 20))],
+                         [(400, 100), (400, 300), (300, 100)])
+        scene.placed_images[0].data = jpeg
+        self.assertGreater(QColor(render_image(scene).pixel(350, 200)).red(), 200)
 
 
 LAYER = (0, 11)          # real files: Layer 1 is node 0:11

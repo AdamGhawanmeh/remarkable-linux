@@ -630,8 +630,12 @@ class DocumentWrapper(EntryWrapper):
         self.coverPageNumberChanged.emit(node.content.cover_page_number)
 
     def _page(self) -> int:
-        return int(self._library.reading_position(self._node.id).get("lastOpenedPage",
+        """lastOpenedPage, kept to an existing page: the tablet writes -1 for a notebook
+        it has not opened on a page yet, and DocumentViewport.goToPage refuses pages out of
+        range, which left such a document loading for ever."""
+        page = int(self._library.reading_position(self._node.id).get("lastOpenedPage",
                                                                       self._node.metadata.last_opened_page))
+        return min(max(page, 0), max(self._page_count() - 1, 0))
 
     def _last_opened(self) -> int:
         return int(self._library.reading_position(self._node.id).get("lastOpened",

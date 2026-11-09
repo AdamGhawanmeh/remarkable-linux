@@ -191,12 +191,39 @@ def sample_text_block() -> bytes:
         lww_width=1000.0)
 
 
-def image_item(parent, item, value: bytes = b"", deleted: int = 0) -> bytes:
-    payload = _item_header(parent, item, deleted)
+def image_item(parent, item, value: bytes = b"", deleted: int = 0, left=ZERO) -> bytes:
+    payload = f_id(1, parent) + f_id(2, item) + f_id(3, left) + f_id(4, ZERO) + f_u32(5, deleted)
     if value:
         payload += f_sub(6, value)
-    return block(0x0F, payload, version=2)
+    return block(0x0F, payload, version=2, min_version=2)
 
 
 def images_table(entries: bytes = b"\x00") -> bytes:
-    return block(0x0E, f_sub(1, entries), version=3)
+    return block(0x0E, f_sub(1, entries), version=3, min_version=3)
+
+
+def lww_string(timestamp, text: str) -> bytes:
+    data = text.encode()
+    return f_id(1, timestamp) + f_sub(2, varuint(len(data)) + b"\x01" + data)
+
+
+def image_value(ref: bytes, vertices, indices=(0, 1, 2, 2, 3, 0), *, timestamp=(1, 18),
+                bounds_timestamp=(1, 17), move_id=None) -> bytes:
+    """A CrdtImageItem value as the tablet writes one: type 7, {1: LWW imageRef},
+    {2: boundsTimestamp}, {3: vertices x y u v}, {4: indices}, {5: moveId}."""
+    floats = [c for vertex in vertices for c in vertex]
+    value = (b"\x07" + f_sub(1, f_id(1, timestamp) + f_sub(2, ref)) + f_id(2, bounds_timestamp)
+             + f_sub(3, varuint(len(floats)) + struct.pack(f"<{len(floats)}f", *floats))
+             + f_sub(4, varuint(len(indices)) + struct.pack(f"<{len(indices)}I", *indices)))
+    if move_id is not None:
+        value += f_id(5, move_id)
+    return value
+
+
+def image_entries(files: dict, timestamp=(1, 15)) -> bytes:
+    """SceneImagesTable entries: per image its 16-byte key, {1: LWW file name},
+    {2: LWW flag (0:0, {1: 0}) as the tablet writes it}."""
+    out = varuint(len(files))
+    for key, name in files.items():
+        out += f_sub(0, key + f_sub(1, lww_string(timestamp, name)) + f_sub(2, f_id(1, ZERO) + f_sub(2, f_u8(1, 0))))
+    return out

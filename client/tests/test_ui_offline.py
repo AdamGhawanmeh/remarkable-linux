@@ -1402,6 +1402,64 @@ class SvgExportTests(DemoCase):
 
 # ----------------------------------------------------------------- library changes
 
+class ImageLoadingTests(unittest.TestCase):
+    """Images inserted on the tablet: the loader fetches each image file stored with the
+    document ("<doc>/<page>/<file name>") so the viewer, thumbnails and exports draw it."""
+
+    def setUp(self):
+        from demo_library import _content, _meta
+        from fakecloud import FakeCloud
+        from rmfixtures import (ROOT, group_item, image_entries, image_item, image_value, images_table, tree_node,
+                                v6_file)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cloud = FakeCloud(schema=3)
+        self.doc, page = demo_id("With an image"), demo_id("image-p1")
+        key, name, layer = bytes(range(16)), "0a1b2c3d-0000-4000-8000-000000000001.png", (0, 11)
+        corners = [(100 - 702, 200, 0, 0), (300 - 702, 200, 1, 0), (300 - 702, 300, 1, 1), (100 - 702, 300, 0, 1)]
+        rm = v6_file(tree_node(layer, "Layer 1"), group_item(ROOT, (0, 13), layer),
+                     images_table(image_entries({key: name})), image_item(layer, (1, 18), image_value(key, corners)))
+        image = QImage(20, 10, QImage.Format.Format_RGB32)
+        image.fill(QColor("#ff0000"))
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+        data = QByteArray(); buffer = QBuffer(data); buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buffer, "PNG")
+        self.png = bytes(data)
+        self.cloud.put_item(self.doc, _meta("With an image", "", 0.1), _content("notebook", [page]),
+                            {f"{self.doc}/{page}.rm": rm, f"{self.doc}/{page}/{name}": self.png})
+        self.auth = paired_auth(Path(self.tmp.name) / "auth", self.cloud)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def scene(self, source):
+        doc = source.load_cached().get(self.doc)
+        return source.page_scene(doc, document_pages(doc)[0])
+
+    def test_page_gets_its_image_and_draws_it(self):
+        source = LibrarySource(SyncClient(self.auth, Path(self.tmp.name) / "cache"))
+        source.refresh()
+        scene = self.scene(source)
+        self.assertEqual([i.data for i in scene.placed_images], [self.png])
+        page = render_content(PageContent(scene, None, None), 1.0)
+        self.assertEqual(page.pixel(200, 250), QColor("#ff0000").rgb())
+
+    def test_offline_without_the_cached_image(self):
+        cache = Path(self.tmp.name) / "cache"
+        online = SyncClient(self.auth, cache)
+        online.refresh()                                   # the tree, but not the page files
+        source = LibrarySource(SyncClient(self.auth, cache), cached_only=True)
+        with self.assertRaises(NotCachedError):            # the page itself is not cached either
+            self.scene(source)
+        doc = online.tree.get(self.doc)
+        page = document_pages(doc)[0]
+        online.get_blob(doc.files[page.rm_name], page.rm_name)       # the page, not its image
+        source = LibrarySource(SyncClient(self.auth, cache), cached_only=True)
+        with self.assertLogs("rm.ui.library", "WARNING"):
+            scene = self.scene(source)
+        self.assertEqual([i.data for i in scene.placed_images], [None])
+        render_content(PageContent(scene, None, None), 0.5)           # drawn without it
+
+
 class LibraryChangeTests(DemoCase):
     """Imports, folders, renames, moves, favorites and the trash, from the navigator
     through the background Mutator to the (fake) cloud and back."""

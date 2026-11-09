@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Callable
 from xml.sax.saxutils import escape, quoteattr
 
-from .rm_parser import (PAGE_HEIGHT, PAGE_WIDTH, Color, PageScene, ParagraphStyle, Stroke,
+from .rm_parser import (PAGE_HEIGHT, PAGE_WIDTH, Color, ImageItem, PageScene, ParagraphStyle, Stroke,
                         TextBlock)
 
 # Official stroke palette (ARGB), indexed by Color; built inline by the renderer in
@@ -313,6 +313,10 @@ def _ink_bounds(scene: PageScene, lines: list[TextLine], offsets, measure: Measu
         for p in stroke.points:
             x, y = scene.to_page(p.x + dx, p.y + dy)
             xs.append(x); ys.append(y)
+    for image in scene.placed_images:
+        for vx, vy, _, _ in image.vertices:
+            x, y = scene.to_page(vx, vy)
+            xs.append(x); ys.append(y)
     for line in lines:
         if line.pieces:
             width = sum(measure(t, f) for t, f in line.pieces)
@@ -365,6 +369,58 @@ def _visible_layers(scene: PageScene, include_hidden: bool):
     return [layer for layer in scene.layers if include_hidden or layer.visible]
 
 
+# --------------------------------------------------------------------- images
+
+def image_size(data: bytes) -> tuple[int, int] | None:
+    """Pixel size of a PNG or JPEG file (the formats the app inserts), from its header."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:2] == b"\xff\xd8":
+        pos = 2
+        while pos + 9 <= len(data) and data[pos] == 0xFF:
+            marker, length = data[pos + 1], int.from_bytes(data[pos + 2:pos + 4], "big")
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):    # start of frame
+                return int.from_bytes(data[pos + 7:pos + 9], "big"), int.from_bytes(data[pos + 5:pos + 7], "big")
+            pos += 2 + length
+    return None
+
+
+def image_matrix(scene: PageScene, image: ImageItem, width: float, height: float
+                 ) -> tuple[float, float, float, float, float, float] | None:
+    """The affine map (a, b, c, d, e, f) from the image's pixels to page coordinates,
+    page = (a*px + c*py + e, b*px + d*py + f), from three of its corners: each vertex puts
+    texture point (u*width, v*height) at (x, y). None without three independent corners."""
+    corners = image.vertices
+    for i in range(len(corners)):
+        for j in range(i + 1, len(corners)):
+            for k in range(j + 1, len(corners)):
+                (x0, y0, u0, v0), (x1, y1, u1, v1), (x2, y2, u2, v2) = corners[i], corners[j], corners[k]
+                su, sv = (u1 - u0) * width, (v1 - v0) * height
+                tu, tv = (u2 - u0) * width, (v2 - v0) * height
+                det = su * tv - sv * tu
+                if abs(det) < 1e-9:
+                    continue
+                ox, oy = scene.to_page(x0, y0)
+                dx1, dy1, dx2, dy2 = x1 - x0, y1 - y0, x2 - x0, y2 - y0
+                a, c = (dx1 * tv - dx2 * sv) / det, (dx2 * su - dx1 * tu) / det
+                b, d = (dy1 * tv - dy2 * sv) / det, (dy2 * su - dy1 * tu) / det
+                return a, b, c, d, ox - a * u0 * width - c * v0 * height, oy - b * u0 * width - d * v0 * height
+    return None
+
+
+def _svg_image(scene: PageScene, image: ImageItem) -> str | None:
+    import base64
+    if not image.data or not (size := image_size(image.data)):
+        return None
+    matrix = image_matrix(scene, image, *size)
+    if matrix is None:
+        return None
+    mime = "image/png" if image.data[:4] == b"\x89PNG" else "image/jpeg"
+    href = f"data:{mime};base64,{base64.b64encode(image.data).decode()}"
+    return (f'<image width="{size[0]}" height="{size[1]}" preserveAspectRatio="none" '
+            f'transform="matrix({" ".join(f"{v:.6g}" for v in matrix)})" href="{href}"/>')
+
+
 # ------------------------------------------------------------------------ SVG
 
 def _svg_font(font: TextFont) -> str:
@@ -386,7 +442,11 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
     out = []
     for index, layer in enumerate(_visible_layers(scene, include_hidden)):
         out.append(f'<g id="layer-{index}" data-name={quoteattr(layer.name)}>')
-        for stroke in layer.strokes:
+        for stroke in layer.items():
+            if isinstance(stroke, ImageItem):
+                if element := _svg_image(scene, stroke):
+                    out.append(element)
+                continue
             style = stroke_style(stroke, background)
             if style is None:
                 continue
@@ -472,7 +532,11 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     offsets = stroke_offsets(scene, lines)
     drawn = 0
     for layer in _visible_layers(scene, include_hidden):
-        for stroke in layer.strokes:
+        for stroke in layer.items():
+            if isinstance(stroke, ImageItem):
+                if layers != "darken" and _paint_image(painter, scene, stroke, blend_modes):
+                    drawn += 1
+                continue
             style = stroke_style(stroke, background)
             if style is None or (layers == "darken" and not style.blend_darken) \
                     or (layers == "normal" and style.blend_darken):
@@ -517,6 +581,32 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     return drawn
 
 
+def _paint_image(painter, scene: PageScene, image: ImageItem, blend_modes: bool) -> bool:
+    """Draw an image item (its file decoded once and kept on the item)."""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QImage, QPainter, QTransform
+
+    qimage = getattr(image, "_qimage", None)
+    if qimage is None:
+        qimage = QImage.fromData(image.data) if image.data else QImage()
+        image._qimage = qimage
+    if qimage.isNull():
+        return False
+    matrix = image_matrix(scene, image, qimage.width(), qimage.height())
+    if matrix is None:
+        return False
+    painter.save()
+    try:
+        if blend_modes:
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setTransform(QTransform(*matrix), True)
+        painter.drawImage(QPointF(0, 0), qimage)
+    finally:
+        painter.restore()
+    return True
+
+
 def render_image(scene: PageScene, *, scale: float = 1.0, background: str = "#ffffff",
                  include_hidden: bool = False, crop: str = "page"):
     """Render to a QImage (ARGB32 premultiplied). Needs a QGuiApplication for text."""
@@ -537,6 +627,6 @@ def render_image(scene: PageScene, *, scale: float = 1.0, background: str = "#ff
     return image
 
 
-__all__ = ["PALETTE_ARGB", "Run", "StrokeStyle", "TextFont", "TextLine", "layout_text",
-           "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
+__all__ = ["PALETTE_ARGB", "Run", "StrokeStyle", "TextFont", "TextLine", "image_matrix", "image_size",
+           "layout_text", "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
            "stroke_style", "PAGE_WIDTH", "PAGE_HEIGHT"]

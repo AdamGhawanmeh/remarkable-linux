@@ -18,7 +18,7 @@ from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.sync import SyncClient
+from core.sync import SyncClient, SyncError
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
@@ -348,11 +348,27 @@ class LibrarySource:
         except RmParseError as err:
             log.error("cannot parse %s: %s", page.rm_name, err)
             scene = None
+        if scene is not None:
+            self._attach_images(doc, page, scene)
         with self._lock:
             self._scenes[key] = scene
             while len(self._scenes) > self._scene_cache:
                 self._scenes.popitem(last=False)
         return scene
+
+    def _attach_images(self, doc: Document, page: PageRef, scene: PageScene) -> None:
+        """Give each image item its file, stored with the document as
+        "<doc>/<page>/<file name>". One that is missing or not cached stays undrawn."""
+        folder = page.rm_name.removesuffix(".rm")
+        for image in scene.placed_images:
+            name = f"{folder}/{image.file_name}"
+            if not image.file_name or name not in doc.files:
+                log.warning("%s: image %s has no file %r", page.rm_name, image.item_id, image.file_name)
+                continue
+            try:
+                image.data = self.blob(doc, name)
+            except (SyncError, OSError) as err:
+                log.warning("%s: image %s: %s", page.rm_name, image.file_name, err)
 
     def pagedata(self, doc: Document) -> list[str] | None:
         """Legacy per-page template names, when the document has a .pagedata file."""

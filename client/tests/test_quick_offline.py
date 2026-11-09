@@ -175,6 +175,25 @@ class ApiParityTests(unittest.TestCase):
         self.assertLessEqual(ours, spec)
 
 
+class LastOpenedPageTests(unittest.TestCase):
+    def test_a_notebook_never_opened_on_a_page_opens_at_the_first(self):
+        """The tablet writes lastOpenedPage -1 for a new notebook; DocumentViewport.goToPage
+        refuses it, which left the document loading for ever."""
+        from core.models import Content, DocumentTree, Metadata, make_node
+        pages = {"pages": [{"id": f"00000000-0000-4000-8000-00000000000{i}",
+                            "idx": {"timestamp": "1:2", "value": f"b{chr(97 + i)}"}} for i in range(3)]}
+        lib = library.Library()
+        for doc_id, page in (("11111111-1111-4111-8111-111111111111", -1),
+                             ("22222222-2222-4222-8222-222222222222", 7),
+                             ("33333333-3333-4333-8333-333333333333", 1)):
+            node = make_node(doc_id, Metadata.parse({"visibleName": "n", "type": "DocumentType", "parent": "",
+                                                     "lastOpenedPage": page}),
+                             Content.parse({"fileType": "notebook", "formatVersion": 2, "cPages": pages}))
+            lib.set_tree(DocumentTree([*lib.tree.documents(), node]))
+        self.assertEqual([lib.entryForId(d.id).property("lastOpenedPage") for d in
+                          sorted(lib.tree.documents(), key=lambda d: d.id)], [0, 2, 1])
+
+
 class RelativeTimeTests(unittest.TestCase):
     """StringUtils' relative time (xofm/libs/library/src/shared.cpp), in the app's
     English translation."""

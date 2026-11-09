@@ -35,11 +35,14 @@ Tool and colour IDs come from the enum name tables in reMarkable.exe
 
 from __future__ import annotations
 
+import logging
 import math
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
+
+log = logging.getLogger("rm.viewer.parser")
 
 HEADER_LENGTH = 43
 HEADER_PREFIX = b"reMarkable .lines file, version="
@@ -188,6 +191,7 @@ class Stroke:
     color_id: int = 0
     item_id: tuple[int, int] | None = None
     anchor: Anchor | None = None   # from the nearest anchored group, if any
+    seq: int = field(default=0, compare=False)    # v6 block position: stacking with images
 
     def bounds(self) -> tuple[float, float, float, float] | None:
         if not self.points:
@@ -203,6 +207,11 @@ class Layer:
     visible: bool = True
     strokes: list[Stroke] = field(default_factory=list)
     node_id: tuple[int, int] | None = None
+    images: list["ImageItem"] = field(default_factory=list)
+
+    def items(self) -> list:
+        """Strokes and images bottom to top, in the order the file lists them."""
+        return sorted([*self.strokes, *self.images], key=lambda item: item.seq)
 
 
 class ParagraphStyle(IntEnum):
@@ -271,11 +280,30 @@ class TextBlock:
 
 @dataclass
 class ImageItem:
-    """A live inserted image (CrdtImageItem). `value` is the undecoded payload."""
+    """A live inserted image (CrdtImageItem, item type 7), decoded from a page the tablet
+    wrote: its value is {1: imageRef, a last-write-wins 16-byte key into the page's
+    SceneImagesTable}, {2: an id (boundsTimestamp)}, {3: vertices, x y u v per corner in
+    scene units}, {4: triangle indices into them}, {5: moveId, the item it replaced when
+    moved}. The table names the image file, stored with the document as
+    "<doc>/<page>/<file_name>". `value` is the raw payload; a payload that cannot be
+    decoded is kept but has no geometry and is not drawn."""
 
     item_id: tuple[int, int]
     parent_id: tuple[int, int]
     value: bytes = b""
+    image_ref: bytes = b""
+    file_name: str = ""
+    vertices: list[tuple[float, float, float, float]] = field(default_factory=list)
+    indices: list[int] = field(default_factory=list)
+    seq: int = field(default=0, compare=False)
+    data: bytes | None = field(default=None, compare=False, repr=False)   # the file, attached by the loader
+
+    def bounds(self) -> tuple[float, float, float, float] | None:
+        if not self.vertices:
+            return None
+        xs = [v[0] for v in self.vertices]
+        ys = [v[1] for v in self.vertices]
+        return min(xs), min(ys), max(xs), max(ys)
 
 
 @dataclass
@@ -297,12 +325,17 @@ class PageScene:
     def strokes(self) -> list[Stroke]:
         return [s for layer in self.layers for s in layer.strokes]
 
+    @property
+    def placed_images(self) -> list[ImageItem]:
+        """The images drawn on the page: those in a layer, with geometry."""
+        return [i for layer in self.layers for i in layer.images if i.vertices]
+
     def to_page(self, x: float, y: float) -> tuple[float, float]:
         return x + self.x_origin, y
 
     def content_bounds(self) -> tuple[float, float, float, float] | None:
-        """Bounding box of all strokes in page coordinates."""
-        boxes = [b for s in self.strokes if (b := s.bounds())]
+        """Bounding box of all strokes and images in page coordinates."""
+        boxes = [b for s in [*self.strokes, *self.placed_images] if (b := s.bounds())]
         if not boxes:
             return None
         return (min(b[0] for b in boxes) + self.x_origin, min(b[1] for b in boxes),
@@ -649,6 +682,7 @@ def _parse_v6(data: bytes) -> PageScene:
     counts: dict[int, int] = {}
     text: TextBlock | None = None
     images: list[ImageItem] = []
+    image_files: dict[bytes, str] = {}      # imageRef -> file name (SceneImagesTable)
     node_parent: dict[tuple, tuple] = {}    # group node -> parent node (group items)
     anchors: dict[tuple, Anchor] = {}
 
@@ -682,7 +716,9 @@ def _parse_v6(data: bytes) -> PageScene:
                     if parent == ROOT_NODE and child not in layer_order:
                         layer_order.append(child)
                 else:
-                    lines.append((parent, _decode_line(value, version, item)))
+                    stroke = _decode_line(value, version, item)
+                    stroke.seq = counts_total(counts)
+                    lines.append((parent, stroke))
             elif block_type == BLOCK_ROOT_TEXT:
                 text = _decode_root_text(payload)
             elif block_type == BLOCK_IMAGE_ITEM:
@@ -694,12 +730,15 @@ def _parse_v6(data: bytes) -> PageScene:
                 if deleted_length or not value:
                     deleted.add(item)
                 else:
-                    images.append(ImageItem(item_id=item, value=value,
-                                            parent_id=_field(f, 1, TAG_ID, "image item").raw))
+                    image = ImageItem(item_id=item, value=value, seq=counts_total(counts),
+                                      parent_id=_field(f, 1, TAG_ID, "image item").raw)
+                    try:
+                        image.image_ref, image.vertices, image.indices = _decode_image(value)
+                    except (RmParseError, struct.error, IndexError) as err:
+                        log.warning("image item %s: cannot decode (%s)", item, err)
+                    images.append(image)
             elif block_type == BLOCK_IMAGES_TABLE:
-                # {1: {varuint n, entries}}; entries are not decoded (none in the
-                # validation data), but the framing is checked.
-                _field(_read_fields(payload), 1, TAG_LENGTH4, "images table")
+                image_files.update(_decode_images_table(payload))
             elif block_type not in STRUCTURAL_BLOCKS:
                 skipped[block_type] = skipped.get(block_type, 0) + 1
         except (RmParseError, struct.error, IndexError) as err:
@@ -742,8 +781,65 @@ def _parse_v6(data: bytes) -> PageScene:
     if root_strokes:
         result.insert(0, Layer(name="Root", strokes=root_strokes, node_id=ROOT_NODE))
     images = [img for img in images if img.item_id not in deleted]
+    for image in images:
+        image.file_name = image_files.get(image.image_ref, "")
+        if image.parent_id == ROOT_NODE:
+            target = None
+        else:
+            layer, _ = owner(image.parent_id)
+            target = layers.get(layer)
+        if target is not None:
+            target.images.append(image)
+        elif result and result[0].node_id == ROOT_NODE:
+            result[0].images.append(image)
+        else:
+            result.insert(0, Layer(name="Root", images=[image], node_id=ROOT_NODE))
     return PageScene(version=6, layers=result, x_origin=PAGE_WIDTH / 2, text=text,
                      images=images, block_counts=counts, skipped_blocks=skipped)
+
+
+IMAGE_ITEM_TYPE = 7      # the value's leading byte, as 2 is a group and 3 a line
+
+
+def counts_total(counts: dict[int, int]) -> int:
+    """Blocks read so far: the position of the current one in the file."""
+    return sum(counts.values())
+
+
+def _decode_image(value: bytes) -> tuple[bytes, list[tuple[float, float, float, float]], list[int]]:
+    """CrdtImageItem value -> (imageRef key, vertices, indices); see ImageItem."""
+    if not value or value[0] != IMAGE_ITEM_TYPE:
+        raise RmParseError(f"image item type {value[:1].hex() or 'missing'}, expected {IMAGE_ITEM_TYPE:02x}")
+    f = _read_fields(value[1:])
+    ref = _field(_read_fields(_field(f, 1, TAG_LENGTH4, "image ref").raw), 2, TAG_LENGTH4, "image ref").raw
+    r = _Reader(_field(f, 3, TAG_LENGTH4, "image vertices").raw)
+    n = r.varuint()
+    if n % 4:
+        raise RmParseError(f"{n} vertex values, not 4 per vertex")
+    floats = r.unpack(f"<{n}f")
+    vertices = [tuple(floats[i:i + 4]) for i in range(0, n, 4)]
+    r = _Reader(_field(f, 4, TAG_LENGTH4, "image indices").raw)
+    n = r.varuint()
+    indices = list(r.unpack(f"<{n}I"))
+    if any(i >= len(vertices) for i in indices):
+        raise RmParseError("image index out of range")
+    return ref, vertices, indices
+
+
+def _decode_images_table(payload: bytes) -> dict[bytes, str]:
+    """SceneImagesTable: {1: {varuint n, n x {0: 16-byte key, {1: LWW file name},
+    {2: LWW flag}}}} -> {key: file name}."""
+    r = _Reader(_field(_read_fields(payload), 1, TAG_LENGTH4, "images table").raw)
+    files: dict[bytes, str] = {}
+    for _ in range(r.varuint()):
+        tag = r.varuint()
+        if tag != (0 << 4 | TAG_LENGTH4):
+            raise RmParseError(f"images table entry tag {tag:#x}")
+        entry = r.take(r.unpack("<I")[0])
+        key, fields = entry[:16], _read_fields(entry[16:])
+        if 1 in fields and fields[1].type == TAG_LENGTH4:
+            files[key] = _lww_string(fields[1].raw)
+    return files
 
 
 # ----------------------------------------------------------------------- reader
