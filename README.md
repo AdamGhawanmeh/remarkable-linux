@@ -180,7 +180,7 @@ when you use them.
 
 | Area | Status |
 |---|---|
-| Editing pages | See [Editing (experimental)](#editing-experimental) below: images and undo/redo of image edits work; drawing, the eraser, typed text and page management do not yet. |
+| Editing pages | See [Editing (experimental)](#editing-experimental) below: images, undo/redo of image edits, and adding, duplicating, moving and deleting pages work; drawing, the eraser and typed text do not yet. |
 | Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
 | Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |
 | Search in documents | The search bar inside a document opens but does not find anything yet. |
@@ -211,7 +211,7 @@ and drawn over the page until you upload them yourself (see Upload below).
 | Eraser | Not yet. |
 | Typed text | Not yet: creating or editing text, and pasting text ("not available on Linux yet"). |
 | Selecting strokes | Not yet: only images can be selected. |
-| Page management | Not yet: adding, moving, duplicating and deleting pages. |
+| Pages: add, duplicate, move, delete | **Working, not yet tried on a tablet.** "Add page" in the toolbar or page overview, and the page overview's Duplicate, Cut/Copy/Paste (move) and Delete, within the notebook. Saved as the official app saves them: the page list in `.content` is changed as its page map changes it (the same page-order keys, `idx`, and per-field timestamps), a duplicate copies the page's files under a new page id, a deleted page stays listed as deleted and its files leave the document, and a notebook left without pages gets a new "Blank" one. A new page has no `.rm` until something is put on it. Moving or pasting pages into another document, and changing a page's template, say "not available on Linux yet". |
 | Undo / redo | **Working, for image edits.** Ctrl+Z / Ctrl+Shift+Z (or Edit > Undo, Redo) for inserts, pastes (several images pasted at once undo together), moves, resizes, turns, deletes and cuts. As in the official app each page has its own undo and redo, any new edit empties redo, and they are kept until the document is closed (or the page changes on another device). An undo is not a step back but new edits, as the tablet records it: an image taken off the page comes back as a new item right where it was among the layer's items, so undo and redo upload like any other edit. |
 | Layers | Not yet: edits go to Layer 1, as the app's do until another layer is chosen. |
 

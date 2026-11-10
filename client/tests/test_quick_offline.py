@@ -1212,6 +1212,49 @@ class EditingTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: self.handler().property("visible")))
         self.assertEqual(real_warnings(self.app.warnings), [])
 
+    def test_page_actions_reach_the_document_controller_from_qml(self):
+        # The calls PageActions.qml / DocumentViewport.qml make, from QML: an arrow
+        # function as the callback, JS arrays of page numbers.
+        from PySide6.QtCore import Q_ARG, Q_RETURN_ARG, QMetaObject
+        from PySide6.QtQml import QQmlComponent
+        self.open_document(self.THROWAWAY)
+        component = QQmlComponent(self.app.engine)
+        component.setData(b"""
+            import QtQuick
+            import com.remarkable
+            QtObject {
+                property int calls: 0
+                function add(id) { return DocumentController.addPageWithTemplateAndPaperSizeFromPage(id, 2, "Blank", 1, () => { calls += 1; }); }
+                function addHere(id) { return DocumentController.addPageWithTemplateAndPageSize(id, 1, "Blank", Qt.size(1404, 1872), () => { calls += 1; }); }
+                function duplicate(id) { return DocumentController.copyPages(id, [0], id, 1); }
+                function move(id) { return DocumentController.movePages(id, [3], id, 0, () => { calls += 1; }); }
+                function remove(id) { return DocumentController.deletePages(id, [0]); }
+            }""", QUrl())
+        actions = component.create()
+        self.assertIsNotNone(actions, component.errorString())
+        document = self.app.library.entryForId(self.THROWAWAY)
+
+        def call(name):
+            return QMetaObject.invokeMethod(actions, name, Q_RETURN_ARG("QVariant"), Q_ARG("QVariant", self.THROWAWAY))
+
+        self.assertTrue(call("add"))
+        self.assertTrue(call("addHere"))
+        self.assertTrue(call("duplicate"))
+        self.assertEqual(document.property("pageCount"), 5)
+        added = document.idForPage(3)
+        self.assertTrue(call("move"))
+        self.assertEqual(document.idForPage(0), added)
+        self.assertTrue(call("remove"))
+        self.assertEqual(document.property("pageCount"), 4)
+        self.assertTrue(self.wait_for(lambda: actions.property("calls") == 3))
+        self.assertEqual([type(e).__name__ for e in self.pending()],
+                         ["PageAdd", "PageAdd", "PageCopy", "PageMove", "PageDelete"])
+        self.assertEqual(self.notices, [])
+        self.assertEqual([w for w in self.cloud.puts()], [])                   # nothing uploaded
+        # The page shown is still there and still loads.
+        self.assertTrue(self.wait_for(lambda: any(v.property("status") == 2 for v in self.scene_views())))
+        actions.deleteLater()
+
     def test_another_notebook_is_never_edited(self):
         view = self.open_document(self.OTHER)
         view._controller.insertImageFileAsSceneItem(QUrl.fromLocalFile(str(self.picture)), QPointF(0, 300))

@@ -61,7 +61,8 @@ from typing import Any, Callable, Iterable
 
 from .auth import AuthClient, HttpResponse
 from .config import atomic_write_json, cache_dir, ensure_private_dir, read_json
-from .edits import EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PendingEdits, document_files
+from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd, PageCopy, PageDelete,
+                    PageMove, PendingEdits, document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
                      new_document_content, new_folder_content, new_metadata)
@@ -344,6 +345,18 @@ def json_changes(old: Any, new: Any, path: str = "") -> list[tuple[str, Any, Any
             else:
                 out += json_changes(old[key], new[key], where)
         return out
+    if isinstance(old, list) and isinstance(new, list) and _by_id(old) is not None and _by_id(new) is not None \
+            and (len(old) != len(new) or [e["id"] for e in old] != [e["id"] for e in new]):
+        # A list of entries with ids (cPages.pages) whose entries were added or reordered:
+        # by id, so that a page added in the middle does not read as every page changed.
+        before, after = _by_id(old), _by_id(new)
+        out = []
+        for key in list(before) + [k for k in after if k not in before]:
+            out += json_changes(before.get(key), after.get(key), f"{path}[id={key}]")
+        moved = [k for k in after if k in before]
+        if [k for k in before if k in after] != moved:
+            out.append((f"{path} (order of entries)", None, None))
+        return out
     if isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
         out = []
         for n, (a, b) in enumerate(zip(old, new)):
@@ -352,6 +365,38 @@ def json_changes(old: Any, new: Any, path: str = "") -> list[tuple[str, Any, Any
             out += json_changes(a, b, f"{path}[{label}]")
         return out
     return [] if old == new and type(old) is type(new) else [(path, old, new)]
+
+
+def _by_id(entries: list) -> dict | None:
+    """A list of objects with distinct string ids, by id; None for any other list."""
+    if not all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in entries):
+        return None
+    out = {e["id"]: e for e in entries}
+    return out if len(out) == len(entries) else None
+
+
+def describe_edit(e) -> str:
+    """One pending edit, as push plans list them."""
+    if isinstance(e, PageAdd):
+        return f"  add page {e.new_id} (template {e.template!r}) at {e.index}, after page {e.after or '(front)'}"
+    if isinstance(e, PageCopy):
+        pairs = ", ".join(f"{s} -> {n}" for s, n in zip(e.sources, e.new_ids))
+        return f"  duplicate pages {pairs}\n    at {e.index}, after page {e.after or '(front)'}"
+    if isinstance(e, PageMove):
+        return f"  move pages {', '.join(e.pages)}\n    to {e.index}, after page {e.after or '(front)'}"
+    if isinstance(e, PageDelete):
+        return (f"  delete pages {', '.join(e.pages)}\n    (if no page is left: new \"Blank\" page {e.blank_id})")
+    if isinstance(e, ImageDelete):
+        return f"  delete image {e.key} on page {e.page_id}"
+    if isinstance(e, ImageRestore):
+        return f"  put back image {e.key} on page {e.page_id} (undo/redo)"
+    xs, ys = [v[0] for v in e.vertices], [v[1] for v in e.vertices]
+    where = f"x {min(xs):g}..{max(xs):g}, y {min(ys):g}..{max(ys):g} (scene units, x 0 = page centre)"
+    if isinstance(e, ImageTransform):
+        return f"  move/resize image {e.key} on page {e.page_id}\n    to {where}"
+    return (f"  image on page {e.page_id}\n"
+            f"    file {e.file_name}  ({e.size} bytes, sha256 {e.sha256[:12]}…), images-table key {e.key}\n"
+            f"    placed {where}")
 
 
 @dataclass
@@ -377,21 +422,7 @@ class PushPlan:
         if not self.files:
             return "\n".join(lines + ["Nothing to upload: the document already has these edits."])
         lines.append(f"Edits     {len(self.edits)}, applied in this order")
-        for e in self.edits:
-            if isinstance(e, ImageDelete):
-                lines.append(f"  delete image {e.key} on page {e.page_id}")
-                continue
-            if isinstance(e, ImageRestore):
-                lines.append(f"  put back image {e.key} on page {e.page_id} (undo/redo)")
-                continue
-            xs, ys = [v[0] for v in e.vertices], [v[1] for v in e.vertices]
-            where = f"x {min(xs):g}..{max(xs):g}, y {min(ys):g}..{max(ys):g} (scene units, x 0 = page centre)"
-            if isinstance(e, ImageTransform):
-                lines.append(f"  move/resize image {e.key} on page {e.page_id}\n    to {where}")
-            else:
-                lines.append(f"  image on page {e.page_id}\n"
-                             f"    file {e.file_name}  ({e.size} bytes, sha256 {e.sha256[:12]}…), images-table key {e.key}\n"
-                             f"    placed {where}")
+        lines += [describe_edit(e) for e in self.edits]
         for name, changes in self.fields.items():
             lines.append(f"Fields changed in {name}")
             lines += [f"  {field}: {json.dumps(old)} -> {json.dumps(new)}" for field, old, new in changes] or ["  (none)"]

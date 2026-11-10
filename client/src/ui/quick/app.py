@@ -264,6 +264,10 @@ class QuickApp:
         register_types()
         set_page_source(lambda: self.source)
         set_edit_notifier(self.library.errorMessage.emit)
+        controller = self.singletons.document_controller
+        controller.source = lambda: self.source
+        controller.refresh = lambda: self.set_tree(self.source.sync.tree)
+        controller.notify = self.library.errorMessage.emit
         set_clipboard(self.singletons.clipboard)
         self.translator = QTranslator()
         self._translate(self.singletons.language.languageCode)
@@ -303,7 +307,8 @@ class QuickApp:
         return self.engine.rootObjects()[0] if self.engine and self.engine.rootObjects() else None
 
     def set_tree(self, tree: DocumentTree) -> None:
-        self.library.set_tree(tree)
+        """Show `tree`, its documents with their pending page edits (LibrarySource.view)."""
+        self.library.set_tree(self.source.view_tree(tree))
         self._update_editing()
 
     def start(self, sync: bool = True) -> None:

@@ -33,7 +33,7 @@ from typing import Callable
 
 import shiboken6
 
-from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject, QPointF, QRect, QRectF, QSize, QSizeF, Qt,
+from PySide6.QtCore import (QAbstractListModel, QCoreApplication, QModelIndex, QObject, QPointF, QRect, QRectF, QSize, QSizeF, Qt,
                             QThreadPool, QTimer, QUrl, Signal, Slot)
 from PySide6.QtGui import QImage, QPainter, QTransform
 from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
@@ -71,6 +71,39 @@ _viewport_transforms: dict[int, tuple[QPointF, float]] = {}
 def _viewport_key(item: QQuickItem) -> int | None:
     parent = item.parentItem()
     return shiboken6.getCppPointer(parent)[0] if parent is not None and shiboken6.isValid(parent) else None
+
+
+# The worker pools of SceneViews that are gone, kept until their last job has finished.
+# A view's pool is not its child: destroying a QThreadPool waits for its jobs, and a view
+# destroyed while Python holds the GIL (from a Python call into Qt, e.g. a test's key
+# click) would wait for a job that needs the GIL to finish: a deadlock. The jobs of a
+# gone view emit nothing (emit_from_worker).
+_retired_pools: list[QThreadPool] = []
+_retire_timer: QTimer | None = None
+
+
+def _view_pool() -> QThreadPool:
+    pool = QThreadPool()
+    pool.setMaxThreadCount(1)
+    return pool
+
+
+def _retire_pool(pool: QThreadPool) -> None:
+    global _retire_timer
+    _retired_pools.append(pool)
+    if QCoreApplication.instance() is None:         # shutting down: they go with the process
+        return
+    if _retire_timer is None or not shiboken6.isValid(_retire_timer):
+        _retire_timer = QTimer(singleShot=False, interval=250)
+        _retire_timer.timeout.connect(_drop_idle_pools)
+    if not _retire_timer.isActive():
+        _retire_timer.start()
+
+
+def _drop_idle_pools() -> None:
+    _retired_pools[:] = [p for p in _retired_pools if p.activeThreadCount() > 0]
+    if not _retired_pools and _retire_timer is not None:
+        _retire_timer.stop()
 
 
 def set_page_source(provider: Callable[[], object]) -> None:
@@ -547,8 +580,8 @@ class _SceneView:
         self._image_scale = 0.0
         self._rendering = False
         self._render_again = False
-        self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(1)
+        self._pool = _view_pool()
+        self.destroyed.connect(lambda *_, pool=self._pool: _retire_pool(pool))
         self._refresh = QTimer(self, singleShot=True)
         self._refresh.timeout.connect(self._render)
         self._loaded.connect(self._on_loaded)

@@ -241,7 +241,10 @@ class Content:
                 pages.append(Page(
                     id=str(p.get("id", "")),
                     template=str((p.get("template") or {}).get("value", "")),
-                    deleted=bool(p.get("deleted")),
+                    # A register: {"value": 1} deleted, {"value": 0} deleted and put back
+                    # (undeleted on another device: the page is live and counted).
+                    deleted=bool((p.get("deleted") or {}).get("value")) if isinstance(p.get("deleted"), dict)
+                    else bool(p.get("deleted")),
                     redirect=int(redir) if isinstance(redir, (int, float)) else None,
                 ))
         elif isinstance(raw.get("pages"), list):

@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, unquote
 
-from PySide6.QtCore import (Property, QByteArray, QCoreApplication, QDate, QFile, QIODevice, QLocale, QObject, QRectF, QSettings,
-                            QSize, QSizeF, QUrl, Qt, Signal, Slot, QEnum)
+from PySide6.QtCore import (Property, QByteArray, QCoreApplication, QDate, QDateTime, QFile, QIODevice, QLocale, QObject, QRectF, QSettings,
+                            QSize, QSizeF, QTimer, QUrl, Qt, Signal, Slot, QEnum)
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QImage, QPainter
 from PySide6.QtNetwork import QNetworkInformation
 
@@ -830,8 +830,13 @@ class NetworkClient(QObject):
 
 
 class DocumentController(QObject):
-    """xofm::libs::library::DocumentController (TaskTracker): page editing, which this
-    client does not do."""
+    """xofm::libs::library::DocumentController (TaskTracker): page editing. Adding,
+    duplicating, moving and deleting pages are made as pending edits of the library
+    (LibrarySource.add_page and the rest, worked as reMarkable.exe's DocumentWorker
+    does, see core.pagemap), shown at once and uploaded by push_edits. The app runs these
+    on a worker and calls the QML callback when done; here they are quick, so they run at
+    once and the callback follows on the event loop. Templates, paper sizes and moving
+    pages between documents are not made yet."""
 
     libraryChanged = Signal()
     isRunningTasksChanged = Signal()
@@ -839,6 +844,11 @@ class DocumentController(QObject):
     def __init__(self, library: QObject | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._library = library
+        # Set by the app: its LibrarySource, how it shows the library again after an edit
+        # (with the pending page edits), and how it tells the user why an edit was not made.
+        self.source: Callable[[], object] = lambda: None
+        self.refresh: Callable[[], None] = lambda: None
+        self.notify: Callable[[str], None] = lambda message: log.warning("%s", message)
 
     def _set_library(self, library: QObject) -> None:
         self._library = library
@@ -848,43 +858,112 @@ class DocumentController(QObject):
     isRunningTasks = Property(bool, lambda self: False, notify=isRunningTasksChanged)
 
     def _unsupported(self, what: str) -> None:
-        log.info("%s: page editing is not available in this client", what)
+        log.info("%s: not available in this client yet", what)
+        self.notify("Not available on Linux yet")
+
+    def _now_ms(self) -> int:
+        now = getattr(self._library, "now_ms", None)
+        return int(now()) if callable(now) else int(QDateTime.currentMSecsSinceEpoch())
+
+    def _edit(self, document_id: str, what: str, run, callback=None, signal=None) -> bool:
+        """Make a page edit of document `document_id` with `run(source, node)`; then show
+        the library again, emit `signal(entry, result)` and call the QML callback, as the
+        app does when its task finishes. False (and the user told why) when not made."""
+        source = self.source()
+        library = self._library
+        node = library.tree.get(str(document_id)) if library is not None else None
+        if source is None or node is None:
+            self.notify(f"Unable to {what}")
+            return False
+        from core.edits import EditError       # here: platform.py loads before the editing modules
+        from core.sync import SyncError
+        try:
+            result = run(source, node)
+        except (EditError, SyncError) as err:
+            log.warning("%s of %s: %s", what, document_id, err)
+            self.notify(str(err))
+            return False
+        self.refresh()
+        entry = library.entryForId(str(document_id))
+        if signal is not None and entry is not None:
+            signal(entry, result)
+        if callback is not None and callable(getattr(callback, "call", None)) and not callback.isUndefined():
+            QTimer.singleShot(0, self, lambda: callback.call([]))
+        return True
 
     @Slot(str, int, str)
     @Slot(str, int, str, QSizeF)
     def setTemplateForPage(self, document_id: str, page: int, template: str, paper_size=None) -> None:
         self._unsupported("setTemplateForPage")
 
-    @Slot(str)
-    @Slot(str, int)
-    @Slot(str, int, str)
-    @Slot(str, int, str, QSizeF)
-    @Slot(str, int, str, QSizeF, "QJSValue")
-    @Slot(str, int, str, QSizeF, "QJSValue", str)
-    def addPageWithTemplateAndPageSize(self, document_id: str, *args) -> None:
-        self._unsupported("addPageWithTemplateAndPageSize")
+    def _add_page(self, document_id: str, insert_index: int = -1, template=None, callback=None,
+                  page_uuid: str = "") -> bool:
+        """doAddPage (0x140558ea0): no template given (or an empty one) takes the page
+        before's, or "Blank" at the front. The paper size is the scene's, which a new page
+        does not have until something is drawn on it (no .rm is written for it)."""
+        def run(source, node):
+            ids = source.page_ids(node)
+            index = len(ids) if insert_index < 0 or insert_index > len(ids) else insert_index
+            name = template or ""
+            if not name:
+                pages = node.content.pages
+                before = next((p for p in pages if index > 0 and p.id == ids[index - 1]), None)
+                name = before.template if before is not None and before.template else "Blank"
+            edit = source.add_page(node, index, name, self._now_ms(), page_uuid)
+            return source.page_ids(node).index(edit.new_id)
 
-    @Slot(str)
-    @Slot(str, int)
-    @Slot(str, int, str)
-    @Slot(str, int, str, int)
-    @Slot(str, int, str, int, "QJSValue")
-    def addPageWithTemplateAndPaperSizeFromPage(self, document_id: str, *args) -> None:
-        self._unsupported("addPageWithTemplateAndPaperSizeFromPage")
+        return self._edit(document_id, "add page", run, callback,
+                          lambda entry, index: (entry.pageAdded.emit(index), entry.pagesAdded.emit([index])))
 
-    @Slot(str, "QVariantList", str, int)
-    @Slot(str, "QVariantList", str, int, "QJSValue")
-    def movePages(self, document_id: str, pages: list, target_id: str, position: int, callback=None) -> None:
-        self._unsupported("movePages")
+    @Slot(str, result=bool)
+    @Slot(str, int, result=bool)
+    @Slot(str, int, str, result=bool)
+    @Slot(str, int, str, QSizeF, result=bool)
+    @Slot(str, int, str, QSizeF, "QJSValue", result=bool)
+    @Slot(str, int, str, QSizeF, "QJSValue", str, result=bool)
+    def addPageWithTemplateAndPageSize(self, document_id: str, insert_index: int = -1, template=None,
+                                       paper_size=None, callback=None, page_uuid: str = "") -> bool:
+        return self._add_page(document_id, insert_index, template, callback, page_uuid)
 
-    @Slot(str, "QVariantList", str, int)
-    def copyPages(self, document_id: str, pages: list, target_id: str, position: int) -> None:
-        self._unsupported("copyPages")
+    @Slot(str, result=bool)
+    @Slot(str, int, result=bool)
+    @Slot(str, int, str, result=bool)
+    @Slot(str, int, str, int, result=bool)
+    @Slot(str, int, str, int, "QJSValue", result=bool)
+    def addPageWithTemplateAndPaperSizeFromPage(self, document_id: str, insert_index: int = -1, template=None,
+                                                paper_size_from_page: int = -1, callback=None) -> bool:
+        return self._add_page(document_id, insert_index, template, callback)
 
-    @Slot(str, "QVariantList")
-    @Slot(str, "QVariantList", "QJSValue")
-    def deletePages(self, document_id: str, pages: list, callback=None) -> None:
-        self._unsupported("deletePages")
+    @Slot(str, "QVariantList", str, int, result=bool)
+    @Slot(str, "QVariantList", str, int, "QJSValue", result=bool)
+    def movePages(self, document_id: str, pages: list, target_id: str, position: int, callback=None) -> bool:
+        if target_id and target_id != document_id:
+            self._unsupported("movePages to another document")
+            return False
+        return self._edit(document_id, "move pages",
+                          lambda source, node: source.move_pages(node, list(pages), position, self._now_ms()),
+                          callback, lambda entry, _: entry.pagesMoved.emit())
+
+    @Slot(str, "QVariantList", str, int, result=bool)
+    def copyPages(self, document_id: str, pages: list, target_id: str, position: int) -> bool:
+        if target_id and target_id != document_id:
+            self._unsupported("copyPages to another document")
+            return False
+
+        def run(source, node):
+            edit = source.copy_pages(node, list(pages), position, self._now_ms())
+            ids = source.page_ids(node)
+            return [ids.index(n) for n in edit.new_ids if n in ids]
+
+        return self._edit(document_id, "duplicate page", run, None,
+                          lambda entry, added: entry.pagesAdded.emit(added))
+
+    @Slot(str, "QVariantList", result=bool)
+    @Slot(str, "QVariantList", "QJSValue", result=bool)
+    def deletePages(self, document_id: str, pages: list, callback=None) -> bool:
+        return self._edit(document_id, "delete page",
+                          lambda source, node: source.delete_pages(node, list(pages), self._now_ms()),
+                          callback, lambda entry, _: entry.pagesRemoved.emit())
 
     @Slot(str, str)
     def setViewBackgroundFilter(self, document_id: str, value: str) -> None:

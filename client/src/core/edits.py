@@ -17,6 +17,12 @@ an image of the tablet's as to one put on the page here.
 Undo and redo (PageHistory) work as in reMarkable.exe (SceneActionStack): they do not
 take edits back but make new ones, so they upload like any other edit.
 
+Four more change the page list itself (core.pagemap, as the app's DocumentWorker):
+a page added (PageAdd), pages duplicated (PageCopy), pages moved (PageMove) and pages
+deleted (PageDelete). They name pages by id and their place by the page before it, so
+they too apply to a newer version of the document. Staged works a document out with
+all its pending edits: its page list, and each page's file.
+
 What an inserted image changes, as in the app (reMarkable.exe 3.29):
     <doc>/<page>/<uuid>.png|.jpg   the image file, added
     <doc>/<page>.rm                the page, with the image item (viewer.rm_writer)
@@ -25,6 +31,18 @@ What an inserted image changes, as in the app (reMarkable.exe 3.29):
 Times are milliseconds as decimal strings, and never move backwards. A moved image
 changes the page, .content and .metadata; a deleted one also takes its file out of the
 document once no item on the page shows it.
+
+What the page edits change (DocumentWorker doAddPage/doCopyPages/doMovePages/
+doDeletePages, 0x140558ea0, 0x14055a1f0, 0x14055e4f0, 0x14055aaf0):
+    <doc>.content                  cPages (core.pagemap) and pageCount
+    <doc>.metadata                 "lastModified"
+    a copied page's files          its .rm (with the edits made to it before the copy),
+                                   images, <page>-metadata.json, .highlights/<page>.json
+                                   and .thumbnails/<page>.png, under the new page's id
+                                   (pagecopyhelper.cpp copyPageFiles: the same bytes)
+    a deleted page's files         out of the document
+An added page gets no .rm: the app keeps a new page's scene in memory until something
+is drawn on it, and a page without one shows as empty paper (as PDF pages do).
 """
 
 from __future__ import annotations
@@ -43,6 +61,7 @@ from viewer.rm_parser import RmParseError
 
 from .config import atomic_write_json, ensure_private_dir, read_json
 from .models import Document, json_bytes
+from .pagemap import PageMap, PageMapError
 
 log = logging.getLogger("rm.edits")
 
@@ -201,9 +220,124 @@ class ImageRestore:
         return cls.new(raw["doc_id"], raw["page_id"], raw["key"], raw["item"], raw["created_ms"], raw.get("uid") or "")
 
 
-Edit = ImageInsert | ImageTransform | ImageDelete | ImageRestore
+# ------------------------------------------------------------------ page edits
+#
+# Places are given as the app gives them, an index in the list of pages as shown, and
+# also by `after`, the id of the page then before that place ("" at the front): made
+# again on a newer version of the page list, an edit goes after that page, or to the
+# index when it is gone.
+
+def _ids(values) -> tuple[str, ...]:
+    ids = tuple(str(v) for v in values)
+    if not ids or any(not v for v in ids):
+        raise EditError(f"not a list of page ids: {values!r}")
+    return ids
+
+
+def _new_id() -> str:
+    return str(uuid.uuid4())
+
+
+class _PageEdit:
+    """A change of the page list: it belongs to no page of its own (page_id "")."""
+
+    @property
+    def page_id(self) -> str:
+        return ""
+
+
+@dataclass(frozen=True)
+class PageAdd(_PageEdit):
+    """A new page (doAddPage): an empty page with template `template` at `index`."""
+
+    doc_id: str
+    new_id: str
+    index: int
+    after: str
+    template: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, index: int, after: str, template: str, created_ms: int,
+            new_id: str | None = None) -> "PageAdd":
+        return cls(str(doc_id), str(new_id or _new_id()), int(index), str(after or ""), str(template or ""),
+                   int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "PageAdd":
+        return cls.new(raw["doc_id"], raw["index"], raw["after"], raw["template"], raw["created_ms"], raw["new_id"])
+
+
+@dataclass(frozen=True)
+class PageCopy(_PageEdit):
+    """Pages duplicated (doCopyPages): a copy of each of `sources`, named `new_ids`,
+    put in a row at `index`."""
+
+    doc_id: str
+    sources: tuple[str, ...]
+    new_ids: tuple[str, ...]
+    index: int
+    after: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, sources, index: int, after: str, created_ms: int, new_ids=None) -> "PageCopy":
+        sources = _ids(sources)
+        new_ids = _ids(new_ids) if new_ids is not None else tuple(_new_id() for _ in sources)
+        if len(new_ids) != len(sources):
+            raise EditError("a copied page needs one new id per page")
+        return cls(str(doc_id), sources, new_ids, int(index), str(after or ""), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "PageCopy":
+        return cls.new(raw["doc_id"], raw["sources"], raw["index"], raw["after"], raw["created_ms"], raw["new_ids"])
+
+
+@dataclass(frozen=True)
+class PageMove(_PageEdit):
+    """Pages moved (doMovePages) to before the page at `index` of the list as it was."""
+
+    doc_id: str
+    pages: tuple[str, ...]
+    index: int
+    after: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, pages, index: int, after: str, created_ms: int) -> "PageMove":
+        return cls(str(doc_id), _ids(pages), int(index), str(after or ""), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "PageMove":
+        return cls.new(raw["doc_id"], raw["pages"], raw["index"], raw["after"], raw["created_ms"])
+
+
+@dataclass(frozen=True)
+class PageDelete(_PageEdit):
+    """Pages deleted (doDeletePages). A document left without pages gets a new "Blank"
+    one, as the app adds one then; `blank_id` is its id."""
+
+    doc_id: str
+    pages: tuple[str, ...]
+    blank_id: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, pages, created_ms: int, blank_id: str | None = None) -> "PageDelete":
+        return cls(str(doc_id), _ids(pages), str(blank_id or _new_id()), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "PageDelete":
+        return cls.new(raw["doc_id"], raw["pages"], raw["created_ms"], raw["blank_id"])
+
+
+PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete)
+DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
+
+Edit = ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
-                          "image-restore": ImageRestore}
+                          "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
+                          "page-move": PageMove, "page-delete": PageDelete}
 
 
 class PendingEdits:
@@ -438,56 +572,244 @@ def _later(old: Any, new_ms: int) -> str:
         return str(new_ms)
 
 
+# ------------------------------------------------------------------ a document with its edits
+
+def page_files(doc: Document, page_id: str) -> list[str]:
+    """The files of `doc` that belong to page `page_id` (the app's page paths:
+    resourceDirectoryPath, pageLinesPath, pageMetadataPath, pageHighlightsPath,
+    pageThumbnailPath)."""
+    own = {f"{doc.id}/{page_id}.rm", f"{doc.id}/{page_id}-metadata.json", f"{doc.id}.highlights/{page_id}.json",
+           f"{doc.id}.thumbnails/{page_id}.png"}
+    folder = f"{doc.id}/{page_id}/"
+    return sorted(name for name in doc.files if name in own or name.startswith(folder))
+
+
+class Staged:
+    """`doc` (as the cloud has it) with `edits` made to it, in order: the page list
+    (`ids`, and `content`, the .content with it when the edits change it) and, for each
+    page, the edits made to it and where it comes from: the document's own page, a new
+    empty page, or a copy of another page as it was when copied. `read(name)` gives a
+    file of `doc`. Pages are worked out when asked for (page, replay)."""
+
+    def __init__(self, doc: Document, edits: list[Edit], read: Callable[[str], bytes], author: bytes) -> None:
+        self.doc, self.read, self.author = doc, read, author
+        self.page_edits: dict[str, list[Edit]] = {}
+        # page id -> ("new",) | ("copy", source page id, how many of its edits the copy has)
+        self.origin: dict[str, tuple] = {}
+        self.deleted: set[str] = set()                  # pages the edits deleted
+        self.page_list_edits: list[Edit] = []
+        self.content: dict | None = None                # .content with the new page list
+        self._pages: dict[str, bytes | None] = {}
+        live = [p.id for p in doc.content.pages if not p.deleted]
+        pagemap: PageMap | None = None
+        for edit in edits:
+            if edit.doc_id != doc.id:
+                raise EditError("an edit of another document")
+            if not isinstance(edit, PAGE_EDITS):
+                if edit.page_id not in self.deleted:   # edits of a page deleted after them are moot
+                    self.page_edits.setdefault(edit.page_id, []).append(edit)
+                continue
+            if pagemap is None:
+                try:
+                    pagemap = PageMap(json.loads(read(f"{doc.id}.content")), author)
+                except (ValueError, PageMapError) as err:
+                    raise EditError(f"the page list cannot be changed: {err}") from err
+            self.page_list_edits.append(edit)
+            self._apply(pagemap, edit)
+        if pagemap is not None:
+            self.content = pagemap.save()
+            live = pagemap.ids()
+        self.ids: list[str] = live
+
+    # -- the page list --
+
+    @staticmethod
+    def _place(pagemap: PageMap, index: int, after: str) -> int:
+        if not after:
+            return 0
+        at = pagemap.index(after)
+        return at + 1 if at >= 0 else min(max(index, 0), len(pagemap.live))
+
+    def _apply(self, pagemap: PageMap, edit: Edit) -> None:
+        """Make a page edit on the page list. One the list has already (uploaded without
+        it being noticed), or whose pages are gone, changes nothing."""
+        try:
+            if isinstance(edit, PageAdd):
+                if not pagemap.known(edit.new_id):
+                    pagemap.insert(self._place(pagemap, edit.index, edit.after), edit.new_id, edit.template)
+                    self.origin[edit.new_id] = ("new",)
+            elif isinstance(edit, PageCopy):
+                pairs = [(pagemap.index(s), s, n) for s, n in zip(edit.sources, edit.new_ids)
+                         if pagemap.index(s) >= 0 and not pagemap.known(n)]
+                at = self._place(pagemap, edit.index, edit.after)
+                infos = [(pagemap.info(s), s, n) for _, s, n in sorted(pairs)]      # read before inserting
+                for i, (info, source, new_id) in enumerate(infos):
+                    pagemap.insert(at + i, new_id, info.template, info.redirect)
+                    self.origin[new_id] = ("copy", source, len(self.page_edits.get(source, [])))
+            elif isinstance(edit, PageMove):
+                indices = [pagemap.index(p) for p in edit.pages if pagemap.index(p) >= 0]
+                if indices:
+                    pagemap.move(indices, self._place(pagemap, edit.index, edit.after))
+            elif isinstance(edit, PageDelete):
+                for page_id in edit.pages:
+                    at = pagemap.index(page_id)
+                    if at >= 0:
+                        pagemap.delete(at)
+                        self.deleted.add(page_id)
+                        self.page_edits.pop(page_id, None)
+                if not pagemap.live and not pagemap.known(edit.blank_id):
+                    pagemap.insert(0, edit.blank_id, DEFAULT_TEMPLATE)
+                    self.origin[edit.blank_id] = ("new",)
+        except PageMapError as err:
+            raise EditError(f"the page list cannot be changed: {err}") from err
+
+    @property
+    def changes_page_list(self) -> bool:
+        return self.content is not None
+
+    def removed(self) -> list[str]:
+        """Pages of `doc` the edits deleted."""
+        return sorted(p for p in self.deleted if p not in self.origin)
+
+    def missing(self) -> list[str]:
+        """Pages with edits that are not in the page list: deleted elsewhere."""
+        return sorted(set(self.page_edits) - set(self.ids))
+
+    # -- pages --
+
+    def base(self, page_id: str, upto: int | None = None) -> bytes | None:
+        """A page before its own edits (None: no file): the document's .rm, nothing for
+        a new page, the source page for a copy."""
+        origin = self.origin.get(page_id)
+        if origin is None:
+            name = f"{self.doc.id}/{page_id}.rm"
+            return self.read(name) if name in self.doc.files else None
+        if origin[0] == "new":
+            return None
+        return self._page(origin[1], origin[2])
+
+    def _page(self, page_id: str, count: int | None = None) -> bytes | None:
+        edits = self.page_edits.get(page_id, [])
+        edits = edits if count is None else edits[:count]
+        base = self.base(page_id)
+        if not edits:
+            return base
+        try:
+            return page_with_edits(base, edits, self.author)
+        except (RmParseError, ValueError) as err:
+            raise EditError(f"the page cannot be edited: {err}") from err
+
+    def page(self, page_id: str) -> bytes | None:
+        """The page's .rm with all its edits (None: it has none)."""
+        if page_id not in self._pages:
+            self._pages[page_id] = self._page(page_id)
+        return self._pages[page_id]
+
+    def replay(self, page_id: str) -> Replay:
+        try:
+            return replay(self.base(page_id), self.page_edits.get(page_id, []), self.author)
+        except (RmParseError, ValueError) as err:
+            raise EditError(f"the page cannot be edited: {err}") from err
+
+    def has_file(self, page_id: str) -> bool:
+        """Whether the page has a .rm, from the document or made by its edits."""
+        origin = self.origin.get(page_id)
+        if self.page_edits.get(page_id):
+            return True
+        if origin is None:
+            return f"{self.doc.id}/{page_id}.rm" in self.doc.files
+        return origin[0] == "copy" and (bool(origin[2]) or self.has_file(origin[1]))
+
+    def image_source(self, page_id: str, file_name: str):
+        """Where the page's image file `file_name` is: ("doc", name of a file of `doc`),
+        ("edit", the ImageInsert that brought it), or None."""
+        for edit in self.page_edits.get(page_id, []):
+            if isinstance(edit, ImageInsert) and edit.file_name == file_name:
+                return "edit", edit
+        origin = self.origin.get(page_id)
+        if origin is None:
+            name = f"{self.doc.id}/{page_id}/{file_name}"
+            return ("doc", name) if name in self.doc.files else None
+        return self.image_source(origin[1], file_name) if origin[0] == "copy" else None
+
+    def copied_files(self, page_id: str) -> list[tuple[str, str]]:
+        """(file of `doc`, its name for the copy) for the page files other than the .rm
+        and images that a copy takes from the document's page it comes from."""
+        origin, page = self.origin.get(page_id), page_id
+        while origin is not None and origin[0] == "copy":
+            page, origin = origin[1], self.origin.get(origin[1])
+        if origin is not None or page == page_id:
+            return []
+        out = []
+        for name in page_files(self.doc, page):
+            if name.endswith(".rm") or name.startswith(f"{self.doc.id}/{page}/"):
+                continue
+            out.append((name, name.replace(page, page_id)))
+        return out
+
+
 def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes],
                    image: Callable[[ImageInsert], bytes], author: bytes) -> dict[str, bytes | None]:
     """The files of `doc` that `edits` add, change (name -> new bytes) or remove (name ->
     None); empty when nothing is left to do. `read(name)` gives a file `doc` has,
     `image(edit)` an inserted image's file. EditError if an edit no longer fits: its page
     was removed, or cannot be edited safely."""
+    staged = Staged(doc, edits, read, author)
+    missing = staged.missing()
+    if missing:
+        raise EditError("the page of an edit is no longer in the document")
     out: dict[str, bytes | None] = {}
-    pages: dict[str, list[Edit]] = {}
-    for edit in edits:
-        if edit.doc_id != doc.id:
-            raise EditError("an edit of another document")
-        pages.setdefault(edit.page_id, []).append(edit)
-    live = {p.id for p in doc.content.pages if not p.deleted}
     changed: dict[str, int] = {}                        # page id -> time of its newest edit
-    for page_id, page_edits in pages.items():
-        if page_id not in live:
-            raise EditError("the page of an edit is no longer in the document")
+    for page_id in staged.ids:
+        origin, page_edits = staged.origin.get(page_id), staged.page_edits.get(page_id, [])
+        if origin is None and not page_edits:
+            continue
         name = f"{doc.id}/{page_id}.rm"
-        old = read(name) if name in doc.files else None
-        try:
-            new = page_with_edits(old, page_edits, author)
-        except (RmParseError, ValueError) as err:
-            raise EditError(f"the page cannot be edited: {err}") from err
+        old = read(name) if origin is None and name in doc.files else None
+        new = staged.page(page_id)
+        if page_edits and new != staged.base(page_id):
+            changed[page_id] = max(e.created_ms for e in page_edits)
         if new == old:
             continue
-        out[name] = new
-        changed[page_id] = max(e.created_ms for e in page_edits)
+        if new is not None:
+            out[name] = new
         used = set(page_images(new).values())
-        for edit in page_edits:                         # an image file is written once
-            if isinstance(edit, ImageInsert) and edit.path not in doc.files and edit.file_name in used:
-                out[edit.path] = image(edit)
-        for file_name in set(page_images(old).values()) - used:
+        for file_name in sorted(used):                  # an image file is written once
             path = f"{doc.id}/{page_id}/{file_name}"
-            if path in doc.files:                       # the page no longer uses it
-                out[path] = None
-    if not changed:
-        return {}
+            if path in doc.files:
+                continue
+            source = staged.image_source(page_id, file_name)
+            if source is None:
+                log.warning("page %s shows image %s, which has no file", page_id, file_name)
+            else:
+                out[path] = read(source[1]) if source[0] == "doc" else image(source[1])
+        if origin is None:
+            for file_name in set(page_images(old).values()) - used:
+                path = f"{doc.id}/{page_id}/{file_name}"
+                if path in doc.files:                   # the page no longer uses it
+                    out[path] = None
+        else:
+            for source, copy in staged.copied_files(page_id):
+                out[copy] = read(source)
+    for page_id in staged.removed():
+        for name in page_files(doc, page_id):
+            out[name] = None
 
     content_name, metadata_name = f"{doc.id}.content", f"{doc.id}.metadata"
-    content = json.loads(read(content_name))
+    if not changed and not staged.changes_page_list:
+        return out if out else {}
+    original = json.loads(read(content_name))
+    content = staged.content if staged.changes_page_list else json.loads(read(content_name))
     listed = (content.get("cPages") or {}).get("pages") if isinstance(content.get("cPages"), dict) else None
-    touched = False
     for entry in listed if isinstance(listed, list) else []:
         if isinstance(entry, dict) and entry.get("id") in changed:
-            stamp = _later(entry.get("modifed"), changed[entry["id"]])
-            touched = touched or entry.get("modifed") != stamp
-            entry["modifed"] = stamp
-    if touched:
+            entry["modifed"] = _later(entry.get("modifed"), changed[entry["id"]])
+    if content != original:
         out[content_name] = json_bytes(content)
+    if not out:
+        return {}
+    newest = max([*changed.values(), *(e.created_ms for e in staged.page_list_edits)])
     metadata = json.loads(read(metadata_name))
-    metadata["lastModified"] = _later(metadata.get("lastModified"), max(changed.values()))
+    metadata["lastModified"] = _later(metadata.get("lastModified"), newest)
     out[metadata_name] = json_bytes(metadata)
     return out

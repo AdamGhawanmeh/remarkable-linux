@@ -8,8 +8,10 @@ order mirror the official sidebar (qml/client/Sidebar.qml):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
+import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,10 +19,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable
 
-from core.models import (ROOT_ID, TRASH_ID, Document, DocumentTree, FileType, Folder, Node,
+from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.edits import (Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageHistory,
-                        document_files, page_with_edits, replay, swapped)
+from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageAdd,
+                        PageCopy, PageDelete, PageHistory, PageMove, Staged, document_files, swapped)
 from core.sync import SyncClient, SyncError, sha256_hex
 from viewer import rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
@@ -323,6 +325,8 @@ class LibrarySource:
         self._lock = threading.Lock()
         # Undo and redo, per (document id, page id), while the document is open.
         self._histories: dict[tuple[str, str], PageHistory] = {}
+        # Documents worked out with their pending edits, by id: (key, Staged).
+        self._staged: dict[str, tuple[tuple, Staged]] = {}
         self._history_lock = threading.RLock()
 
     @property
@@ -376,6 +380,120 @@ class LibrarySource:
 
     def pending_edits(self, doc: Document, page_id: str | None = None) -> list[Edit]:
         return [e for e in self.sync.edits.of(doc.id) if page_id is None or e.page_id == page_id]
+
+    def staged(self, doc: Document) -> Staged:
+        """The document as last synced with its pending edits (core.edits.Staged)."""
+        synced = self.sync.tree.get(doc.id)
+        base = synced if isinstance(synced, Document) else doc
+        edits = self.sync.edits.of(doc.id)
+        key = (base.hash, tuple(edits))
+        with self._lock:
+            known = self._staged.get(doc.id)
+            if known is not None and known[0] == key:
+                return known[1]
+        staged = Staged(base, edits, lambda name: self.blob(base, name), self.sync.author() if edits else b"")
+        staged.key = key
+        with self._lock:
+            self._staged[doc.id] = (key, staged)
+        return staged
+
+    def view(self, doc: Node) -> Node:
+        """`doc` as the app shows it: with the page list its pending page edits make
+        (added, copied, moved and deleted pages). Its hash is made from the synced one
+        and the edits, so that views and thumbnails of the old page list are not reused;
+        it is never sent to the cloud (writes go by id through SyncClient)."""
+        if not isinstance(doc, Document) or not any(isinstance(e, PAGE_EDITS) for e in self.sync.edits.of(doc.id)):
+            return doc
+        try:
+            staged = self.staged(doc)
+        except (EditError, SyncError) as err:
+            log.error("cannot show the pending page edits of %s: %s", doc.id, err)
+            return doc
+        if not staged.changes_page_list:
+            return doc
+        # A hash of its own from the first character on: thumbnail URLs carry only the
+        # start of it (image://rmthumb/<id>/<page>?v=<16 chars>), and a page index now
+        # showing another page must not get the old picture from Qt's image cache.
+        marked = hashlib.sha256(f"{doc.hash}:{staged.key[1]!r}".encode()).hexdigest()
+        return Document(id=doc.id, metadata=doc.metadata, hash=marked, files=dict(doc.files),
+                        content=Content.parse(staged.content))
+
+    def view_tree(self, tree: DocumentTree) -> DocumentTree:
+        """`tree` with each document that has pending page edits as view() shows it."""
+        documents = set(self.sync.edits.documents())
+        if not documents & set(tree.nodes):
+            return tree
+        return DocumentTree([self.view(node) if node.id in documents else node for node in tree.nodes.values()])
+
+    # -- pages: add, duplicate, move, delete (the app's DocumentController) --
+
+    def page_ids(self, doc: Document) -> list[str]:
+        """The document's pages as shown here (with its pending page edits)."""
+        return list(self.staged(self._editable(doc)).ids)
+
+    def _place(self, ids: list[str], index: int) -> tuple[int, str]:
+        """An index of the page list as given to the app (clamped), and the page before it."""
+        index = min(max(int(index), 0), len(ids))
+        return index, ids[index - 1] if index > 0 else ""
+
+    def _pages_at(self, ids: list[str], indices) -> list[str]:
+        """The ids of the pages at `indices` (in list order), EditError if one is out of range."""
+        try:
+            wanted = sorted({int(i) for i in indices})
+        except (TypeError, ValueError) as err:
+            raise EditError(f"not a list of pages: {indices!r}") from err
+        if not wanted or wanted[0] < 0 or wanted[-1] >= len(ids):
+            raise EditError(f"no such pages: {sorted(wanted)} of {len(ids)}")
+        return [ids[i] for i in wanted]
+
+    def add_page(self, doc: Document, index: int, template: str, now_ms: int, page_uuid: str = "") -> PageAdd:
+        """Add an empty page at `index` (past the end or negative: at the end, as
+        doAddPage clamps it), here only until pushed. The app passes the template; the
+        desktop's "Add page" passes "Blank" (Strings.defaultTemplateName). `page_uuid`
+        names the page when it is a UUID no page of the document has (else a new one)."""
+        doc = self._editable(doc)
+        staged = self.staged(doc)
+        ids = staged.ids
+        index = len(ids) if index < 0 else index
+        index, after = self._place(ids, index)
+        new_id = None
+        try:
+            if page_uuid and str(uuid.UUID(page_uuid)) not in set(ids) | staged.deleted \
+                    and not any(p.id == str(uuid.UUID(page_uuid)) for p in doc.content.pages):
+                new_id = str(uuid.UUID(page_uuid))
+        except ValueError:
+            new_id = None
+        edit = PageAdd.new(doc.id, index, after, template, now_ms, new_id)
+        self._add_edit(doc, edit)
+        return edit
+
+    def copy_pages(self, doc: Document, indices, insert_index: int, now_ms: int) -> PageCopy:
+        """Duplicate the pages at `indices`, the copies in a row at `insert_index`."""
+        doc = self._editable(doc)
+        ids = self.staged(doc).ids
+        sources = self._pages_at(ids, indices)
+        index, after = self._place(ids, insert_index)
+        edit = PageCopy.new(doc.id, sources, index, after, now_ms)
+        self._add_edit(doc, edit)
+        return edit
+
+    def move_pages(self, doc: Document, indices, insert_index: int, now_ms: int) -> PageMove:
+        """Move the pages at `indices` to before the page now at `insert_index`."""
+        doc = self._editable(doc)
+        ids = self.staged(doc).ids
+        pages = self._pages_at(ids, indices)
+        index, after = self._place(ids, insert_index)
+        edit = PageMove.new(doc.id, pages, index, after, now_ms)
+        self._add_edit(doc, edit)
+        return edit
+
+    def delete_pages(self, doc: Document, indices, now_ms: int) -> PageDelete:
+        """Delete the pages at `indices` (a document left empty gets a "Blank" page)."""
+        doc = self._editable(doc)
+        pages = self._pages_at(self.staged(doc).ids, indices)
+        edit = PageDelete.new(doc.id, pages, now_ms)
+        self._add_edit(doc, edit)
+        return edit
 
     def insert_image(self, doc: Document, page_id: str, data: bytes, extension: str, vertices,
                      now_ms: int, timestamps=None, action: list[Change] | None = None) -> ImageInsert:
@@ -472,10 +590,8 @@ class LibrarySource:
     def _live_item(self, doc: Document, page_id: str, key: bytes):
         """(how an edit names it, its id) of the item showing the image `key` on the
         page as it is shown here, or None."""
-        name = f"{doc.id}/{page_id}.rm"
-        page = self.blob(doc, name) if name in doc.files else None
         try:
-            done = replay(page, self.pending_edits(doc, page_id), self.sync.author())
+            done = self.staged(doc).replay(page_id)
             live = rm_writer.image_item(done.page, key)
         except (RmParseError, ValueError) as err:
             raise EditError(f"the page cannot be edited: {err}") from err
@@ -517,12 +633,14 @@ class LibrarySource:
             for key in [k for k in self._histories if k[0] == doc_id]:
                 del self._histories[key]
 
-    def _editable(self, doc: Document, page_id: str) -> Document:
+    def _editable(self, doc: Document, page_id: str | None = None) -> Document:
+        """The document as last synced, when it may be edited (and has the page
+        `page_id`, with the pending edits: a page added here counts)."""
         refusal = self.edit_refusal(doc)
         if refusal:
             raise EditError(refusal)
         doc = self.sync.tree.get(doc.id)                # the document as last synced
-        if page_id not in {p.id for p in doc.content.pages if not p.deleted}:
+        if page_id is not None and page_id not in self.staged(doc).ids:
             raise EditError("this page is not in the document's page list")
         return doc
 
@@ -539,26 +657,27 @@ class LibrarySource:
             self.sync.edits.add(edit, data)
         with self._lock:
             self._scenes.clear()
+            self._staged.clear()
 
     def _page_data(self, doc: Document, page: PageRef) -> bytes | None:
         """A page's .rm as it is to be shown: the cloud's file (None: the page has
-        none) with the pending edits of the page made to it."""
-        data = self.blob(doc, page.rm_name) if page.rm_name else None
-        edits = self.pending_edits(doc, page.page_id)
-        if not edits:
-            return data
+        none) with the pending edits made to it, or a page added or copied here."""
+        staged = self.staged(doc)
+        if not staged.page_edits.get(page.page_id) and page.page_id not in staged.origin:
+            return self.blob(doc, page.rm_name) if page.rm_name else None
         try:
-            return page_with_edits(data, edits, self.sync.author())
-        except (EditError, RmParseError, ValueError) as err:
+            return staged.page(page.page_id)
+        except EditError as err:
             log.error("cannot show the pending edits of page %s: %s", page.page_id, err)
-            return data
+            return self.blob(doc, page.rm_name) if page.rm_name else None
 
     def page_scene(self, doc: Document, page: PageRef) -> PageScene | None:
         """Parsed strokes/text for a page, with the edits made here that are not
         uploaded yet; None if the page has no .rm file and no such edit."""
-        if page.rm_name is None and not self.pending_edits(doc, page.page_id):
+        staged = self.staged(doc)
+        if page.rm_name is None and not staged.has_file(page.page_id):
             return None
-        key = (doc.files.get(page.rm_name or "") or "", tuple(self.pending_edits(doc, page.page_id)))
+        key = (doc.id, page.page_id, doc.files.get(page.rm_name or "") or "", staged.key)
         with self._lock:
             if key in self._scenes:
                 self._scenes.move_to_end(key)
@@ -579,16 +698,17 @@ class LibrarySource:
 
     def _attach_images(self, doc: Document, page: PageRef, scene: PageScene) -> None:
         """Give each image item its file, stored with the document as
-        "<doc>/<page>/<file name>". One that is missing or not cached stays undrawn."""
+        "<doc>/<page>/<file name>" (or not uploaded yet). One that is missing or not
+        cached stays undrawn."""
+        staged = self.staged(doc)
         folder = f"{doc.id}/{page.page_id}"
-        pending = {e.path: e for e in self.pending_edits(doc, page.page_id) if isinstance(e, ImageInsert)}
         for image in scene.placed_images:
-            name = f"{folder}/{image.file_name}"
-            if not image.file_name or (name not in doc.files and name not in pending):
+            source = staged.image_source(page.page_id, image.file_name) if image.file_name else None
+            if source is None:
                 log.warning("%s: image %s has no file %r", folder, image.item_id, image.file_name)
                 continue
             try:
-                image.data = self.blob(doc, name) if name in doc.files else self.sync.edits.data(pending[name])
+                image.data = self.blob(doc, source[1]) if source[0] == "doc" else self.sync.edits.data(source[1])
             except (SyncError, EditError, OSError) as err:
                 log.warning("%s: image %s: %s", folder, image.file_name, err)
 

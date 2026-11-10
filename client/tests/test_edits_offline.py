@@ -29,9 +29,12 @@ from PySide6.QtGui import QColor, QImage, QImageIOHandler, QImageWriter  # noqa:
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import push_edits  # noqa: E402
-from core.edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PendingEdits,  # noqa: E402
-                        document_files, page_images, page_with_edits)
-from core.models import json_bytes  # noqa: E402
+from core.edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd,  # noqa: E402
+                        PageCopy, PageDelete, PageMove, PendingEdits, Staged, document_files, page_images,
+                        page_with_edits)
+from core import pagemap  # noqa: E402
+from core.pagemap import PageMap, PageMapError, jump, key_after, keys_after, keys_between, not_before  # noqa: E402
+from core.models import Content, json_bytes  # noqa: E402
 from core.sync import SyncClient, SyncError, json_changes, parse_index  # noqa: E402
 from ui import editing  # noqa: E402
 from ui.library import LibrarySource, document_pages  # noqa: E402
@@ -1238,6 +1241,438 @@ class UndoTests(Base):
         fresh.refresh()
         self.assertEqual(fresh.history_state(fresh.sync.tree.get(THROWAWAY), PAGE1), (False, False))
         self.assertEqual(len(fresh.sync.edits.all()), 2)
+
+
+# ------------------------------------------------------------------ page management
+
+def entry(page_id: str, key: str, author: int = 1, template: str = "Blank", **extra) -> dict:
+    return {"id": page_id, "idx": {"timestamp": f"{author}:2", "value": key},
+            "template": {"timestamp": f"{author}:2", "value": template}, **extra}
+
+
+def content_of(*entries, uuids=None) -> dict:
+    return {"fileType": "notebook", "formatVersion": 2,
+            "pageCount": sum(1 for e in entries if not (e.get("deleted") or {}).get("value")),
+            "cPages": {"pages": list(entries), "lastOpened": {"timestamp": "0:0", "value": ""},
+                       "original": {"timestamp": "0:0", "value": -1},
+                       "uuids": uuids if uuids is not None else [{"first": TABLET_UUID, "second": 1}]}}
+
+
+TABLET_UUID = "0f0e0d0c-0b0a-5908-8706-050403020100"
+OURS = bytes(range(100, 116))
+OURS_UUID = "64656667-6869-6a6b-6c6d-6e6f70717273"
+P = [f"bbbbbbbb-0000-4000-8000-{n:012d}" for n in range(10)]
+
+
+class PageKeyTests(unittest.TestCase):
+    """The page-order keys, as reMarkable.exe makes them (core.pagemap), checked on the
+    shapes found in real libraries: every page appended on a tablet is key_after the
+    one before (1829 of 1839 neighbouring pages of the library this was built from),
+    and the rest are keys_between or a jump after another author's page."""
+
+    def test_pages_added_at_the_end_count_up_from_ba(self):
+        self.assertEqual(keys_after("a", 4), ["ba", "bb", "bc", "bd"])
+        self.assertEqual([key_after(k) for k in ("bz", "cz", "mz")], ["ca", "da", "na"])
+
+    def test_keys_grow_when_their_first_half_runs_high(self):
+        self.assertEqual(key_after("ny"), "nza")         # "nz", all of its first half n or later: one longer
+        self.assertEqual(key_after("zz"), "zzaa")        # no letter to step up: "a" added, then grown
+        self.assertEqual(key_after("ona"), "onba")
+        self.assertEqual(key_after("onba"), "onbb")
+
+    def test_a_jump_leaves_room_after_another_authors_page(self):
+        self.assertEqual(jump("ba"), "ona")
+        self.assertEqual(key_after(jump("ba")), "onba")  # as found after a page by another device
+        self.assertEqual(jump("ona"), "pnna")
+
+    def test_keys_between_two_pages(self):
+        self.assertEqual(keys_between("ba", "bb", 3), ["bab", "bac", "bad"])
+        self.assertEqual(keys_between("opfx", "opfy", 1), ["opfxb"])     # as found in a real file
+        self.assertEqual(keys_between("a", "ba", 1), ["aab"])            # before the first page
+        self.assertEqual(keys_between("bb", "ba", 1), [])                # no room the wrong way round
+        self.assertEqual(keys_between("ba", "baa", 1), [])               # "baa" counts as "ba"
+        for a, b, n in (("ba", "bb", 30), ("ba", "ca", 5), ("aab", "ba", 2), ("onbz", "oobp", 4)):
+            keys = keys_between(a, b, n)
+            self.assertEqual(len(keys), n)
+            self.assertEqual(keys, sorted(keys))
+            self.assertTrue(all(a < k < b for k in keys), (a, b, keys))
+
+    def test_not_before(self):
+        self.assertTrue(not_before("bb", "ba"))
+        self.assertTrue(not_before("ba", "ba"))
+        self.assertTrue(not_before("ba", "baa"))         # trailing "a"s: the same place
+        self.assertFalse(not_before("ba", "bab"))
+        self.assertFalse(not_before("ba", "bb"))
+
+
+class PageMapTests(unittest.TestCase):
+    def pagemap(self, *entries, uuids=None) -> PageMap:
+        return PageMap(content_of(*entries, uuids=uuids), OURS)
+
+    def three(self) -> PageMap:
+        return self.pagemap(entry(P[0], "ba"), entry(P[1], "bb"), entry(P[2], "bc"))
+
+    def test_a_new_author_gets_the_next_index_listed_first(self):
+        pm = self.three()
+        self.assertEqual(pm.author, 2)
+        self.assertEqual(pm.cpages["uuids"][0], {"first": OURS_UUID, "second": 2})
+        self.assertEqual(PageMap(pm.content, OURS).author, 2)           # found the next time
+        # Without a uuids list, the indices in the timestamps are still not reused.
+        self.assertEqual(self.pagemap(entry(P[0], "ba", author=3), uuids=[]).author, 4)
+
+    def test_insert_at_the_end_as_the_app_writes_a_new_page(self):
+        pm = self.three()
+        self.assertEqual(pm.insert(3, P[5], "Blank"), 3)
+        new = pm.live[3]
+        # Each field written once (counter 1) then counted once more by the normal insert
+        # mode: the "A:2" every tablet-added page in the library has.
+        self.assertEqual(new, {"id": P[5], "template": {"timestamp": "2:2", "value": "Blank"},
+                               "idx": {"timestamp": "2:2", "value": key_after(jump(jump("bc")))}})
+        self.assertNotIn("redir", new)
+        self.assertNotIn("modifed", new)
+        self.assertEqual(pm.ids(), [P[0], P[1], P[2], P[5]])
+
+    def test_insert_after_our_own_page_does_not_jump(self):
+        pm = self.pagemap(entry(P[0], "ba", author=2), uuids=[{"first": OURS_UUID, "second": 2}])
+        pm.insert(5, P[5])                                               # clamped to the end
+        self.assertEqual(pm.live[1]["idx"], {"timestamp": "2:2", "value": "bb"})
+        self.assertNotIn("template", pm.live[1])
+
+    def test_insert_at_the_front_and_in_the_middle(self):
+        pm = self.three()
+        pm.insert(0, P[5])
+        pm.insert(2, P[6], "P Lines small", redirect=4)
+        self.assertEqual(pm.ids(), [P[5], P[0], P[6], P[1], P[2]])
+        self.assertEqual(pm.live[0]["idx"]["value"], "aab")
+        self.assertEqual(pm.live[2]["idx"]["value"], "bab")
+        self.assertEqual(pm.live[2]["redir"], {"timestamp": "2:2", "value": 4})
+        keys = [e["idx"]["value"] for e in pm.live]
+        self.assertEqual(keys, sorted(keys))
+        with self.assertRaises(PageMapError):
+            pm.insert(0, P[5])                                           # already a page of it
+
+    def test_pages_left_without_room_are_keyed_again(self):
+        # Two devices put pages at the same key: inserting after the first keys the
+        # crowded one again, with the writer's counter one more.
+        pm = self.pagemap(entry(P[0], "ba"), entry(P[1], "ba"), entry(P[2], "bb"))
+        pm.insert(1, P[5])
+        self.assertEqual(pm.ids()[:2], [P[0], P[5]])
+        crowded = next(e for e in pm.live if e["id"] == P[1])
+        self.assertEqual(crowded["idx"]["timestamp"], "2:3")
+        keys = [e["idx"]["value"] for e in pm.live]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(len(set(keys)), 4)
+
+    def test_move_keys_the_moved_pages_between_their_new_neighbours(self):
+        pm = self.pagemap(*(entry(P[n], k) for n, k in enumerate(["ba", "bb", "bc", "bd", "be"])))
+        self.assertTrue(pm.move([0, 1], 4))                              # before the last page
+        self.assertEqual(pm.ids(), [P[2], P[3], P[0], P[1], P[4]])
+        moved = {e["id"]: e["idx"] for e in pm.live}
+        self.assertEqual([moved[P[0]]["value"], moved[P[1]]["value"]], ["bdb", "bdc"])
+        self.assertEqual(moved[P[0]]["timestamp"], "2:3")               # counter one more, our index
+        self.assertEqual(moved[P[2]]["timestamp"], "1:2")               # pages not moved are not written
+        self.assertTrue(pm.move([4], 0))
+        self.assertEqual(pm.ids()[0], P[4])
+        self.assertTrue(pm.move([0], 5))                                 # to the end: keys after the last
+        self.assertEqual(pm.ids()[-1], P[4])
+        self.assertFalse(pm.move([], 1))
+        self.assertFalse(pm.move([9], 1))
+
+    def test_delete_marks_the_page_and_lists_it_after_the_live_ones(self):
+        pm = self.three()
+        self.assertEqual(pm.delete(1), P[1])
+        content = pm.save()
+        pages = content["cPages"]["pages"]
+        self.assertEqual([p["id"] for p in pages], [P[0], P[2], P[1]])
+        self.assertEqual(pages[2]["deleted"], {"timestamp": "2:1", "value": 1})   # as the tablet's "1:1"
+        self.assertEqual(pages[2]["idx"], {"timestamp": "1:2", "value": "bb"})     # keeps its place
+        self.assertEqual(content["pageCount"], 2)
+        self.assertTrue(pm.known(P[1]))
+        with self.assertRaises(PageMapError):
+            pm.delete(5)
+
+    def test_saved_layout_is_the_one_real_files_have(self):
+        # Live pages by key, then deleted pages by id: the layout of every file of the library.
+        pm = self.pagemap(entry(P[3], "bb"), {**entry(P[9], "ba"), "deleted": {"timestamp": "1:1", "value": 1}},
+                          entry(P[1], "ba"), {**entry(P[0], "bc"), "deleted": {"timestamp": "1:1", "value": 1}})
+        pm.insert(2, P[5])
+        pages = pm.save()["cPages"]["pages"]
+        self.assertEqual([p["id"] for p in pages], [P[1], P[3], P[5], P[0], P[9]])
+        reparsed = json.loads(json_bytes(pm.content))
+        self.assertEqual(reparsed["cPages"]["pages"], pages)
+
+    def test_a_page_deleted_and_put_back_is_live(self):
+        # Found in a real library: deleted on one device ("1"), put back on another ("0").
+        back = {**entry(P[1], "bb"), "deleted": {"timestamp": "2:2", "value": 0}}
+        gone = {**entry(P[2], "ba"), "deleted": {"timestamp": "1:1", "value": 1}}
+        pm = self.pagemap(entry(P[0], "ba"), back, gone)
+        self.assertEqual(pm.ids(), [P[0], P[1]])
+        content = Content.parse(content_of(entry(P[0], "ba"), back, gone))
+        self.assertEqual((content.page_ids, content.page_count), ([P[0], P[1]], 2))
+
+    def test_the_unknown_fields_of_a_page_are_kept(self):
+        pm = self.pagemap(entry(P[0], "ba", modifed="123", scrollTime={"timestamp": "1:1", "value": "x"}),
+                          entry(P[1], "bb"))
+        pm.move([0], 2)
+        moved = pm.live[1]
+        self.assertEqual((moved["id"], moved["modifed"], moved["scrollTime"]), (P[0], "123", {"timestamp": "1:1", "value": "x"}))
+
+
+def image_page(key: bytes, file_name: str) -> bytes:
+    return rm_writer.append_image(drawn_page(), author=TABLET, key=key, file_name=file_name, vertices=box())
+
+
+class PageEditTests(Base):
+    """Pages added, duplicated, moved and deleted: kept as pending edits, shown at once
+    (LibrarySource.view) and uploaded by push_edits, as reMarkable.exe's DocumentWorker
+    changes a document."""
+
+    KEY = bytes(range(32, 48))
+    FILE = "cccccccc-0000-4000-8000-000000000001.png"
+
+    def setUp(self):
+        super().setUp()
+        content = notebook_content(PAGE1, PAGE2)
+        content["cPages"]["uuids"] = [{"first": TABLET_UUID, "second": 1}]
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), content,
+                            {f"{THROWAWAY}/{PAGE1}.rm": image_page(self.KEY, self.FILE),
+                             f"{THROWAWAY}/{PAGE1}/{self.FILE}": self.image,
+                             f"{THROWAWAY}/{PAGE1}-metadata.json": b'{"layers": [{"name": "Layer 1"}]}\n'})
+        self.tree = self.source.refresh()
+        self.doc = self.tree.get(THROWAWAY)
+
+    def staged(self) -> Staged:
+        return self.source.staged(self.doc)
+
+    def files(self) -> dict:
+        return self.sync.staged_files(self.doc)
+
+    def content(self, files=None) -> dict:
+        files = self.files() if files is None else files
+        return json.loads(files[f"{THROWAWAY}.content"])
+
+    def live(self, content: dict) -> list[str]:
+        return [p["id"] for p in sorted(content["cPages"]["pages"], key=lambda p: p["idx"]["value"])
+                if "deleted" not in p]
+
+    # -- add --
+
+    def test_an_added_page_changes_only_content_and_metadata(self):
+        edit = self.source.add_page(self.doc, 1, "Blank", NOW)
+        files = self.files()
+        self.assertEqual(sorted(files), [f"{THROWAWAY}.content", f"{THROWAWAY}.metadata"])     # no .rm
+        content = self.content(files)
+        self.assertEqual(self.live(content), [PAGE1, edit.new_id, PAGE2])
+        self.assertEqual(content["pageCount"], 3)
+        self.assertEqual(content["cPages"]["uuids"][0]["second"], 2)
+        old = json.loads(self.source.blob(self.doc, f"{THROWAWAY}.content"))
+        changes = json_changes(old, content)
+        self.assertIn((f"cPages.pages[id={edit.new_id}]", None,
+                       {"id": edit.new_id, "template": {"timestamp": "2:2", "value": "Blank"},
+                        "idx": {"timestamp": "2:2", "value": "bab"}}), changes)
+        self.assertIn(("pageCount", 2, 3), changes)
+        self.assertEqual(json.loads(files[f"{THROWAWAY}.metadata"])["lastModified"], str(NOW))
+        self.assertEqual((edit.index, edit.after, edit.template), (1, PAGE1, "Blank"))
+
+    def test_an_added_page_is_shown_and_can_take_an_image(self):
+        edit = self.source.add_page(self.doc, -1, "P Lines small", NOW)                 # -1: at the end
+        view = self.source.view(self.doc)
+        self.assertEqual(view.content.page_ids, [PAGE1, PAGE2, edit.new_id])
+        self.assertEqual((view.page_count, view.content.pages[2].template), (3, "P Lines small"))
+        # Its thumbnails are not the old ones: QML's thumbnail URLs carry the first 16 characters.
+        self.assertNotEqual(view.hash[:16], self.doc.hash[:16])
+        new_page = document_pages(view)[2]
+        self.assertIsNone(self.source.page_scene(view, new_page))      # empty paper: no .rm
+        image = self.insert(page=edit.new_id, doc=view)
+        files = self.files()
+        self.assertEqual(page_images(files[f"{THROWAWAY}/{edit.new_id}.rm"]), {bytes.fromhex(image.key): image.file_name})
+        self.assertEqual(files[image.path], self.image)
+        self.assertEqual(self.content(files)["cPages"]["pages"][2]["modifed"], str(NOW))
+        [placed] = self.source.page_scene(view, new_page).placed_images
+        self.assertEqual(placed.data, self.image)
+
+    def test_add_page_takes_a_given_uuid_once(self):
+        mine = "dddddddd-0000-4000-8000-000000000001"
+        self.assertEqual(self.source.add_page(self.doc, 0, "Blank", NOW, mine).new_id, mine)
+        self.assertNotEqual(self.source.add_page(self.doc, 0, "Blank", NOW, mine).new_id, mine)
+        self.assertNotEqual(self.source.add_page(self.doc, 0, "Blank", NOW, PAGE1).new_id, PAGE1)
+
+    # -- duplicate --
+
+    def test_a_duplicate_copies_the_page_files_under_a_new_id(self):
+        edit = self.source.copy_pages(self.doc, [0], 1, NOW)
+        [copy] = edit.new_ids
+        files = self.files()
+        self.assertEqual(files[f"{THROWAWAY}/{copy}.rm"], self.source.blob(self.doc, f"{THROWAWAY}/{PAGE1}.rm"))
+        self.assertEqual(files[f"{THROWAWAY}/{copy}/{self.FILE}"], self.image)
+        self.assertEqual(files[f"{THROWAWAY}/{copy}-metadata.json"],
+                         self.source.blob(self.doc, f"{THROWAWAY}/{PAGE1}-metadata.json"))
+        self.assertNotIn(f"{THROWAWAY}/{PAGE1}.rm", files)              # the original is untouched
+        content = self.content(files)
+        self.assertEqual(self.live(content), [PAGE1, copy, PAGE2])
+        entry_ = next(p for p in content["cPages"]["pages"] if p["id"] == copy)
+        self.assertEqual(entry_["template"], {"timestamp": "2:2", "value": "Blank"})  # the source's template
+        self.assertNotIn("modifed", entry_)
+
+    def test_a_duplicate_has_the_edits_made_before_it_only(self):
+        before = self.insert(PAGE1)
+        [copy] = self.source.copy_pages(self.doc, [0], 2, NOW + 1).new_ids
+        after = self.insert(PAGE1, when=NOW + 2)
+        files = self.files()
+        self.assertEqual(set(page_images(files[f"{THROWAWAY}/{copy}.rm"]).values()), {self.FILE, before.file_name})
+        self.assertEqual(set(page_images(files[f"{THROWAWAY}/{PAGE1}.rm"]).values()),
+                         {self.FILE, before.file_name, after.file_name})
+        self.assertEqual(files[f"{THROWAWAY}/{copy}/{before.file_name}"], self.image)
+        self.assertEqual(self.live(self.content(files)), [PAGE1, PAGE2, copy])
+        # Shown: the copy with its images.
+        view = self.source.view(self.doc)
+        scene = self.source.page_scene(view, document_pages(view)[2])
+        self.assertEqual(sorted(i.file_name for i in scene.placed_images), sorted([self.FILE, before.file_name]))
+        self.assertTrue(all(i.data == self.image for i in scene.placed_images))
+
+    def test_duplicating_several_pages_keeps_their_order(self):
+        edit = self.source.copy_pages(self.doc, [1, 0], 2, NOW)
+        self.assertEqual(self.live(self.content()), [PAGE1, PAGE2, *edit.new_ids])
+        self.assertEqual(edit.sources, (PAGE1, PAGE2))
+
+    # -- move --
+
+    def test_a_move_changes_only_the_page_order(self):
+        self.source.move_pages(self.doc, [0], 2, NOW)
+        files = self.files()
+        self.assertEqual(sorted(files), [f"{THROWAWAY}.content", f"{THROWAWAY}.metadata"])
+        content = self.content(files)
+        self.assertEqual(self.live(content), [PAGE2, PAGE1])
+        old = json.loads(self.source.blob(self.doc, f"{THROWAWAY}.content"))
+        fields = {f for f, _, _ in json_changes(old, content)}
+        self.assertEqual(fields, {f"cPages.pages[id={PAGE1}].idx.timestamp", f"cPages.pages[id={PAGE1}].idx.value",
+                                  "cPages.uuids", "cPages.pages (order of entries)"})
+        self.assertEqual(self.source.view(self.doc).content.page_ids, [PAGE2, PAGE1])
+
+    # -- delete --
+
+    def test_a_deleted_page_stays_listed_and_its_files_go(self):
+        self.source.delete_pages(self.doc, [0], NOW)
+        files = self.files()
+        for name in (f"{THROWAWAY}/{PAGE1}.rm", f"{THROWAWAY}/{PAGE1}/{self.FILE}", f"{THROWAWAY}/{PAGE1}-metadata.json"):
+            self.assertIsNone(files[name], name)
+        content = self.content(files)
+        self.assertEqual((self.live(content), content["pageCount"]), ([PAGE2], 1))
+        gone = content["cPages"]["pages"][-1]
+        self.assertEqual((gone["id"], gone["deleted"]), (PAGE1, {"timestamp": "2:1", "value": 1}))
+
+    def test_the_edits_of_a_deleted_page_are_dropped(self):
+        self.insert(PAGE1)
+        self.source.delete_pages(self.doc, [0], NOW + 1)
+        files = self.files()
+        self.assertEqual({n for n, d in files.items() if d is not None}, {f"{THROWAWAY}.content", f"{THROWAWAY}.metadata"})
+
+    def test_deleting_every_page_leaves_a_blank_one(self):
+        edit = self.source.delete_pages(self.doc, [0, 1], NOW)
+        content = self.content()
+        self.assertEqual(self.live(content), [edit.blank_id])
+        blank = next(p for p in content["cPages"]["pages"] if p["id"] == edit.blank_id)
+        self.assertEqual(blank["template"]["value"], "Blank")
+        self.assertEqual(content["pageCount"], 1)
+
+    # -- staging, refusing, uploading --
+
+    def test_page_edits_are_kept_across_restarts(self):
+        self.source.add_page(self.doc, 0, "Blank", NOW)
+        self.source.copy_pages(self.doc, [1], 0, NOW)
+        self.source.move_pages(self.doc, [2], 0, NOW)
+        self.source.delete_pages(self.doc, [3], NOW)
+        kept = PendingEdits(self.dir / "cache" / "pending").all()
+        self.assertEqual(kept, self.sync.edits.all())
+        self.assertEqual([type(e) for e in kept], [PageAdd, PageCopy, PageMove, PageDelete])
+
+    def test_page_edits_of_a_document_not_editable_are_refused(self):
+        other = self.tree.get(OTHER)
+        for make in (lambda: self.source.add_page(other, 0, "Blank", NOW),
+                     lambda: self.source.copy_pages(other, [0], 1, NOW),
+                     lambda: self.source.move_pages(other, [0], 1, NOW),
+                     lambda: self.source.delete_pages(other, [0], NOW)):
+            with self.assertRaises(EditError):
+                make()
+        with self.assertRaises(EditError):
+            self.source.move_pages(self.doc, [5], 0, NOW)              # no such page
+        self.assertEqual(self.sync.edits.all(), [])
+
+    def test_page_edits_go_after_their_page_on_a_newer_version(self):
+        edit = self.source.add_page(self.doc, 1, "Blank", NOW)          # after PAGE1
+        newer = notebook_content(PAGE2, PAGE1)                          # the tablet moved PAGE1 to the end
+        newer["cPages"]["pages"][1]["idx"]["value"] = "bc"
+        newer["cPages"]["uuids"] = [{"first": TABLET_UUID, "second": 1}]
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), newer, {f"{THROWAWAY}/{PAGE1}.rm": drawn_page()})
+        self.sync.push_edits(THROWAWAY)
+        content = json.loads(self.cloud.item(THROWAWAY)[f"{THROWAWAY}.content"])
+        self.assertEqual(self.live(content), [PAGE2, PAGE1, edit.new_id])
+
+    def test_push_uploads_the_page_edits_and_only_once(self):
+        added = self.source.add_page(self.doc, 2, "Blank", NOW)
+        [copy] = self.source.copy_pages(self.doc, [0], 0, NOW).new_ids
+        plan = self.sync.push_plan(THROWAWAY)
+        text = plan.describe()
+        for part in ("add page " + added.new_id, "duplicate pages", copy, "pageCount"):
+            self.assertIn(part, text)
+        tree = self.sync.push_edits(THROWAWAY)
+        item = self.cloud.item(THROWAWAY)
+        content = json.loads(item[f"{THROWAWAY}.content"])
+        self.assertEqual(self.live(content), [copy, PAGE1, PAGE2, added.new_id])
+        self.assertEqual(item[f"{THROWAWAY}/{copy}.rm"], item[f"{THROWAWAY}/{PAGE1}.rm"])
+        self.assertEqual(item[f"{THROWAWAY}/{copy}/{self.FILE}"], self.image)
+        self.assertEqual(self.sync.edits.all(), [])
+        self.assertEqual(tree.get(THROWAWAY).content.page_ids, [copy, PAGE1, PAGE2, added.new_id])
+        # The same edits again change nothing: what the cloud has is not added twice.
+        self.assertEqual(document_files(tree.get(THROWAWAY), [added, PageCopy.new(THROWAWAY, [PAGE1], 0, "", NOW, [copy])],
+                                        lambda n: self.sync.get_blob(tree.get(THROWAWAY).files[n], n), lambda e: b"",
+                                        self.sync.author()), {})
+
+
+class DocumentControllerTests(Base):
+    """The QML side: PageActions.qml calls DocumentController, whose slots make the
+    pending edits and show the document again with its new page list."""
+
+    def setUp(self):
+        super().setUp()
+        from ui.quick.bridge.library import Library
+        from ui.quick.bridge.platform import DocumentController
+        self.library = Library()
+        self.library.set_tree(self.source.view_tree(self.tree))
+        self.controller = DocumentController(self.library)
+        self.messages: list[str] = []
+        self.controller.source = lambda: self.source
+        self.controller.refresh = lambda: self.library.set_tree(self.source.view_tree(self.sync.tree))
+        self.controller.notify = self.messages.append
+        self.entry = self.library.entryForId(THROWAWAY)
+
+    def test_add_duplicate_move_delete_from_the_page_overview(self):
+        added = []
+        self.entry.pagesAdded.connect(added.append)
+        self.assertTrue(self.controller.addPageWithTemplateAndPaperSizeFromPage(THROWAWAY, 2, "Blank", 1))
+        self.assertEqual((self.entry.pageCount, added), (3, [[2]]))
+        new_id = self.entry.idForPage(2)
+        self.assertEqual(self.entry.templateForPage(2), "Blank")
+        self.assertTrue(self.controller.copyPages(THROWAWAY, [0], THROWAWAY, 1))
+        self.assertEqual(self.entry.pageCount, 4)
+        self.assertTrue(self.controller.movePages(THROWAWAY, [3], THROWAWAY, 0))
+        self.assertEqual(self.entry.idForPage(0), new_id)
+        self.assertTrue(self.controller.deletePages(THROWAWAY, [0]))
+        self.assertEqual(self.entry.pageCount, 3)
+        self.assertEqual(self.entry.pageForId(new_id), -1)
+        self.assertEqual(self.messages, [])
+        self.assertEqual(len(self.sync.edits.all()), 4)
+
+    def test_add_page_without_a_template_takes_the_one_before(self):
+        self.assertTrue(self.controller.addPageWithTemplateAndPageSize(THROWAWAY))
+        self.assertEqual(self.entry.templateForPage(2), "Blank")
+
+    def test_what_cannot_be_done_is_said(self):
+        self.assertFalse(self.controller.copyPages(THROWAWAY, [0], OTHER, 0))
+        self.assertFalse(self.controller.deletePages(OTHER, [0]))
+        self.assertFalse(self.controller.movePages(THROWAWAY, [7], THROWAWAY, 0))
+        self.assertEqual(len(self.messages), 3)
+        self.assertEqual(self.sync.edits.all(), [])
 
 
 if __name__ == "__main__":
