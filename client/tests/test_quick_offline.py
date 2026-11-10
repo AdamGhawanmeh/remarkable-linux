@@ -1072,19 +1072,103 @@ class EditingTests(unittest.TestCase):
         self.assertEqual(self.notices, [])
         self.assertEqual(real_warnings(self.app.warnings), [])
 
-    def test_cut_does_not_lose_the_image(self):
-        from core.edits import ImageDelete
-        view = self.open_document(self.THROWAWAY, self.PAGE1)
+    def drop_and_select(self, view):
         QMetaObject.invokeMethod(self.drop_area(), "dropSupportedImages",
                                  Q_ARG("QVariant", [QUrl.fromLocalFile(str(self.picture))]),
                                  Q_ARG("QVariant", QPointF(view.width() / 2, 300)))
+        self.assertTrue(self.wait_for(lambda: self.handler().property("visible")), self.notices)
+
+    def copy(self, view):
+        """DocumentViewport's copy action: Clipboard.items = cloneSelectedItems(...)."""
+        clipboard = self.app.singletons.clipboard
+        viewport = self.qml("DocumentViewport")
+        clipboard.setProperty("items", view._controller.cloneSelectedItems(
+            view._controller.property("currentLayer"), viewport.property("defaultScale")))
+        return clipboard
+
+    def test_copy_then_paste_adds_a_new_image_selected(self):
+        from core.edits import ImageInsert
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.drop_and_select(view)
+        [original] = self.pending()
+        clipboard = self.copy(view)
+        self.assertTrue(clipboard.property("hasItems"))
+        self.assertEqual(clipboard.property("lastCopiedType"), 1)                # Items
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "pasteLines")
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2), self.notices)
+        pasted = self.pending()[1]
+        self.assertIsInstance(pasted, ImageInsert)
+        self.assertNotEqual((pasted.file_name, pasted.key), (original.file_name, original.key))
+        self.assertEqual(pasted.sha256, original.sha256)          # the same picture, stored again
+        self.assertIsNotNone(pasted.timestamps)                   # the copied item's two timestamps
+        size = lambda e: (max(v[0] for v in e.vertices) - min(v[0] for v in e.vertices),
+                          max(v[1] for v in e.vertices) - min(v[1] for v in e.vertices))
+        for got, want in zip(size(pasted), size(original)):
+            self.assertAlmostEqual(got, want, places=6)
+        self.assertTrue(self.wait_for(lambda: view._selected == bytes.fromhex(pasted.key)))
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.placed_images) == 2))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_cut_deletes_and_paste_brings_it_back(self):
+        from core.edits import ImageDelete, ImageInsert
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.drop_and_select(view)
+        self.copy(view)
+        view._controller.deleteSelectedItems(view._controller.property("currentLayer"))
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "endItemSelection")
+        self.assertTrue(self.wait_for(lambda: isinstance(self.pending()[-1], ImageDelete)))
+        self.assertTrue(self.wait_for(lambda: view._content.scene is not None
+                                      and not view._content.scene.placed_images))
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "pasteLines")
+        self.assertTrue(self.wait_for(lambda: isinstance(self.pending()[-1], ImageInsert)
+                                      and len(self.pending()) == 3), self.notices)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.placed_images) == 1))
+
+    def test_a_picture_copied_in_another_program_pastes_as_a_floating_image(self):
+        from PySide6.QtCore import QMimeData
+        from core.edits import ImageInsert
+
+        class System(QObject):
+            dataChanged = Signal()
+
+            def __init__(self, mime):
+                super().__init__()
+                self.mime = mime
+
+            def ownsClipboard(self):
+                return False
+
+            def mimeData(self):
+                return self.mime
+
+            def image(self):
+                return self.mime.imageData()
+
+        picture = QImage(120, 80, QImage.Format.Format_RGB32)
+        picture.fill(QColor("#1060d0"))
+        mime = QMimeData()
+        mime.setImageData(picture)
+        clipboard = self.app.singletons.clipboard
+        system, clipboard._system = clipboard._system, System(mime)
+        try:
+            clipboard.systemClipboardDataChanged()
+        finally:
+            clipboard._system = system
+        content = clipboard.property("text")
+        self.assertTrue(clipboard.property("hasText"))
+        self.assertEqual((content["text"], content["hasImage"]), ("", True))
+        self.assertEqual(clipboard.property("lastCopiedType"), 0)                # Text
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.assertFalse(view._controller.shouldPasteClipboardContentInTextMode(content))
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "pasteClipboardData", Q_ARG("QVariant", 0))
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 1), self.notices)
+        [pasted] = self.pending()
+        self.assertIsInstance(pasted, ImageInsert)
+        self.assertEqual((pasted.file_name[-4:], pasted.timestamps), (".jpg", None))     # opaque: JPEG
+        xs = [v[0] for v in pasted.vertices]
+        self.assertEqual(max(xs) - min(xs), 120)
         self.assertTrue(self.wait_for(lambda: self.handler().property("visible")))
-        layer = view._controller.property("currentLayer")
-        view._controller.cloneSelectedItems(layer, 1.0)            # what Cut does: copy...
-        view._controller.deleteSelectedItems(layer)                # ...then delete
-        wait(300)
-        self.assertFalse(any(isinstance(e, ImageDelete) for e in self.pending()))
-        self.assertIn("Copying images is not available on Linux yet", self.notices)
+        self.assertEqual(real_warnings(self.app.warnings), [])
 
     def test_another_notebook_is_never_edited(self):
         view = self.open_document(self.OTHER)

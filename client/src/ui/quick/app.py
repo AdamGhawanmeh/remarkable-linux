@@ -46,7 +46,7 @@ from .bridge.platform import (LOGIN_RESULTS, ArkIconProvider, ArkTokensSettings,
                               DocumentController, HandwritingLanguageModel, LanguageSettings, LinkProvider,
                               NetworkClient, PlatformApp, PlatformHelpers, Settings, SettingsStore, UserInfo,
                               login_result)
-from .bridge.scene import Recognizer, set_edit_notifier, set_page_source
+from .bridge.scene import Recognizer, set_clipboard, set_edit_notifier, set_page_source
 from .bridge.screenshare import ScreenShareClient
 
 log = logging.getLogger("rm.ui.quick")
@@ -264,6 +264,7 @@ class QuickApp:
         register_types()
         set_page_source(lambda: self.source)
         set_edit_notifier(self.library.errorMessage.emit)
+        set_clipboard(self.singletons.clipboard)
         self.translator = QTranslator()
         self._translate(self.singletons.language.languageCode)
         self.singletons.language.on_change = self._language_changed

@@ -909,8 +909,13 @@ class DocumentController(QObject):
 
 
 class Clipboard(QObject):
-    """The scene clipboard (strokes and text copied inside documents); the library
-    clipboard state (copy/cut/move of entries) lives in main.qml."""
+    """The app's Clipboard (xofm/libs/ui/src/clipboard.cpp): items copied in a document
+    (`items`: clones of scene items, kept here only), and the system clipboard's content
+    (`text`, the app's SceneClipboardText) for pasting text or a picture from other
+    programs. The library clipboard (copy/cut/move of entries) lives in main.qml.
+
+    `text` reaches QML as {"text", "html", "hasImage", "imageSerial"}; the picture itself
+    stays here (image_of), as QML only hands the content back to the SceneController."""
 
     Action = IntEnum("Action", {"None": 0, "Copy": 1, "Cut": 2, "Move": 3})
     LastCopy = IntEnum("LastCopy", {"Text": 0, "Items": 1})
@@ -922,16 +927,50 @@ class Clipboard(QObject):
     lastCopiedTypeChanged = Signal()
     imagePastingEnabledChanged = Signal()
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, system=None) -> None:
         super().__init__(parent)
-        self._text = ""
-        self._image_pasting = False
+        self._content: dict = {}
+        self._image = QImage()
+        self._serial = 0
+        self._items: list = []
+        self._last = 0
+        # The desktop app turns image pasting on when it starts (0x14009cda7).
+        self._image_pasting = True
+        self._system = system if system is not None else (QGuiApplication.clipboard()
+                                                          if QGuiApplication.instance() is not None else None)
+        if self._system is not None:
+            self._system.dataChanged.connect(self.systemClipboardDataChanged)
+            self.systemClipboardDataChanged()
 
-    hasItems = Property(bool, lambda self: False, notify=itemsChanged)
-    items = Property("QVariantList", lambda self: [], notify=itemsChanged)
-    hasText = Property(bool, lambda self: bool(self._text), notify=textChanged)
-    text = Property(str, lambda self: self._text, notify=textChanged)
-    lastCopiedType = Property(int, lambda self: 0, notify=lastCopiedTypeChanged)
+    # -- items --
+    def _set_items(self, items) -> None:
+        self._items = list(items or [])
+        self._set_last(1)
+        self.itemsChanged.emit()
+
+    hasItems = Property(bool, lambda self: bool(self._items), notify=itemsChanged)
+    items = Property("QVariantList", lambda self: self._items, _set_items, notify=itemsChanged)
+
+    # -- text and pictures --
+    def _set_content(self, content) -> None:
+        if isinstance(content, str):
+            content = {"text": content}
+        content = dict(content or {})
+        self._content = {"text": str(content.get("text") or ""), "html": str(content.get("html") or ""),
+                         "hasImage": False, "imageSerial": 0}
+        self._image = QImage()
+        self._set_last(0)
+        self.textChanged.emit()
+
+    def _set_last(self, kind: int) -> None:
+        if kind != self._last:
+            self._last = kind
+            self.lastCopiedTypeChanged.emit()
+
+    hasText = Property(bool, lambda self: bool(self._content.get("text") or self._content.get("html")
+                                               or self._content.get("hasImage")), notify=textChanged)
+    text = Property("QVariant", lambda self: dict(self._content), _set_content, notify=textChanged)
+    lastCopiedType = Property(int, lambda self: self._last, _set_last, notify=lastCopiedTypeChanged)
 
     def _set_image_pasting(self, value: bool) -> None:
         self._image_pasting = bool(value)
@@ -940,18 +979,107 @@ class Clipboard(QObject):
     imagePastingEnabled = Property(bool, lambda self: self._image_pasting, _set_image_pasting,
                                    notify=imagePastingEnabledChanged)
 
+    def image_of(self, content) -> QImage:
+        """The picture of a clipboard content QML handed back, while it is the current one."""
+        serial = (dict(content) if hasattr(content, "keys") else {}).get("imageSerial")
+        return QImage(self._image) if serial and serial == self._serial else QImage()
+
     @Slot()
     def systemClipboardDataChanged(self) -> None:
-        pass
+        """Take what another program put on the system clipboard
+        (transferDataFromSystemClipboard, 0x140607f30): a picture from a copied image file,
+        the picture itself, image data, or a picture in copied HTML, in that order; and
+        the text and HTML, unless the picture is what was copied (_prefers_image)."""
+        board = self._system
+        if board is None or board.ownsClipboard():
+            return
+        mime = board.mimeData()
+        if mime is None:
+            return
+        image, from_url, from_html = QImage(), False, False
+        if self._image_pasting and mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    image = QImage(url.toLocalFile())
+                    if not image.isNull():
+                        from_url = True
+                        break
+        if image.isNull() and self._image_pasting and mime.hasImage():
+            image = board.image()
+        if image.isNull() and self._image_pasting:
+            image = _image_data(mime)
+        if image.isNull() and self._image_pasting and mime.hasHtml():
+            image = _html_image(mime.html())
+            from_html = not image.isNull()
+        prefer = not image.isNull() and (from_url or from_html or _prefers_image(mime))
+        html = mime.html() if mime.hasHtml() and not prefer else ""
+        text = mime.text() if mime.hasText() and not prefer else ""
+        if not text and not html and image.isNull():
+            log.debug("empty clipboard content, ignore")
+            return
+        self._serial += 1
+        self._content = {"text": text, "html": html, "hasImage": not image.isNull(),
+                         "imageSerial": self._serial if not image.isNull() else 0}
+        self._image = image
+        self._set_last(0)
+        self.textChanged.emit()
 
     @Slot(result=str)
     def textString(self) -> str:
-        return self._text
+        return self._content.get("text", "")
 
     @Slot(str)
     def setTextFromString(self, text: str) -> None:
-        self._text = text
-        self.textChanged.emit()
+        """Text copied in the app, also to the system clipboard (the app's setText)."""
+        self._set_content(text)
+        if self._system is not None:
+            self._system.setText(text)
+
+
+def _prefers_image(mime) -> bool:
+    """Whether a copied picture is meant rather than the text with it (0x140607db0): the
+    clipboard has files, or a picture with HTML and no text, or a web address as text
+    with an <img> in its HTML (a picture copied from a browser)."""
+    if mime.hasUrls():
+        return True
+    if mime.hasImage() and mime.hasHtml() and not mime.hasText():
+        return True
+    if mime.hasText() and mime.hasHtml():
+        text = mime.text().strip()
+        return text.startswith(("http://", "https://")) and "<img" in mime.html()
+    return False
+
+
+def _image_data(mime) -> QImage:
+    """A picture among the clipboard's formats (0x140606a80): an image/* one, else one
+    that is not text or HTML."""
+    formats = mime.formats()
+    for kind in [f for f in formats if f.startswith("image/")] + \
+                [f for f in formats if not f.startswith("text/") and "html" not in f]:
+        data = mime.data(kind)
+        image = QImage()
+        if not data.isEmpty() and image.loadFromData(data):
+            return image
+    return QImage()
+
+
+def _html_image(html: str) -> QImage:
+    """The picture of the first <img> in copied HTML: inline (data:) or a local file."""
+    import base64
+    import re
+    from urllib.parse import unquote, urlparse
+    for src in re.findall(r"""<img[^>]*\ssrc\s*=\s*["']([^"']+)["']""", html, re.I):
+        image = QImage()
+        if src.startswith("data:") and ";base64," in src:
+            try:
+                image.loadFromData(base64.b64decode(src.split(";base64,", 1)[1]))
+            except ValueError:
+                continue
+        elif src.startswith("file:"):
+            image = QImage(unquote(urlparse(src).path))
+        if not image.isNull():
+            return image
+    return QImage()
 
 
 # -- images -------------------------------------------------------------------------

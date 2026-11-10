@@ -64,6 +64,8 @@ class ImageInsert:
     sha256: str                     # of the image file
     size: int
     created_ms: int
+    # A pasted copy keeps the (boundsTimestamp, imageRef timestamp) of the item copied.
+    timestamps: tuple[tuple[int, int], tuple[int, int]] | None = None
 
     @property
     def path(self) -> str:
@@ -72,19 +74,30 @@ class ImageInsert:
 
     @classmethod
     def new(cls, doc_id: str, page_id: str, extension: str, vertices, sha256: str, size: int,
-            created_ms: int) -> "ImageInsert":
+            created_ms: int, timestamps=None) -> "ImageInsert":
         """With a new file name and key: two random UUIDs, as the app makes them. The key
         is stored as the tablet's is, the UUID's bytes last to first."""
         if extension not in IMAGE_EXTENSIONS:
             raise EditError(f"images are stored as {' or '.join(IMAGE_EXTENSIONS)}, not {extension!r}")
         corners = _corners(vertices)
         return cls(doc_id, page_id, f"{uuid.uuid4()}.{extension}", uuid.uuid4().bytes[::-1].hex(), corners,
-                   sha256, int(size), int(created_ms))
+                   sha256, int(size), int(created_ms), _timestamps(timestamps))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "ImageInsert":
         return cls(str(raw["doc_id"]), str(raw["page_id"]), str(raw["file_name"]), str(raw["key"]),
-                   _corners(raw["vertices"]), str(raw["sha256"]), int(raw["size"]), int(raw["created_ms"]))
+                   _corners(raw["vertices"]), str(raw["sha256"]), int(raw["size"]), int(raw["created_ms"]),
+                   _timestamps(raw.get("timestamps")))
+
+
+def _timestamps(value):
+    """(boundsTimestamp, imageRef timestamp) as two (author, counter) pairs, or None."""
+    if value is None:
+        return None
+    pair = tuple(tuple(int(n) for n in stamp) for stamp in value)
+    if len(pair) != 2 or any(len(stamp) != 2 or not 0 <= stamp[0] <= 0xFF or stamp[1] < 0 for stamp in pair):
+        raise EditError(f"not a pair of item timestamps: {value!r}")
+    return pair
 
 
 def _corners(vertices) -> tuple[tuple[float, float, float, float], ...]:
@@ -238,7 +251,7 @@ def page_with_edits(page: bytes | None, edits: list[Edit], author: bytes) -> byt
         if isinstance(edit, ImageInsert):
             if key not in page_images(page):
                 page = rm_writer.append_image(page, author=author, key=key, file_name=edit.file_name,
-                                              vertices=list(edit.vertices))
+                                              vertices=list(edit.vertices), timestamps=edit.timestamps)
         elif page is None:
             continue
         elif isinstance(edit, ImageTransform):

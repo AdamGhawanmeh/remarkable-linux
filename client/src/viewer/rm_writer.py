@@ -589,7 +589,8 @@ def _insert_item(blocks: list[Block], block: Block) -> None:
 
 def append_image(page: bytes | None, *, author: bytes, key: bytes, file_name: str,
                  vertices: list[tuple[float, float, float, float]],
-                 layer: tuple[int, int] | None = None) -> bytes:
+                 layer: tuple[int, int] | None = None,
+                 timestamps: tuple[tuple[int, int], tuple[int, int]] | None = None) -> bytes:
     """`page` (None: a page with no .rm yet) with one more image, on top of `layer`
     (default: the current layer). Every block of the page is kept as it is, byte for
     byte; added are an entry of the images table, one image item, and `author` in the
@@ -600,7 +601,12 @@ def append_image(page: bytes | None, *, author: bytes, key: bytes, file_name: st
     0x14094c420), the item's boundsTimestamp and imageRef timestamp (creating the item,
     0x14043c3c0), then the item's id (adding it to the layer after its last item,
     0x1408c2bc0). A new item has no moveId: the app writes that field only for an item
-    that was moved (0x1409a52d0)."""
+    that was moved (0x1409a52d0).
+
+    A pasted copy of an item (`timestamps`: its (boundsTimestamp, imageRef timestamp))
+    keeps those two, as the app's clone does (0x14043a320, 0x1409a6510); only its image
+    is stored again, under a new name and key (0x1409b1a90 -> 0x14094c420), so it takes
+    the file name's timestamp, then the item's id."""
     if len(key) != 16:
         raise ValueError("an image needs a 16-byte key")
     check_corners(vertices)
@@ -608,7 +614,10 @@ def append_image(page: bytes | None, *, author: bytes, key: bytes, file_name: st
     before, original = list(blocks), [b.payload for b in blocks]
     me = _author_index(blocks, author)
     clock = highest_counter(blocks)
-    name_at, bounds_at, ref_at, item_id = ((me, clock + n) for n in (1, 2, 3, 4))
+    if timestamps is None:
+        name_at, bounds_at, ref_at, item_id = ((me, clock + n) for n in (1, 2, 3, 4))
+    else:
+        (bounds_at, ref_at), name_at, item_id = timestamps, (me, clock + 1), (me, clock + 2)
     layer = current_layer(blocks) if layer is None else layer
     if layer not in layers(blocks):
         raise RmParseError(f"{layer} is not a layer of the page")

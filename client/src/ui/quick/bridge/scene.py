@@ -79,6 +79,20 @@ def set_page_source(provider: Callable[[], object]) -> None:
     _source = provider
 
 
+_clipboard = None                       # the app's Clipboard singleton (pictures pasted from other programs)
+
+
+def set_clipboard(clipboard) -> None:
+    global _clipboard
+    _clipboard = clipboard
+
+
+def _js(value):
+    """A value QML handed over (QJSValue or plain) as Python data."""
+    to_variant = getattr(value, "toVariant", None)
+    return to_variant() if callable(to_variant) else value
+
+
 def set_edit_notifier(notify: Callable[[str], None]) -> None:
     global _notify
     _notify = notify
@@ -353,6 +367,7 @@ class _Controller:
         # Set by the SceneView showing the page: (file url, scene position) -> None.
         self.insert_image: Callable[[QUrl, QPointF], None] | None = None
         self.view = None                    # that SceneView: selecting and changing images
+        self.last_area: tuple[float, float] | None = None   # corner of the area last selected
 
     def set_page(self, frame: QRectF, bounds: QRectF, layers: list, links: list[dict]) -> None:
         """The loaded page: its frame (paper), content bounds and links, in scene
@@ -411,14 +426,47 @@ class _Controller:
         if self.view is not None:
             self.view.delete_selection(int(layer))
 
+    # -- the clipboard (DocumentViewport's copy, cut and paste actions) --
     @Slot(int, float, result="QVariantList")
     def cloneSelectedItems(self, layer: int, scale_factor: float) -> list:
-        """Copying (and so cutting, and converting to text) is not built yet. Cut and
-        convert delete the selection right after copying it: that delete is refused
-        too, so the image is not lost."""
+        """Clones of the selected items for Clipboard.items, scaled by `scale_factor`
+        (0x14043a320). Cut is this, then deleteSelectedItems."""
+        return self.view.copy_selection(int(layer), float(scale_factor)) if self.view is not None else []
+
+    @Slot("QVariant", result=QRectF)
+    def getItemBoundingRect(self, items) -> QRectF:
+        bounds = editing.items_bounds(_js(items))
+        return QRectF(*bounds) if bounds else QRectF()
+
+    @Slot("QVariant", QRectF, QPointF, result=QPointF)
+    def getSelectionPastePos(self, items, scene_bounds: QRectF, pos: QPointF) -> QPointF:
+        b = QRectF(scene_bounds)
+        x, y = editing.paste_position(_js(items), (b.x(), b.y(), b.width(), b.height()), (pos.x(), pos.y()),
+                                      self.last_area)
+        return QPointF(x, y)
+
+    @Slot(int, "QVariant", float, QPointF)
+    def cloneAddAndSelectItems(self, layer: int, items, scale_factor: float, pos: QPointF) -> None:
         if self.view is not None:
-            self.view.refuse_copy()
-        return []
+            self.view.paste_items(int(layer), _js(items), float(scale_factor), QPointF(pos))
+
+    @Slot("QVariant", result=bool)
+    def shouldPasteClipboardContentInTextMode(self, content) -> bool:
+        """Text (or HTML) is pasted as text; a picture copied in another program, which
+        then has neither, floats on the page."""
+        content = _js(content) or {}
+        return bool(content.get("text") or content.get("html")) if hasattr(content, "get") else False
+
+    @Slot("QVariant", QPointF)
+    def pasteClipboardContentAsFloatingSceneImage(self, content, pos: QPointF) -> None:
+        if self.view is not None and _clipboard is not None:
+            self.view.paste_picture(_clipboard.image_of(_js(content)), QPointF(pos))
+
+    @Slot("QVariant")
+    @Slot("QVariant", int)
+    @Slot("QVariant", int, int)
+    def pasteClipboardContent(self, content, mode: int = 0, merge: int = 0) -> None:
+        _notify("Pasting text is not available on Linux yet")
 
     @Slot(result="QVariantList")
     @Slot(QRect, result="QVariantList")
@@ -468,7 +516,6 @@ class _SceneView:
         self._values["worker"] = self       # SelectionImage asks it for the selected image
         self._selected: bytes | None = None     # images-table key of the selected image
         self._reselect = False              # open the selection box again once the page reloads
-        self._copy_refused = False
         self._tiles = SceneTileManager(self)
         self._values["controller"] = self._controller
         self._values["tileManager"] = self._tiles
@@ -579,36 +626,100 @@ class _SceneView:
             learn(pages.pdf.page_count)
 
     # -- editing --
-    def _insert_image(self, url: QUrl, pos: QPointF) -> None:
-        """Put an image file on the page shown, centred on a scene position: prepared
-        as the app stores one (ui/editing.py) and kept as a pending edit of the library
-        (LibrarySource.insert_image), then the page is drawn again with it. Whatever
-        stops it is told to the user, and nothing is changed."""
+    def _insertion_target(self, what: str):
+        """(source, document, page id) where an image may be put now, or None after
+        telling the user why not."""
         source, node = _source(), getattr(self._get("document"), "node", None)
         if source is None or node is None or self._content is None or not self._page_id:
-            return
+            return None
         refusal = source.edit_refusal(node)
         if not refusal and self._content.has_pdf_page:
-            refusal = "Images can only be put on notebook pages"
-        if not refusal and not url.isLocalFile():
-            refusal = "Only image files on this computer can be inserted"
+            refusal = f"{what} can only be put on notebook pages"
         if refusal:
             _notify(refusal)
-            return
-        path, page_id, x, y, now_ms = url.toLocalFile(), self._page_id, pos.x(), pos.y(), int(time.time() * 1000)
+            return None
+        return source, node, self._page_id
 
+    def _run_insertion(self, page_id: str, insert) -> None:
+        """Run `insert()` (making the pending edits; it returns the key of the image to
+        select, or None) on the view's worker, then draw the page again with that image
+        selected, as the app selects what it adds (addAndSelect, 0x1409af310)."""
         def job():
             error = select = None
             try:
-                data, extension, vertices = prepare_image(path, x, y)
-                select = bytes.fromhex(source.insert_image(node, page_id, data, extension, vertices, now_ms).key)
+                select = insert()
             except (EditError, *EXPECTED_ERRORS) as err:
                 error = str(err)
             except Exception as err:      # an edit never takes the page view down with it
-                log.exception("inserting an image on page %s", page_id)
+                log.exception("putting an image on page %s", page_id)
                 error = f"The image could not be inserted: {type(err).__name__}"
             emit_from_worker(self, lambda: self._edited.emit((error, select)))
         self._pool.start(_Job(job))
+
+    def _insert_image(self, url: QUrl, pos: QPointF) -> None:
+        """Put an image file on the page shown, centred on a scene position
+        (insertImageFileAsSceneItem): prepared as the app stores one (ui/editing.py) and
+        kept as a pending edit of the library (LibrarySource.insert_image)."""
+        target = self._insertion_target("Images")
+        if target is None:
+            return
+        if not url.isLocalFile():
+            _notify("Only image files on this computer can be inserted")
+            return
+        source, node, page_id = target
+        path, x, y, now_ms = url.toLocalFile(), pos.x(), pos.y(), int(time.time() * 1000)
+
+        def insert():
+            data, extension, vertices = prepare_image(path, x, y)
+            return bytes.fromhex(source.insert_image(node, page_id, data, extension, vertices, now_ms).key)
+        self._run_insertion(page_id, insert)
+
+    def paste_picture(self, picture: QImage, pos: QPointF) -> None:
+        """A picture from the system clipboard, centred on a scene position
+        (pasteClipboardContentAsFloatingSceneImage, 0x1404346b0): stored and placed as a
+        dropped file is (createPersistedSceneImageItem, 0x14043c3c0)."""
+        target = self._insertion_target("Images")
+        if target is None or picture.isNull():
+            return
+        source, node, page_id = target
+        x, y, now_ms = pos.x(), pos.y(), int(time.time() * 1000)
+
+        def insert():
+            data, extension, size = editing.encode_image(picture)
+            corners = editing.corners(x, y, *editing.placed_size(size.width(), size.height()))
+            return bytes.fromhex(source.insert_image(node, page_id, data, extension, corners, now_ms).key)
+        self._run_insertion(page_id, insert)
+
+    def paste_items(self, layer: int, items, scale: float, pos: QPointF) -> None:
+        """Copied items pasted, centred on a scene position (cloneAddAndSelectItems,
+        0x14043a060): each image is loaded from where it was copied and stored again as
+        a new file under a new key (0x1409b1a90 -> 0x14094c420), and its copy keeps the
+        copied item's timestamps; one whose image cannot be loaded is dropped, as the
+        app drops it."""
+        images = editing.clip_images(items)
+        target = self._insertion_target("Images") if images else None
+        if target is None:
+            return
+        source, node, page_id = target
+        center, now_ms = (pos.x(), pos.y()), int(time.time() * 1000)
+
+        def insert():
+            select = None
+            for item in images:
+                try:
+                    picture = QImage.fromData(source.image_file(item["documentId"], item["pageId"], item["fileName"]))
+                except EditError as err:
+                    log.warning("dropping pasted image item, failed to load source image ref: %s", err)
+                    continue
+                if picture.isNull():
+                    log.warning("dropping pasted image item, failed to load source image ref")
+                    continue
+                data, extension, _ = editing.encode_image(picture)
+                corners = editing.pasted_corners(item, scale, center)
+                edit = source.insert_image(node, page_id, data, extension, corners, now_ms, item["timestamps"])
+                select = bytes.fromhex(edit.key)
+            return select
+        self._run_insertion(page_id, insert)
 
     def _on_edited(self, result) -> None:
         """An edit was made (or refused): draw the page again, with the image it
@@ -660,6 +771,7 @@ class _SceneView:
         layer, image = found
         self._set_selected(image.image_ref)
         x, y, w, h = editing.corner_bounds(image.vertices)
+        self._controller.last_area = (x, y)
         self._controller.areaSelected.emit(layer, QRectF(x, y, w, h))
 
     def clear_selection(self) -> None:
@@ -713,14 +825,16 @@ class _SceneView:
             emit_from_worker(self, lambda: self._edited.emit((error, key)))
         self._pool.start(_Job(job))
 
-    def refuse_copy(self) -> None:
-        _notify("Copying images is not available on Linux yet")
-        self._copy_refused = True
-        QTimer.singleShot(0, lambda: setattr(self, "_copy_refused", False))
+    def copy_selection(self, layer: int, scale: float) -> list:
+        """The selected image as a clipboard item (cloneSelectedItems)."""
+        if self._selected is None or self._content is None:
+            return []
+        found = editing.find_image(self._content.scene, self._selected)
+        if found is None or found[0] != layer:
+            return []
+        return [editing.clip_image(self._get("document").node.id, self._page_id, found[1], scale)]
 
     def delete_selection(self, layer: int) -> None:
-        if self._copy_refused:          # cut or convert: copy, then delete; the copy failed
-            return
         target = self._selection_change(layer)
         if target is None:
             return

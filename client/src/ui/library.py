@@ -372,15 +372,33 @@ class LibrarySource:
         return [e for e in self.sync.edits.of(doc.id) if page_id is None or e.page_id == page_id]
 
     def insert_image(self, doc: Document, page_id: str, data: bytes, extension: str, vertices,
-                     now_ms: int) -> ImageInsert:
+                     now_ms: int, timestamps=None) -> ImageInsert:
         """Put an image (`data`: a PNG or JPEG file as the app stores one, see
         ui.editing.encode_image) on a page, here only: the edit is kept with the cache
         and drawn over the page until SyncClient.push_edits uploads it. EditError when
         `doc` may not be edited, or the page cannot take the image safely."""
         doc = self._editable(doc, page_id)
-        edit = ImageInsert.new(doc.id, page_id, extension, vertices, sha256_hex(data), len(data), now_ms)
+        edit = ImageInsert.new(doc.id, page_id, extension, vertices, sha256_hex(data), len(data), now_ms,
+                               timestamps)
         self._add_edit(doc, edit, data)
         return edit
+
+    def image_file(self, doc_id: str, page_id: str, file_name: str) -> bytes:
+        """The file of an image of a page, as stored with the document
+        ("<doc>/<page>/<file name>"), or put on the page here and not uploaded yet: what
+        the app's paste loads to store a copy (0x1409a8240). EditError when it cannot be
+        had (the document is gone, or the file is not cached offline)."""
+        doc = self.sync.tree.get(doc_id)
+        name = f"{doc_id}/{page_id}/{file_name}"
+        if isinstance(doc, Document) and name in doc.files:
+            try:
+                return self.blob(doc, name)
+            except (SyncError, OSError) as err:
+                raise EditError(f"the copied image cannot be loaded: {err}") from err
+        for edit in self.sync.edits.of(doc_id):
+            if isinstance(edit, ImageInsert) and edit.page_id == page_id and edit.file_name == file_name:
+                return self.sync.edits.data(edit)
+        raise EditError("the copied image is no longer there")
 
     def transform_image(self, doc: Document, page_id: str, key: bytes, vertices, now_ms: int) -> ImageTransform:
         """Move, scale or turn an image of a page to new corners, here only (as

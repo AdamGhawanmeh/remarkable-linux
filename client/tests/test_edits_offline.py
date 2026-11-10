@@ -693,6 +693,200 @@ class TransformEditTests(Base):
         self.assertEqual(self.sync.edits.all(), [])
 
 
+class ClipboardTests(Base):
+    """Copy, cut and paste of images, as the app's cloneSelectedItems /
+    getSelectionPastePos / cloneAddAndSelectItems and its system clipboard do them."""
+
+    def setUp(self):
+        super().setUp()
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), notebook_content(PAGE1, PAGE2),
+                            {f"{THROWAWAY}/{PAGE1}.rm": tablet_image_page(),
+                             f"{THROWAWAY}/{PAGE1}/{TABLET_FILE}": self.image})
+        self.tree = self.source.refresh()
+        self.doc = self.tree.get(THROWAWAY)
+        self.tablet_image = self.source.page_scene(self.doc, document_pages(self.doc)[0]).placed_images[0]
+
+    def clip(self, scale=0.4):
+        return editing.clip_image(THROWAWAY, PAGE1, self.tablet_image, scale)
+
+    # -- the clipboard record --
+    def test_a_copy_is_a_plain_record_of_the_image(self):
+        item = self.clip()
+        self.assertEqual(json.loads(json.dumps(item)), item)                 # survives QML and back
+        self.assertEqual((item["type"], item["documentId"], item["pageId"], item["fileName"]),
+                         ("image", THROWAWAY, PAGE1, TABLET_FILE))
+        value = rm_writer.decode_image_value(self.tablet_image.value)
+        self.assertEqual((tuple(item["boundsTimestamp"]), tuple(item["refTimestamp"])),
+                         (value.bounds_timestamp, value.ref_timestamp))
+        self.assertNotIn("moveId", item)                                     # a clone has none
+        self.assertEqual(item["vertices"], [[x * 0.4, y * 0.4, u, v] for x, y, u, v in box()])
+
+    def test_records_handed_back_are_checked(self):
+        good = self.clip()
+        [back] = editing.clip_images([good, {"type": "line"}, {"type": "image", "vertices": [[1, 2]]}, None, 7])
+        self.assertEqual((back["timestamps"], back["vertices"][0]), (((1, 17), (1, 18)), tuple(good["vertices"][0])))
+        self.assertEqual(editing.clip_images(None), [])
+        self.assertEqual(editing.items_bounds([good]), editing.corner_bounds(back["vertices"]))
+        self.assertIsNone(editing.items_bounds([]))
+
+    # -- where a paste goes --
+    def test_paste_position_is_the_point_kept_inside_the_page(self):
+        items = [editing.clip_image(THROWAWAY, PAGE1, self.tablet_image, 1.0)]      # 200 x 150
+        page = (-702.0, 0.0, 1404.0, 1872.0)
+        self.assertEqual(editing.paste_position(items, page, (0, 500), None), (0, 500))
+        self.assertEqual(editing.paste_position(items, page, (-680, 500), None), (-602, 500))   # left edge
+        self.assertEqual(editing.paste_position(items, page, (690, 500), None), (602, 500))     # right edge
+        self.assertEqual(editing.paste_position(items, page, (0, 10), None), (0, 75))           # top
+        self.assertEqual(editing.paste_position(items, page, (0, 1860), None), (0, 1860))       # the page grows down
+        self.assertEqual(editing.paste_position(items, page, (0, 500), (0, 500)), (100, 575))   # at the last corner
+        self.assertEqual(editing.paste_position([], page, (5, 6), None), (5, 6))
+
+    def test_pasted_corners_are_scaled_then_centred(self):
+        item = editing.clip_images([self.clip(0.4)])[0]
+        corners = editing.pasted_corners(item, 1 / 0.4, (300, 900))
+        x, y, w, h = editing.corner_bounds(corners)
+        for got, want in zip((x + w / 2, y + h / 2, w, h), (300, 900, 200, 150)):
+            self.assertAlmostEqual(got, want, places=6)
+        same = editing.pasted_corners(editing.clip_images([self.clip(1.0)])[0], 1.0 + 1e-15, (0, 0))
+        self.assertEqual(editing.corner_bounds(same)[2:], (200, 150))
+
+    # -- what a paste writes --
+    def test_a_paste_gets_a_new_file_key_and_ids_and_keeps_the_timestamps(self):
+        item = editing.clip_images([self.clip(1.0)])[0]
+        corners = editing.pasted_corners(item, 1.0, (100, 1000))
+        data = self.source.image_file(THROWAWAY, PAGE1, TABLET_FILE)
+        self.assertEqual(data, self.image)
+        edit = self.source.insert_image(self.doc, PAGE1, data, "png", corners, NOW, item["timestamps"])
+        self.assertNotEqual((edit.key, edit.file_name), (TABLET_KEY.hex(), TABLET_FILE))
+        self.assertEqual(PendingEdits(self.dir / "cache" / "pending").all(), [edit])     # timestamps kept on disk
+        page = self.sync.staged_files(self.sync.tree.get(THROWAWAY))[f"{THROWAWAY}/{PAGE1}.rm"]
+        old, new = (items(tablet_image_page())[-1], items(page)[-1])
+        value = rm_writer.decode_image_value(new.value)
+        me = rm_writer.decode_authors(rm_writer.split(page)[1][0].payload)[-1][1]
+        self.assertEqual(new.item, (me, 20))                         # name 19, then the item: clock 18 + 2
+        self.assertEqual((new.left, new.right), (old.item, (0, 0)))
+        self.assertEqual((value.bounds_timestamp, value.ref_timestamp, value.move_id), ((1, 17), (1, 18), None))
+        [entry] = [e for e in rm_writer.decode_images_table(
+            [b for b in rm_writer.split(page)[1] if b.type == rm_writer.BLOCK_IMAGES_TABLE][0].payload)
+            if e.key == bytes.fromhex(edit.key)]
+        self.assertEqual((entry.file_name, entry.timestamp), (edit.file_name, (me, 19)))
+        self.assertEqual(len(parse(page).placed_images), 2)          # the original stays
+
+    def test_a_copy_of_an_image_put_here_and_not_uploaded_can_be_pasted(self):
+        first = self.insert(PAGE2)
+        self.assertEqual(self.source.image_file(THROWAWAY, PAGE2, first.file_name), self.image)
+        with self.assertRaises(EditError):
+            self.source.image_file(THROWAWAY, PAGE2, "gone.png")
+        with self.assertRaises(EditError):
+            self.source.image_file("nope", PAGE2, first.file_name)
+
+    def test_cut_and_paste_uploads_a_new_file_and_drops_the_old(self):
+        item = editing.clip_images([self.clip(1.0)])[0]
+        self.source.delete_image(self.doc, PAGE1, TABLET_KEY, NOW)                    # cut: copy, then delete
+        data = self.source.image_file(THROWAWAY, PAGE1, TABLET_FILE)                 # still loadable
+        edit = self.source.insert_image(self.doc, PAGE1, data, "png", editing.pasted_corners(item, 1.0, (0, 600)),
+                                        NOW + 1, item["timestamps"])
+        self.sync.push_edits(THROWAWAY)
+        files = self.cloud.item(THROWAWAY)
+        self.assertNotIn(f"{THROWAWAY}/{PAGE1}/{TABLET_FILE}", files)
+        self.assertEqual(files[edit.path], data)
+        [image] = parse(files[f"{THROWAWAY}/{PAGE1}.rm"]).placed_images
+        self.assertEqual(image.image_ref.hex(), edit.key)
+
+    def test_timestamps_must_be_pairs(self):
+        with self.assertRaises(EditError):
+            ImageInsert.new(THROWAWAY, PAGE1, "png", box(), sha(self.image), len(self.image), NOW, [(1, 2)])
+        with self.assertRaises(EditError):
+            ImageInsert.new(THROWAWAY, PAGE1, "png", box(), sha(self.image), len(self.image), NOW, [(300, 2), (1, 1)])
+
+
+class SystemClipboardTests(unittest.TestCase):
+    """What the app takes from the system clipboard (transferDataFromSystemClipboard)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.qt = QApplication.instance() or QApplication([])
+
+    def take(self, mime):
+        from PySide6.QtCore import QObject, Signal
+        from ui.quick.bridge.platform import Clipboard
+
+        class System(QObject):
+            dataChanged = Signal()
+
+            def ownsClipboard(self):
+                return False
+
+            def mimeData(self):
+                return mime
+
+            def image(self):
+                return mime.imageData() if mime.hasImage() else QImage()
+
+            def setText(self, text):
+                self.text = text
+        clipboard = Clipboard(system=System())
+        return clipboard, clipboard.property("text")
+
+    def mime(self, **kinds):
+        from PySide6.QtCore import QMimeData
+        mime = QMimeData()
+        for kind, value in kinds.items():
+            {"text": mime.setText, "html": mime.setHtml, "image": mime.setImageData, "urls": mime.setUrls}[kind](value)
+        return mime
+
+    def picture(self):
+        image = QImage(30, 20, QImage.Format.Format_RGB32)
+        image.fill(QColor("#008000"))
+        return image
+
+    def test_a_copied_picture_is_preferred_to_nothing(self):
+        clipboard, content = self.take(self.mime(image=self.picture()))
+        self.assertEqual((content["text"], content["hasImage"], clipboard.property("hasText")), ("", True, True))
+        self.assertEqual(clipboard.image_of(content).size().width(), 30)
+        self.assertTrue(clipboard.image_of({"imageSerial": 99}).isNull())
+
+    def test_text_wins_over_a_picture_unless_the_picture_is_meant(self):
+        _, content = self.take(self.mime(text="hello", image=self.picture()))
+        self.assertEqual((content["text"], content["hasImage"]), ("hello", True))      # text is pasted
+        _, content = self.take(self.mime(html="<b>x</b>", image=self.picture()))      # picture + HTML, no text
+        self.assertEqual((content["text"], content["html"], content["hasImage"]), ("", "", True))
+        _, content = self.take(self.mime(text="https://example.com/a.png",
+                                         html='<img src="https://example.com/a.png">', image=self.picture()))
+        self.assertEqual((content["text"], content["hasImage"]), ("", True))           # a browser's "copy image"
+
+    def test_a_copied_image_file_and_an_inline_html_picture(self):
+        import base64
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QUrl
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            self.picture().save(str(path))
+            _, content = self.take(self.mime(urls=[QUrl.fromLocalFile(str(path))], text=str(path)))
+            self.assertEqual((content["text"], content["hasImage"]), ("", True))
+        data = QByteArray()
+        buffer = QBuffer(data)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        self.picture().save(buffer, "PNG")
+        html = f'<p>x</p><img src="data:image/png;base64,{base64.b64encode(bytes(data)).decode()}">'
+        clipboard, content = self.take(self.mime(html=html, text="x"))
+        self.assertEqual((content["text"], content["hasImage"]), ("", True))
+        self.assertEqual(clipboard.image_of(content).width(), 30)
+
+    def test_plain_text_and_nothing(self):
+        clipboard, content = self.take(self.mime(text="just words"))
+        self.assertEqual((content["text"], content["hasImage"]), ("just words", False))
+        clipboard, content = self.take(self.mime())
+        self.assertEqual((content, clipboard.property("hasText")), ({}, False))
+
+    def test_items_and_text_set_what_was_copied_last(self):
+        clipboard, _ = self.take(self.mime())
+        clipboard.setProperty("items", [{"type": "image"}])
+        self.assertEqual((clipboard.property("hasItems"), clipboard.property("lastCopiedType")), (True, 1))
+        clipboard.setTextFromString("copied")
+        self.assertEqual((clipboard.property("lastCopiedType"), clipboard.textString()), (0, "copied"))
+        self.assertEqual(clipboard._system.text, "copied")                  # text also goes to the system
+
+
 class ImageEncodingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -768,8 +962,7 @@ class ImageEncodingTests(unittest.TestCase):
 
     def test_placement(self):
         self.assertEqual(editing.placed_size(400, 300), (400, 300))             # one scene unit a pixel
-        self.assertEqual(editing.placed_size(2808, 1872), (1404, 936))          # larger than the page: fitted
-        self.assertEqual(editing.placed_size(1000, 3744), (500, 1872))
+        self.assertEqual(editing.placed_size(2808, 1872), (2808, 1872))         # larger than the page too, as the app
         self.assertEqual(editing.corners(0, 100, 40, 20),
                          [(-20, 90, 0, 0), (20, 90, 1, 0), (20, 110, 1, 1), (-20, 110, 0, 1)])
 
