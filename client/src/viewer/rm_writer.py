@@ -745,28 +745,94 @@ def transform_image(page: bytes, *, author: bytes, key: bytes,
     return join(header, blocks)
 
 
-def delete_image(page: bytes, *, author: bytes, key: bytes) -> tuple[bytes, str | None]:
+def delete_image(page: bytes, *, author: bytes, key: bytes, prune: bool = True) -> tuple[bytes, str | None]:
     """(`page` with the image `key` deleted, the name of the image file the page no
-    longer uses or None). The item is deleted where it is (0x1408ce450), and the
-    images table loses the entries no live item shows any more, as the app's
-    pruneImageTable does when it saves; the table itself stays, even empty, as in real
-    pages. Unchanged when the page no longer shows the image."""
+    longer uses or None). The item is deleted where it is (0x1408ce450), and, with
+    `prune`, the images table loses the entry no live item shows any more, as the app's
+    pruneImageTable does when it saves (prune_images). Unchanged when the page no
+    longer shows the image."""
     found = _image_page(page, author, key)
     if found is None:
         return page, None
     header, blocks, before, original, index, item, value = found
     blocks[index] = _deleted(item)
-    replaced = {0, index}
-    gone = None
+    _check_untouched(before, original, blocks, {0, index})
+    page = join(header, blocks)
+    if not prune:
+        return page, None
+    page, gone = prune_images(page, {key})
+    return page, (gone[0] if gone else None)
+
+
+def prune_images(page: bytes, keys) -> tuple[bytes, list[str]]:
+    """(`page` without the images-table entries of `keys` that no live item shows,
+    the file names of those entries), as pruneImageTable drops unused entries when the
+    app saves a page. The table itself stays, even empty, as in real pages; the
+    entries left keep their order and bytes."""
+    header, blocks = split(page)
     table = next((n for n, b in enumerate(blocks) if b.type == BLOCK_IMAGES_TABLE), None)
-    if table is not None and live_image(blocks, key) is None:
-        entries = decode_images_table(blocks[table].payload)
-        if encode_images_table(entries) != blocks[table].payload:
-            raise RmParseError("the images table is not understood")
-        names = [e.file_name for e in entries if e.key == key]
-        if names:
-            blocks[table] = new_block(BLOCK_IMAGES_TABLE, encode_images_table([e for e in entries if e.key != key]))
-            replaced.add(table)
-            gone = names[0]
-    _check_untouched(before, original, blocks, replaced)
+    if table is None:
+        return page, []
+    entries = decode_images_table(blocks[table].payload)
+    if encode_images_table(entries) != blocks[table].payload:
+        raise RmParseError("the images table is not understood")
+    unused = {k for k in keys if live_image(blocks, k) is None}
+    gone = [e.file_name for e in entries if e.key in unused]
+    if not gone:
+        return page, []
+    before, original = list(blocks), [b.payload for b in blocks]
+    blocks[table] = new_block(BLOCK_IMAGES_TABLE, encode_images_table([e for e in entries if e.key not in unused]))
+    _check_untouched(before, original, blocks, {table})
     return join(header, blocks), gone
+
+
+def image_item(page: bytes | None, key: bytes) -> tuple[tuple[int, int], ImageValue] | None:
+    """(id, value) of the live item showing the image `key`, or None."""
+    if page is None:
+        return None
+    blocks = split(page)[1]
+    index = live_image(blocks, key)
+    if index is None:
+        return None
+    item = decode_item(blocks[index].payload)
+    return item.item, decode_image_value(item.value)
+
+
+def restore_image(page: bytes, *, author: bytes, item: tuple[int, int], value: ImageValue) -> bytes:
+    """`page` with an image item taken off it (deleted, or replaced by a move) put back,
+    as reMarkable.exe's undo and redo put an item back (SceneActionStack ->
+    0x14095e690 / 0x14095f520 -> 0x1408cbd60): not by bringing the deleted item back,
+    which stays deleted, but as a new item under a new id (++clock, 0x1408e43e0), put
+    right after the deleted one (`item`) so it is where it was among the layer's items,
+    with `value` (the corners, imageRef and boundsTimestamp it had) and its moveId set
+    to the deleted item's id unless it already had one. Every other block is kept
+    byte for byte; the images table must still have the image's entry (the app keeps it
+    in memory while the page is open, see prune_images)."""
+    header, blocks = split(page)
+    before, original = list(blocks), [b.payload for b in blocks]
+    if live_image(blocks, value.ref) is not None:
+        raise ValueError("the page shows this image already")
+    table = next((b for b in blocks if b.type == BLOCK_IMAGES_TABLE), None)
+    if table is None or not any(e.key == value.ref for e in decode_images_table(table.payload)):
+        raise ValueError("the page's images table no longer lists this image")
+    check_corners(value.vertices)
+    owner = None
+    for block in blocks:
+        if block.type in ITEM_BLOCKS:
+            found = decode_item(block.payload)
+            if found.item[0] == item[0] and 0 <= item[1] - found.item[1] < max(found.deleted_length, 1):
+                owner = found
+                break
+    if owner is None or owner.value is not None or owner.deleted_length < 1:
+        raise ValueError(f"the page has no deleted item {item}")
+    me = _author_index(blocks, author)
+    ids = [i for i, _ in sequence(blocks, owner.parent)]
+    at = ids.index(item)
+    right = ids[at + 1] if at + 1 < len(ids) else ZERO_ID
+    new_id = (me, highest_counter(blocks) + 1)
+    back = ImageValue(value.ref, value.ref_timestamp, value.bounds_timestamp, [tuple(v) for v in value.vertices],
+                      value.indices, value.move_id if value.move_id not in (None, ZERO_ID) else item)
+    _insert_item(blocks, new_block(BLOCK_IMAGE_ITEM, ItemHeader(owner.parent, new_id, item, right, 0,
+                                                                back.encode()).encode()))
+    _check_untouched(before, original, blocks, {0})
+    return join(header, blocks)

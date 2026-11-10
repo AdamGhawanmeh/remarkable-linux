@@ -1286,6 +1286,8 @@ class LibraryController(QObject):
         it opens a tagged page."""
         self.library.set_reading_position(document_id, page=page)
         self.library.document_closed(document_id)
+        from .scene import forget_history
+        forget_history(document_id)
 
     @Slot(str, int)
     def setOrientation(self, document_id: str, orientation: int) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -18,8 +19,10 @@ from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.edits import Edit, EditError, ImageDelete, ImageInsert, ImageTransform, document_files, page_with_edits
+from core.edits import (Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageHistory,
+                        document_files, page_with_edits, replay, swapped)
 from core.sync import SyncClient, SyncError, sha256_hex
+from viewer import rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
@@ -318,6 +321,9 @@ class LibrarySource:
         self._scenes: OrderedDict[str, PageScene | None] = OrderedDict()
         self._scene_cache = scene_cache
         self._lock = threading.Lock()
+        # Undo and redo, per (document id, page id), while the document is open.
+        self._histories: dict[tuple[str, str], PageHistory] = {}
+        self._history_lock = threading.RLock()
 
     @property
     def writable(self) -> bool:
@@ -372,15 +378,18 @@ class LibrarySource:
         return [e for e in self.sync.edits.of(doc.id) if page_id is None or e.page_id == page_id]
 
     def insert_image(self, doc: Document, page_id: str, data: bytes, extension: str, vertices,
-                     now_ms: int, timestamps=None) -> ImageInsert:
+                     now_ms: int, timestamps=None, action: list[Change] | None = None) -> ImageInsert:
         """Put an image (`data`: a PNG or JPEG file as the app stores one, see
         ui.editing.encode_image) on a page, here only: the edit is kept with the cache
         and drawn over the page until SyncClient.push_edits uploads it. EditError when
-        `doc` may not be edited, or the page cannot take the image safely."""
+        `doc` may not be edited, or the page cannot take the image safely. It can be
+        undone: on its own, or as part of `action` (see edit_action)."""
         doc = self._editable(doc, page_id)
         edit = ImageInsert.new(doc.id, page_id, extension, vertices, sha256_hex(data), len(data), now_ms,
                                timestamps)
-        self._add_edit(doc, edit, data)
+        with self.edit_action(doc, page_id, action) as changes:
+            self._add_edit(doc, edit, data)
+            changes.append(Change(edit.key, None, ("edit", edit.uid)))
         return edit
 
     def image_file(self, doc_id: str, page_id: str, file_name: str) -> bytes:
@@ -400,20 +409,113 @@ class LibrarySource:
                 return self.sync.edits.data(edit)
         raise EditError("the copied image is no longer there")
 
-    def transform_image(self, doc: Document, page_id: str, key: bytes, vertices, now_ms: int) -> ImageTransform:
+    def transform_image(self, doc: Document, page_id: str, key: bytes, vertices, now_ms: int,
+                        action: list[Change] | None = None) -> ImageTransform:
         """Move, scale or turn an image of a page to new corners, here only (as
         insert_image). EditError when not allowed or not possible safely."""
         doc = self._editable(doc, page_id)
         edit = ImageTransform.new(doc.id, page_id, key, vertices, now_ms)
-        self._add_edit(doc, edit)
+        with self.edit_action(doc, page_id, action) as changes:
+            before = self._live_item(doc, page_id, key)
+            self._add_edit(doc, edit)
+            after = self._live_item(doc, page_id, key)
+            if before is not None and after is not None and after[1] != before[1]:     # not left as it was
+                changes.append(Change(edit.key, before[0], ("edit", edit.uid)))
         return edit
 
-    def delete_image(self, doc: Document, page_id: str, key: bytes, now_ms: int) -> ImageDelete:
+    def delete_image(self, doc: Document, page_id: str, key: bytes, now_ms: int,
+                     action: list[Change] | None = None) -> ImageDelete:
         """Delete an image of a page, here only (as insert_image)."""
         doc = self._editable(doc, page_id)
         edit = ImageDelete.new(doc.id, page_id, key, now_ms)
-        self._add_edit(doc, edit)
+        with self.edit_action(doc, page_id, action) as changes:
+            before = self._live_item(doc, page_id, key)
+            self._add_edit(doc, edit)
+            if before is not None:
+                changes.append(Change(edit.key, before[0], None))
         return edit
+
+    # -- undo and redo --
+
+    def _seen(self, doc_id: str, page_id: str):
+        synced = self.sync.tree.get(doc_id)
+        files = synced.files if isinstance(synced, Document) else {}
+        return files.get(f"{doc_id}/{page_id}.rm"), tuple(e for e in self.sync.edits.of(doc_id) if e.page_id == page_id)
+
+    def _history(self, doc_id: str, page_id: str) -> PageHistory:
+        """The page's undo and redo stacks, empty when the page changed since they were
+        last used (synced anew, or its pending edits uploaded or discarded)."""
+        seen = self._seen(doc_id, page_id)
+        history = self._histories.get((doc_id, page_id))
+        if history is None or history.seen != seen:
+            history = self._histories[(doc_id, page_id)] = PageHistory(seen)
+        return history
+
+    @contextmanager
+    def edit_action(self, doc: Document, page_id: str, action: list[Change] | None = None):
+        """Edits made in this block are one action for undo (several images pasted at
+        once, as the app's add-items action). With `action` (a list from an outer
+        edit_action), they are part of that one instead."""
+        if action is not None:
+            yield action
+            return
+        with self._history_lock:
+            history = self._history(doc.id, page_id)
+            changes: list[Change] = []
+            try:
+                yield changes
+            finally:
+                if changes:
+                    history.push(changes)
+                    history.seen = self._seen(doc.id, page_id)
+
+    def _live_item(self, doc: Document, page_id: str, key: bytes):
+        """(how an edit names it, its id) of the item showing the image `key` on the
+        page as it is shown here, or None."""
+        name = f"{doc.id}/{page_id}.rm"
+        page = self.blob(doc, name) if name in doc.files else None
+        try:
+            done = replay(page, self.pending_edits(doc, page_id), self.sync.author())
+            live = rm_writer.image_item(done.page, key)
+        except (RmParseError, ValueError) as err:
+            raise EditError(f"the page cannot be edited: {err}") from err
+        return (done.ref(live[0]), live[0]) if live is not None else None
+
+    def history_state(self, doc: Document, page_id: str) -> tuple[bool, bool]:
+        """(undo available, redo available) for a page."""
+        with self._history_lock:
+            history = self._history(doc.id, page_id)
+            return bool(history.undo), bool(history.redo)
+
+    def undo(self, doc: Document, page_id: str, now_ms: int) -> bool:
+        """Undo the last edit of a page, with new edits (core.edits.swapped). False when
+        there is nothing to undo; EditError when it cannot be done (the stacks are then
+        left as they were)."""
+        return self._step(doc, page_id, now_ms, redo=False)
+
+    def redo(self, doc: Document, page_id: str, now_ms: int) -> bool:
+        """Redo the last edit undone on a page (as undo)."""
+        return self._step(doc, page_id, now_ms, redo=True)
+
+    def _step(self, doc: Document, page_id: str, now_ms: int, redo: bool) -> bool:
+        with self._history_lock:
+            history = self._history(doc.id, page_id)
+            source, target = (history.redo, history.undo) if redo else (history.undo, history.redo)
+            if not source:
+                return False
+            doc = self._editable(doc, page_id)
+            edits, back = swapped(source[-1], doc.id, page_id, now_ms)
+            self._add_edits(doc, [(e, None) for e in edits])
+            source.pop()
+            target.append(back)
+            history.seen = self._seen(doc.id, page_id)
+            return True
+
+    def forget_history(self, doc_id: str) -> None:
+        """The document was closed: its undo and redo go, as the app's go with its pages."""
+        with self._history_lock:
+            for key in [k for k in self._histories if k[0] == doc_id]:
+                del self._histories[key]
 
     def _editable(self, doc: Document, page_id: str) -> Document:
         refusal = self.edit_refusal(doc)
@@ -425,11 +527,16 @@ class LibrarySource:
         return doc
 
     def _add_edit(self, doc: Document, edit: Edit, data: bytes | None = None) -> None:
-        """Work the document out with `edit` before keeping it: an edit the writer refuses
-        leaves nothing behind."""
-        document_files(doc, self.sync.edits.of(doc.id) + [edit], lambda name: self.blob(doc, name),
-                       lambda e: data if e is edit else self.sync.edits.data(e), self.sync.author())
-        self.sync.edits.add(edit, data)
+        self._add_edits(doc, [(edit, data)])
+
+    def _add_edits(self, doc: Document, edits: list[tuple[Edit, bytes | None]]) -> None:
+        """Work the document out with the edits (and the files of inserted images) before
+        keeping them: edits the writer refuses leave nothing behind."""
+        new = {id(e): data for e, data in edits}
+        document_files(doc, self.sync.edits.of(doc.id) + [e for e, _ in edits], lambda name: self.blob(doc, name),
+                       lambda e: new[id(e)] if id(e) in new else self.sync.edits.data(e), self.sync.author())
+        for edit, data in edits:
+            self.sync.edits.add(edit, data)
         with self._lock:
             self._scenes.clear()
 

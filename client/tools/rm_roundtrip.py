@@ -15,7 +15,10 @@ For every v6 page under the directory (default: the library cache) it checks tha
   - adding an image leaves every existing block untouched, and the result parses with
     one image more and the same strokes;
   - moving, then deleting, each image of the page gives the corners asked for, then
-    no such image, and nothing else changes.
+    no such image, and nothing else changes;
+  - undoing the move (the moved item deleted, the old one put back under a new id right
+    after itself) gives the old corners at the old place among the layer's items, the
+    moveId naming the first item, and changes nothing else.
 It prints counts only, nothing of the pages' content. Exit status 1 if anything failed.
 """
 
@@ -146,6 +149,27 @@ def check(data: bytes, stats: Counter, skeleton: dict[bytes, str]) -> None:
             stats[f"move/delete refused: {re.sub(r'[0-9]+', 'N', str(e))}"] += 1
             continue
         stats["moves and deletes"] += 1
+        # Undo of the move, as the app's undo does it.
+        try:
+            old_id = w.decode_item(new_blocks[index].payload).item
+            undone, _ = w.delete_image(moved, author=AUTHOR, key=key, prune=False)
+            undone = w.restore_image(undone, author=AUTHOR, item=old_id, value=old_value)
+        except (rm_parser.RmParseError, ValueError) as e:
+            stats[f"undo refused: {re.sub(r'[0-9]+', 'N', str(e))}"] += 1
+        else:
+            stats["undone moves"] += 1
+            back = [i for i in rm_parser.parse(undone).placed_images if i.image_ref == key]
+            undone_blocks = w.split(undone)[1]
+            restored = w.decode_item(undone_blocks[w.live_image(undone_blocks, key)].payload)
+            first = old_value.move_id if old_value.move_id not in (None, w.ZERO_ID) else old_id
+            where = lambda scene: [[n for n, i in enumerate(l.items()) if getattr(i, "image_ref", None) == key]
+                                   for l in scene.layers]
+            if (len(back) != 1 or back[0].vertices != after.placed_images[[i.image_ref for i in after.placed_images].index(key)].vertices
+                    or where(rm_parser.parse(undone)) != where(after) or restored.left != old_id
+                    or w.decode_image_value(restored.value).move_id != first
+                    or w.join(*w.split(undone)) != undone
+                    or not ORDER.match("".join(LETTER.get(b.type, "?") for b in undone_blocks))):
+                stats["undo: WRONG"] += 1
         after_move, after_delete = rm_parser.parse(moved), rm_parser.parse(deleted)
         shown = [i for i in after_move.placed_images if i.image_ref == key]
         if (len(shown) != 1 or [tuple(v) for v in shown[0].vertices] != [tuple(map(float, c)) for c in corners]

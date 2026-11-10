@@ -61,7 +61,7 @@ from typing import Any, Callable, Iterable
 
 from .auth import AuthClient, HttpResponse
 from .config import atomic_write_json, cache_dir, ensure_private_dir, read_json
-from .edits import EditError, ImageDelete, ImageInsert, ImageTransform, PendingEdits, document_files
+from .edits import EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PendingEdits, document_files
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
                      new_document_content, new_folder_content, new_metadata)
@@ -380,6 +380,9 @@ class PushPlan:
         for e in self.edits:
             if isinstance(e, ImageDelete):
                 lines.append(f"  delete image {e.key} on page {e.page_id}")
+                continue
+            if isinstance(e, ImageRestore):
+                lines.append(f"  put back image {e.key} on page {e.page_id} (undo/redo)")
                 continue
             xs, ys = [v[0] for v in e.vertices], [v[1] for v in e.vertices]
             where = f"x {min(xs):g}..{max(xs):g}, y {min(ys):g}..{max(ys):g} (scene units, x 0 = page centre)"

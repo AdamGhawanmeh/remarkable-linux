@@ -29,7 +29,7 @@ from PySide6.QtGui import QColor, QImage, QImageIOHandler, QImageWriter  # noqa:
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import push_edits  # noqa: E402
-from core.edits import (EditError, ImageDelete, ImageInsert, ImageTransform, PendingEdits,  # noqa: E402
+from core.edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PendingEdits,  # noqa: E402
                         document_files, page_images, page_with_edits)
 from core.models import json_bytes  # noqa: E402
 from core.sync import SyncClient, SyncError, json_changes, parse_index  # noqa: E402
@@ -965,6 +965,279 @@ class ImageEncodingTests(unittest.TestCase):
         self.assertEqual(editing.placed_size(2808, 1872), (2808, 1872))         # larger than the page too, as the app
         self.assertEqual(editing.corners(0, 100, 40, 20),
                          [(-20, 90, 0, 0), (20, 90, 1, 0), (20, 110, 1, 1), (-20, 110, 0, 1)])
+
+
+OTHER_KEY = bytes.fromhex("0123456789abcdef0123456789abcdef")
+OTHER_FILE = "6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d.png"
+
+
+def staged_page(sync, page_id=PAGE1) -> bytes:
+    return sync.staged_files(sync.tree.get(THROWAWAY))[f"{THROWAWAY}/{page_id}.rm"]
+
+
+class RestoreWriterTests(unittest.TestCase):
+    """rm_writer.restore_image: an item put back as reMarkable.exe's undo and redo put
+    one back (0x1408cbd60): a new item under a new id, right after the deleted one."""
+
+    def two_images(self) -> bytes:
+        """The tablet's image (live item 1:18) with another image put on top of it."""
+        return rm_writer.append_image(tablet_image_page(), author=ME, key=OTHER_KEY, file_name=OTHER_FILE,
+                                      vertices=box(0, 600, 100, 700))
+
+    def test_a_new_item_right_after_the_deleted_one(self):
+        page = self.two_images()
+        self.assertEqual([(i.item, i.left) for i in items(page)][-1], ((2, 22), (1, 18)))
+        [_, value] = rm_writer.image_item(page, TABLET_KEY)
+        gone, name = rm_writer.delete_image(page, author=ME, key=TABLET_KEY, prune=False)
+        self.assertIsNone(name)                                                 # the entry is kept for now
+        back = rm_writer.restore_image(gone, author=ME, item=(1, 18), value=value)
+        restored = items(back)[-1]
+        # A new id (the clock ticks once), between the deleted item and the one after it.
+        self.assertEqual((restored.parent, restored.item, restored.left, restored.right, restored.deleted_length),
+                         (LAYER, (2, 23), (1, 18), (2, 22), 0))
+        again = rm_writer.decode_image_value(restored.value)
+        self.assertEqual(again, value)                                          # moveId 1:16 kept: it had one
+        # The deleted item stays deleted; every other block is as it was, byte for byte.
+        self.assertEqual([b.encode() for b in rm_writer.split(back)[1] if b.type != rm_writer.BLOCK_IMAGE_ITEM
+                          or decode(b).item != (2, 23)], [b.encode() for b in rm_writer.split(gone)[1]])
+        # Back where it was among the layer's items: under the other image.
+        self.assertEqual([i.image_ref for i in stacked(parse(back))], [TABLET_KEY, OTHER_KEY])
+        self.assertEqual([i.image_ref for i in stacked(parse(page))], [TABLET_KEY, OTHER_KEY])
+        self.assertEqual([i for i, _ in rm_writer.sequence(rm_writer.split(back)[1], LAYER)],
+                         [(1, 16), (1, 17), (1, 18), (2, 23), (2, 22)])
+        self.assertEqual(rm_writer.join(*rm_writer.split(back)), back)        # re-encodes to the same bytes
+
+    def test_the_moveid_names_the_deleted_item_when_it_had_none(self):
+        page = rm_writer.append_image(drawn_page(), author=ME, key=OTHER_KEY, file_name=OTHER_FILE, vertices=box())
+        [item_id, value] = rm_writer.image_item(page, OTHER_KEY)
+        self.assertEqual((item_id, value.move_id), ((2, 19), None))
+        gone, _ = rm_writer.delete_image(page, author=ME, key=OTHER_KEY, prune=False)
+        back = rm_writer.restore_image(gone, author=ME, item=item_id, value=value)
+        restored = items(back)[-1]
+        self.assertEqual((restored.item, restored.left, restored.right), ((2, 20), (2, 19), (0, 0)))
+        self.assertEqual(rm_writer.decode_image_value(restored.value).move_id, (2, 19))
+
+    def test_what_cannot_be_put_back_is_refused(self):
+        page = self.two_images()
+        [_, value] = rm_writer.image_item(page, TABLET_KEY)
+        with self.assertRaises(ValueError):                                     # still shown
+            rm_writer.restore_image(page, author=ME, item=(1, 18), value=value)
+        gone, _ = rm_writer.delete_image(page, author=ME, key=TABLET_KEY, prune=False)
+        with self.assertRaises(ValueError):                                     # not a deleted item
+            rm_writer.restore_image(gone, author=ME, item=(2, 22), value=value)
+        with self.assertRaises(ValueError):                                     # no such item
+            rm_writer.restore_image(gone, author=ME, item=(3, 40), value=value)
+        pruned, _ = rm_writer.prune_images(gone, {TABLET_KEY})
+        with self.assertRaises(ValueError):                                     # its entry is gone
+            rm_writer.restore_image(pruned, author=ME, item=(1, 18), value=value)
+
+    def test_pruning_drops_only_unused_entries_of_the_keys_named(self):
+        page = self.two_images()
+        gone, _ = rm_writer.delete_image(page, author=ME, key=TABLET_KEY, prune=False)
+        self.assertEqual(rm_writer.prune_images(gone, {OTHER_KEY}), (gone, []))     # still shown
+        pruned, names = rm_writer.prune_images(gone, {TABLET_KEY, OTHER_KEY})
+        self.assertEqual(names, [TABLET_FILE])
+        self.assertEqual(pruned, rm_writer.delete_image(page, author=ME, key=TABLET_KEY)[0])
+
+
+def decode(block):
+    return rm_writer.decode_item(block.payload)
+
+
+def stacked(scene) -> list:
+    """The images of a page bottom to top, as they are drawn (Layer.items)."""
+    return [i for layer in scene.layers for i in layer.items() if hasattr(i, "image_ref") and i.vertices]
+
+
+class UndoTests(Base):
+    """Undo and redo of image edits, as reMarkable.exe's SceneActionStack does them: an
+    undo or redo is new edits (a delete, an item put back under a new id), kept and
+    uploaded like any other edit."""
+
+    def setUp(self):
+        super().setUp()
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), notebook_content(PAGE1, PAGE2),
+                            {f"{THROWAWAY}/{PAGE1}.rm": tablet_image_page(),
+                             f"{THROWAWAY}/{PAGE1}/{TABLET_FILE}": self.image})
+        self.tree = self.source.refresh()
+        self.doc = self.tree.get(THROWAWAY)
+        self.page = document_pages(self.doc)[0]
+
+    def state(self, page=PAGE1):
+        return self.source.history_state(self.doc, page)
+
+    def undo(self, page=PAGE1, when=NOW + 100):
+        return self.source.undo(self.doc, page, when)
+
+    def redo(self, page=PAGE1, when=NOW + 200):
+        return self.source.redo(self.doc, page, when)
+
+    def shown(self, page=None):
+        page = page or self.page
+        return [(i.image_ref, i.vertices) for i in stacked(self.source.page_scene(self.doc, page))]
+
+    def kinds(self):
+        return [type(e).__name__ for e in self.sync.edits.all()]
+
+    def test_nothing_to_undo_or_redo_at_first(self):
+        self.assertEqual(self.state(), (False, False))
+        self.assertFalse(self.undo())
+        self.assertFalse(self.redo())
+        self.assertEqual(self.sync.edits.all(), [])
+
+    def test_undoing_an_insert_deletes_it_and_redoing_puts_it_back(self):
+        before = self.shown()
+        edit = self.insert()
+        inserted = self.shown()
+        self.assertEqual(self.state(), (True, False))
+        self.assertTrue(self.undo())
+        self.assertEqual(self.shown(), before)
+        self.assertEqual(self.state(), (False, True))
+        self.assertTrue(self.redo())
+        self.assertEqual(self.shown(), inserted)
+        self.assertEqual(self.state(), (True, False))
+        self.assertEqual(self.kinds(), ["ImageInsert", "ImageDelete", "ImageRestore"])
+        # Redo did not bring the deleted item back: a new item after it, naming it as moveId.
+        page = staged_page(self.sync)
+        first, again = [i for i in items(page) if i.item[0] != 1]
+        self.assertEqual((first.deleted_length, first.value), (1, None))
+        self.assertEqual((again.left, again.item[1]), (first.item, first.item[1] + 1))
+        self.assertEqual(rm_writer.decode_image_value(again.value).move_id, first.item)
+        self.assertEqual(rm_writer.decode_image_value(again.value).ref, bytes.fromhex(edit.key))
+        # The file is uploaded once, as for any image put on the page.
+        self.assertIn(edit.path, self.sync.staged_files(self.sync.tree.get(THROWAWAY)))
+
+    def test_undoing_a_move_puts_the_image_back_in_its_place_among_the_layers_items(self):
+        other = self.insert()                                       # on top of the tablet's image
+        self.assertEqual([k for k, _ in self.shown()], [TABLET_KEY, bytes.fromhex(other.key)])
+        self.source.transform_image(self.doc, PAGE1, TABLET_KEY, editing.moved(box(), 300, 0), NOW + 1)
+        self.assertEqual(self.shown()[-1], (TABLET_KEY, editing.moved(box(), 300, 0)))    # a move puts it on top
+        self.assertTrue(self.undo())
+        self.assertEqual(self.shown(), [(TABLET_KEY, box()), (bytes.fromhex(other.key), box())])
+        page = staged_page(self.sync)
+        restored = next(i for i in items(page) if i.value is not None
+                        and rm_writer.decode_image_value(i.value).ref == TABLET_KEY)
+        self.assertEqual(restored.left, (1, 18))                    # right after the tablet's own item
+        self.assertEqual(rm_writer.decode_image_value(restored.value).move_id, (1, 16))   # the first, as before
+        self.assertTrue(self.redo())
+        self.assertEqual(self.shown()[-1], (TABLET_KEY, editing.moved(box(), 300, 0)))    # on top again
+        self.assertEqual(self.kinds(), ["ImageInsert", "ImageTransform", "ImageDelete", "ImageRestore",
+                                        "ImageDelete", "ImageRestore"])
+
+    def test_undoing_a_delete_keeps_the_file_in_the_document(self):
+        self.source.delete_image(self.doc, PAGE1, TABLET_KEY, NOW)
+        self.assertEqual(self.shown(), [])
+        self.assertTrue(self.undo())
+        self.assertEqual(self.shown(), [(TABLET_KEY, box())])
+        plan = self.sync.push_plan(THROWAWAY)
+        self.assertEqual(plan.removed, [])
+        self.assertIn("put back image", plan.describe())
+        self.sync.push_edits(THROWAWAY)
+        files = self.cloud.item(THROWAWAY)
+        self.assertEqual(files[f"{THROWAWAY}/{PAGE1}/{TABLET_FILE}"], self.image)
+        page = files[f"{THROWAWAY}/{PAGE1}.rm"]
+        [image] = parse(page).placed_images
+        self.assertEqual((image.image_ref, image.vertices), (TABLET_KEY, box()))
+        # The table keeps the tablet's entry as it was, byte for byte.
+        table = lambda data: next(b.payload for b in rm_writer.split(data)[1] if b.type == rm_writer.BLOCK_IMAGES_TABLE)
+        self.assertEqual(table(page), table(tablet_image_page()))
+
+    def test_a_new_edit_empties_the_redo_stack(self):
+        self.insert()
+        self.assertTrue(self.undo())
+        self.assertEqual(self.state(), (False, True))
+        self.source.transform_image(self.doc, PAGE1, TABLET_KEY, editing.moved(box(), 5, 5), NOW + 300)
+        self.assertEqual(self.state(), (True, False))
+        self.assertFalse(self.redo())
+        self.assertTrue(self.undo())                                # the move
+        self.assertFalse(self.undo())                               # the insert went with the redo stack
+        self.assertEqual(self.shown(), [(TABLET_KEY, box())])
+        self.assertEqual(self.state(), (False, True))
+
+    def test_undo_and_redo_many_times_mint_new_ids_and_agree_with_a_replay(self):
+        self.source.delete_image(self.doc, PAGE1, TABLET_KEY, NOW)
+        for n in range(3):
+            self.assertTrue(self.undo(when=NOW + 10 * n))
+            self.assertEqual(self.shown(), [(TABLET_KEY, box())])
+            self.assertTrue(self.redo(when=NOW + 10 * n + 5))
+            self.assertEqual(self.shown(), [])
+        page = staged_page(self.sync)
+        ids = [i.item for i in items(page)]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual([i.item[1] for i in items(page)][2:], list(range(19, 22)))     # one tick each put-back
+        self.assertTrue(all(i.value is None for i in items(page)))
+        self.assertEqual(rm_writer.join(*rm_writer.split(page)), page)
+        self.assertEqual(page_with_edits(tablet_image_page(), self.sync.edits.all(), self.sync.author()), page)
+        # Every put-back names the tablet's first item, as every move does.
+        self.assertEqual(self.kinds(), ["ImageDelete"] + ["ImageRestore", "ImageDelete"] * 3)
+
+    def test_undo_made_here_applies_to_a_newer_page(self):
+        other = self.insert()
+        self.source.transform_image(self.doc, PAGE1, bytes.fromhex(other.key), editing.moved(box(), 0, 400), NOW + 1)
+        self.assertTrue(self.undo())
+        # Meanwhile the tablet draws a stroke on the page.
+        newer = tablet_image_page() + line_item(LAYER, (1, 30), tool=17, color=0,
+                                                points=points_v2([(0, 0, 0, 0, 2, 255), (9, 9, 0, 0, 2, 255)]))
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), notebook_content(PAGE1, PAGE2),
+                            {f"{THROWAWAY}/{PAGE1}.rm": newer, f"{THROWAWAY}/{PAGE1}/{TABLET_FILE}": self.image})
+        self.sync.push_edits(THROWAWAY)
+        page = self.cloud.item(THROWAWAY)[f"{THROWAWAY}/{PAGE1}.rm"]
+        self.assertEqual([(i.image_ref, i.vertices) for i in stacked(parse(page))],
+                         [(TABLET_KEY, box()), (bytes.fromhex(other.key), box())])
+        self.assertEqual([s.item_id for s in parse(page).strokes], [(1, 30)])     # the tablet's stroke kept
+        self.assertTrue(all(i.item[1] > 30 for i in items(page) if i.item[0] != 1))     # ids above the newer clock
+
+    def test_the_stacks_go_when_the_page_changes_elsewhere_or_the_document_closes(self):
+        self.insert()
+        self.source.forget_history(THROWAWAY)
+        self.assertEqual(self.state(), (False, False))
+        self.insert()
+        self.sync.edits.clear()                                     # discarded (push_edits --discard)
+        self.assertEqual(self.state(), (False, False))
+        self.insert()
+        self.sync.push_edits(THROWAWAY)                             # uploaded: the page is new
+        self.source.refresh()
+        self.assertEqual(self.state(), (False, False))
+        self.assertFalse(self.undo())
+
+    def test_pages_have_their_own_stacks(self):
+        self.insert(PAGE2)
+        self.assertEqual((self.state(PAGE1), self.state(PAGE2)), ((False, False), (True, False)))
+        self.assertTrue(self.undo(PAGE2))
+        self.assertEqual(self.shown(document_pages(self.doc)[1]), [])
+
+    def test_several_images_pasted_at_once_are_undone_at_once(self):
+        with self.source.edit_action(self.doc, PAGE1) as action:
+            for n in range(2):
+                self.source.insert_image(self.doc, PAGE1, self.image, "png", box(n * 100, 600, n * 100 + 50, 650),
+                                         NOW, None, action)
+        self.assertEqual(len(self.shown()), 3)
+        self.assertTrue(self.undo())
+        self.assertEqual(self.shown(), [(TABLET_KEY, box())])
+        self.assertEqual(self.state(), (False, True))
+        self.assertTrue(self.redo())
+        self.assertEqual(len(self.shown()), 3)
+
+    def test_an_edit_that_changes_nothing_is_not_an_action(self):
+        self.source.transform_image(self.doc, PAGE1, TABLET_KEY, box(), NOW)       # where it is already
+        self.assertEqual(self.state(), (False, False))
+
+    def test_undo_edits_are_records_that_survive_a_restart(self):
+        self.source.delete_image(self.doc, PAGE1, TABLET_KEY, NOW)
+        self.undo()
+        self.assertEqual(PendingEdits(self.dir / "cache" / "pending").all(), self.sync.edits.all())
+        restore = self.sync.edits.all()[-1]
+        self.assertEqual(restore.item, ("page", 1, 18))
+        with self.assertRaises(EditError):
+            ImageRestore.new(THROWAWAY, PAGE1, TABLET_KEY, ("page", 1, 0), NOW)
+        with self.assertRaises(EditError):
+            ImageRestore.new(THROWAWAY, PAGE1, TABLET_KEY, ("edit", ""), NOW)
+        # A new process has the edits but not the stacks, as the app keeps them in memory.
+        fresh = LibrarySource(SyncClient(paired_auth(self.dir / "auth", self.cloud), self.dir / "cache"),
+                              editable=("throwaway",))
+        fresh.refresh()
+        self.assertEqual(fresh.history_state(fresh.sync.tree.get(THROWAWAY), PAGE1), (False, False))
+        self.assertEqual(len(fresh.sync.edits.all()), 2)
 
 
 if __name__ == "__main__":

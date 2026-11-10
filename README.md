@@ -180,7 +180,7 @@ when you use them.
 
 | Area | Status |
 |---|---|
-| Editing pages | See [Editing (experimental)](#editing-experimental) below: images work; drawing, the eraser, typed text, page management and undo/redo do not yet. |
+| Editing pages | See [Editing (experimental)](#editing-experimental) below: images and undo/redo of image edits work; drawing, the eraser, typed text and page management do not yet. |
 | Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
 | Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |
 | Search in documents | The search bar inside a document opens but does not find anything yet. |
@@ -212,13 +212,13 @@ and drawn over the page until you upload them yourself (see Upload below).
 | Typed text | Not yet: creating or editing text, and pasting text ("not available on Linux yet"). |
 | Selecting strokes | Not yet: only images can be selected. |
 | Page management | Not yet: adding, moving, duplicating and deleting pages. |
-| Undo / redo | Not yet. |
+| Undo / redo | **Working, for image edits.** Ctrl+Z / Ctrl+Shift+Z (or Edit > Undo, Redo) for inserts, pastes (several images pasted at once undo together), moves, resizes, turns, deletes and cuts. As in the official app each page has its own undo and redo, any new edit empties redo, and they are kept until the document is closed (or the page changes on another device). An undo is not a step back but new edits, as the tablet records it: an image taken off the page comes back as a new item right where it was among the layer's items, so undo and redo upload like any other edit. |
 | Layers | Not yet: edits go to Layer 1, as the app's do until another layer is chosen. |
 
 The first time editing turns on, the official app's "Desktop note-taking" introduction
 is shown. `client/tools/rm_roundtrip.py` checks the page writer against your own cached
-pages (every page must come back byte for byte, and take an image, a move and a delete
-without any other block changing); it prints counts only.
+pages (every page must come back byte for byte, and take an image, a move, an undo of
+the move and a delete without any other block changing); it prints counts only.
 
 ## What install.sh puts where
 

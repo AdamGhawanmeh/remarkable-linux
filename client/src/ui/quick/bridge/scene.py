@@ -98,6 +98,13 @@ def set_edit_notifier(notify: Callable[[str], None]) -> None:
     _notify = notify
 
 
+def forget_history(doc_id: str) -> None:
+    """A document was closed: its pages' undo and redo go with it."""
+    source = _source()
+    if source is not None and hasattr(source, "forget_history"):
+        source.forget_history(doc_id)
+
+
 def to_scene(rect: QRectF) -> QRectF:
     """ui/pages.py page coordinates -> scene coordinates."""
     return rect.translated(-HALF_WIDTH, 0)
@@ -475,6 +482,17 @@ class _Controller:
         strokes cannot be selected yet (an image's outline is the selection box)."""
         return []
 
+    # -- undo and redo (DocumentViewport's undo and redo actions) --
+    @Slot()
+    def undo(self) -> None:
+        if self.view is not None:
+            self.view.history_step(redo=False)
+
+    @Slot()
+    def redo(self) -> None:
+        if self.view is not None:
+            self.view.history_step(redo=True)
+
     @Slot(int)
     def applyPendingEdit(self, layer: int) -> None:
         """Each move is saved when it ends: nothing is left pending."""
@@ -612,6 +630,7 @@ class _SceneView:
         self._update_viewport()
         self._set("defaultCenter", QPointF(0, frame.height() / 2))
         self._set("sceneExteriorBoundary", bounds)
+        self._update_history()
         self._set("pageStatus", PAGE_READY)
         self._set("awaitingInitialTileSet", False)
         self._set("status", 2)  # Active
@@ -705,20 +724,24 @@ class _SceneView:
 
         def insert():
             select = None
-            for item in images:
-                try:
-                    picture = QImage.fromData(source.image_file(item["documentId"], item["pageId"], item["fileName"]))
-                except EditError as err:
-                    log.warning("dropping pasted image item, failed to load source image ref: %s", err)
-                    continue
-                if picture.isNull():
-                    log.warning("dropping pasted image item, failed to load source image ref")
-                    continue
-                data, extension, _ = editing.encode_image(picture)
-                corners = editing.pasted_corners(item, scale, center)
-                edit = source.insert_image(node, page_id, data, extension, corners, now_ms, item["timestamps"])
-                select = bytes.fromhex(edit.key)
+            with source.edit_action(node, page_id) as action:      # undone at once, as the app's add-items
+                for item in images:
+                    select = paste_one(item, action) or select
             return select
+
+        def paste_one(item, action) -> bytes | None:
+            try:
+                picture = QImage.fromData(source.image_file(item["documentId"], item["pageId"], item["fileName"]))
+            except EditError as err:
+                log.warning("dropping pasted image item, failed to load source image ref: %s", err)
+                return None
+            if picture.isNull():
+                log.warning("dropping pasted image item, failed to load source image ref")
+                return None
+            data, extension, _ = editing.encode_image(picture)
+            corners = editing.pasted_corners(item, scale, center)
+            edit = source.insert_image(node, page_id, data, extension, corners, now_ms, item["timestamps"], action)
+            return bytes.fromhex(edit.key)
         self._run_insertion(page_id, insert)
 
     def _on_edited(self, result) -> None:
@@ -854,6 +877,42 @@ class _SceneView:
                 error = f"The image could not be deleted: {type(err).__name__}"
             emit_from_worker(self, lambda: self._edited.emit((error, None)))
         self._pool.start(_Job(job))
+
+    # -- undo and redo --
+    def history_step(self, redo: bool) -> None:
+        """Undo or redo the last edit of the page shown (SceneController::undo/redo,
+        which run the page's SceneActionStack on the scene's worker): made as new
+        pending edits (LibrarySource.undo/redo), then the page is drawn again with
+        nothing selected (DocumentViewport ends the selection before it undoes)."""
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        if source is None or node is None or not self._page_id or not hasattr(source, "undo"):
+            return
+        (self._controller.aboutToRedo if redo else self._controller.aboutToUndo).emit()
+        if self._selected is not None:
+            self._set_selected(None)
+            self._controller.selectionCleared.emit()
+        page_id, now_ms = self._page_id, int(time.time() * 1000)
+
+        def job():
+            error = None
+            try:
+                (source.redo if redo else source.undo)(node, page_id, now_ms)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("%s on page %s", "redo" if redo else "undo", page_id)
+                error = f"Could not {'redo' if redo else 'undo'}: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._edited.emit((error, None)))
+        self._pool.start(_Job(job))
+
+    def _update_history(self) -> None:
+        """undoAvailable / redoAvailable of the page shown."""
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        state = (False, False)
+        if source is not None and node is not None and self._page_id and hasattr(source, "history_state"):
+            state = source.history_state(node, self._page_id)
+        self._controller._set("undoAvailable", state[0])
+        self._controller._set("redoAvailable", state[1])
 
     # -- geometry --
     def geometryChange(self, new: QRectF, old: QRectF) -> None:

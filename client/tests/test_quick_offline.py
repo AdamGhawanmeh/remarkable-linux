@@ -1072,6 +1072,48 @@ class EditingTests(unittest.TestCase):
         self.assertEqual(self.notices, [])
         self.assertEqual(real_warnings(self.app.warnings), [])
 
+    def action(self, text: str) -> QObject:
+        """One of the app's ActionManager actions, by its text (Ctrl+Z is "Undo", Ctrl+Shift+Z "Redo")."""
+        return next(o for o in self.qml("ActionManager").findChildren(QObject)
+                    if o.metaObject().className().startswith("ProxyAction") and o.property("text") == text)
+
+    def test_undo_and_redo_through_the_apps_actions(self):
+        from core.edits import ImageDelete, ImageInsert, ImageRestore
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        controller = view._controller
+        self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
+        self.assertEqual((controller.property("undoAvailable"), controller.property("redoAvailable")), (False, False))
+        undo, redo = self.action("Undo"), self.action("Redo")
+        # Actions go to the item with the focus (main.qml actionHandler): the viewport, as after a click.
+        self.window.requestActivate()
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "forceActiveFocus")
+        self.assertTrue(self.wait_for(lambda: undo.property("enabled") is False))
+        self.drop_and_select(view)
+        self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))
+        self.assertTrue(self.wait_for(lambda: undo.property("enabled")))
+        # Undo (the viewport ends the selection first, then SceneController.undo).
+        QMetaObject.invokeMethod(undo, "trigger")
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2), self.notices)
+        self.assertTrue(self.wait_for(lambda: view._content.scene is not None
+                                      and len(view._content.scene.placed_images) == 0))
+        self.assertFalse(self.handler().property("visible"))
+        self.assertTrue(self.wait_for(lambda: controller.property("redoAvailable")
+                                      and not controller.property("undoAvailable")))
+        self.assertTrue(self.wait_for(lambda: redo.property("enabled")))
+        QMetaObject.invokeMethod(redo, "trigger")
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 3), self.notices)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.placed_images) == 1))
+        self.assertEqual([type(e) for e in self.pending()], [ImageInsert, ImageDelete, ImageRestore])
+        self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")
+                                      and not controller.property("redoAvailable")))
+        # Closing the document drops the stacks, as the app's go with its pages.
+        self.close_document()
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
+        self.assertFalse(view._controller.property("undoAvailable"))
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
     def drop_and_select(self, view):
         QMetaObject.invokeMethod(self.drop_area(), "dropSupportedImages",
                                  Q_ARG("QVariant", [QUrl.fromLocalFile(str(self.picture))]),
