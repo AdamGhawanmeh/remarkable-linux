@@ -11,7 +11,7 @@ reMarkable desktop app's own interface (its QML, fonts and icons, unmodified) on
 from-scratch Python/Qt implementation of everything underneath: cloud sync, the `.rm`
 notebook renderer, PDF/EPUB viewing, page templates, PDF, PNG, SVG and `.rmdoc` export,
 imports, folders, moves and the trash, and Screen Share from the tablet. It is a reader
-and organiser: editing pages is not there yet. See
+and organiser; editing notebook pages is being added, starting with images (experimental). See
 [Feature status and roadmap](#feature-status-and-roadmap) for exactly what works.
 
 It works on a **bring-your-own-asset** basis: `install.sh` takes reMarkable's official
@@ -144,11 +144,11 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 403 offline tests use a fake cloud and synthetic documents; they need no account
+The 438 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
 `client/tools/rm_roundtrip.py` checks the page writer against your own cached pages:
-every page must come back byte for byte, and take an image without any existing block
-changing (it prints counts only).
+every page must come back byte for byte, and take an image, a move and a delete without
+any other block changing (it prints counts only).
 
 ## Feature status and roadmap
 
@@ -180,15 +180,45 @@ when you use them.
 
 | Area | Status |
 |---|---|
-| Editing pages | Drawing, typed text (creating or editing text notes), new notebooks and quick sheets are not available. The app's own client-editing feature is off, so the UI hides or disables them, as the official app does without it. |
-| Images on notebook pages (experimental) | Being built first of the editing features, and off unless asked for: `client/run.py --edit-notebook NAME` turns the app's editing interface on for the one notebook with that name. There, a PNG or JPEG file dropped on a page is put on it, stored as the official app stores one (scaled to at most 3200 px, PNG with transparency or else JPEG, at most 3 MiB); the page's existing content is kept byte for byte. The dropped image is selected in the app's own selection box; clicking an image (also one placed on the tablet) selects it. Drag the box to move it, a corner to resize, the round handle to turn it; Delete, Backspace or the bin icon deletes it. A move is saved the way the tablet saves one (the old item deleted, a new one with a `moveId`), and a deleted image's file leaves the document. The edit stays on this computer until `client/tools/push_edits.py` uploads it: run without arguments it prints exactly what would be sent, and uploads only with `--confirm DOCUMENT_ID`. Copy, cut and paste work as in the official app: a pasted image is a new copy (its picture stored again under a new file name and key) placed at the mouse, and a picture copied in another program (an image, an image file, or a picture copied from a web page) pastes onto the page; copying inside the app does not put anything on the system clipboard, as in the official app. Undo, pasting text and selecting strokes are not there yet, and the other editing tools the interface shows (pens, text, page actions) do nothing yet. The first time editing turns on, the official app's "Desktop note-taking" introduction is shown. |
-| Page management | Adding, moving, copying, duplicating and deleting pages are part of editing: disabled. |
+| Editing pages | See [Editing (experimental)](#editing-experimental) below: images work; drawing, the eraser, typed text, page management and undo/redo do not yet. |
 | Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
 | Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |
 | Search in documents | The search bar inside a document opens but does not find anything yet. |
 | EPUBs | Shown through the PDF version your tablet makes of them. An EPUB imported here opens once the tablet has opened it and synced; until then the viewer says so. There is no reflowing, font or margin setting. |
 | Password-protected PDFs | Not supported. |
 | Not on Linux | Converting handwriting to text, the share sheet (Share), scanning documents and in-app updates. |
+
+### Editing (experimental)
+
+Editing is being built feature by feature, each one the way the official app does it
+(verified against `reMarkable.exe` and real pages), and is off unless asked for:
+
+```sh
+client/.venv/bin/python client/run.py --edit-notebook NAME
+```
+
+turns the app's own editing interface on for the one notebook with that name (not in
+the trash, and no other notebook may share the name). Edits are kept on this computer
+and drawn over the page until you upload them yourself (see Upload below).
+
+| Feature | Status |
+|---|---|
+| Images: insert | **Working.** Drop a PNG or JPEG file on a page. It is stored as the official app stores one (turned as its EXIF says, scaled to at most 3200 px, PNG with transparency or else JPEG, at most 3 MiB), placed one unit a pixel at the drop point, and selected. The page's existing content is kept byte for byte. |
+| Images: select, move, resize, turn, delete | **Working.** Click an image (also one placed on the tablet) for the app's selection box: drag it to move, a corner to resize, the round handle to turn; Delete, Backspace or the bin deletes. Saved as the tablet saves it (a moved image replaces its old item and records a `moveId`; a deleted one leaves a deleted item and its file leaves the document). Verified on a reMarkable: moved, resized and turned images sync and show there. |
+| Images: copy, cut, paste | **Working.** Ctrl+C, Ctrl+X, Ctrl+V or the selection menu. A pasted image is a new copy (its picture stored again under a new file name and key) placed at the mouse. A picture copied in another program (an image, an image file, a picture from a web page) pastes onto the page. As in the official app, copying here puts nothing on the system clipboard. |
+| Upload | **Working, by hand.** `client/tools/push_edits.py` prints exactly what would be sent (document and page ids, the `.content`/`.metadata` fields that change, every file), without connecting; `--confirm DOCUMENT_ID` uploads, re-applying the edits to the cloud's latest version if another device synced meanwhile; `--discard DOCUMENT_ID` forgets them. |
+| Drawing (pens, highlighter, shapes) | Not yet: the tools show but do nothing. |
+| Eraser | Not yet. |
+| Typed text | Not yet: creating or editing text, and pasting text ("not available on Linux yet"). |
+| Selecting strokes | Not yet: only images can be selected. |
+| Page management | Not yet: adding, moving, duplicating and deleting pages. |
+| Undo / redo | Not yet. |
+| Layers | Not yet: edits go to Layer 1, as the app's do until another layer is chosen. |
+
+The first time editing turns on, the official app's "Desktop note-taking" introduction
+is shown. `client/tools/rm_roundtrip.py` checks the page writer against your own cached
+pages (every page must come back byte for byte, and take an image, a move and a delete
+without any other block changing); it prints counts only.
 
 ## What install.sh puts where
 
