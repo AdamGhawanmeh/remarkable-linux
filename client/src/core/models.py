@@ -83,9 +83,27 @@ def ms_timestamp(when: float) -> str:
     return str(int(when * 1000))
 
 
+def _json_text(value: Any, depth: int) -> str:
+    pad = "    " * depth
+    if isinstance(value, dict):
+        rows = [f"{pad}    {json.dumps(str(k), ensure_ascii=False)}: {_json_text(v, depth + 1)}"
+                for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))]
+        return "{\n" + "".join(row + ",\n" for row in rows)[:-2] + ("\n" if rows else "") + pad + "}"
+    if isinstance(value, (list, tuple)):
+        rows = [f"{pad}    {_json_text(v, depth + 1)}" for v in value]
+        return "[\n" + "".join(row + ",\n" for row in rows)[:-2] + ("\n" if rows else "") + pad + "]"
+    if isinstance(value, float) and value.is_integer() and abs(value) < 2 ** 53:
+        return str(int(value))                  # Qt writes a whole number without ".0"
+    return json.dumps(value, ensure_ascii=False)
+
+
 def json_bytes(raw: dict[str, Any]) -> bytes:
-    """Serialise a .metadata/.content file the way the apps write them."""
-    return (json.dumps(raw, indent=4, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    """Serialise a .metadata/.content file the way the tablet and the apps write them
+    (Qt's QJsonDocument::toJson): keys sorted, four spaces a level, and an empty object
+    or array on two lines ("{", then "}" at its own indent). Parsing a file the tablet
+    wrote and serialising it again gives the same bytes, so changing one field of a
+    file changes only that field."""
+    return (_json_text(raw, 0) + "\n").encode("utf-8")
 
 
 def new_metadata(name: str, parent: str, item_type: str, now_ms: str) -> dict[str, Any]:

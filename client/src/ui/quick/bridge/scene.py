@@ -10,8 +10,14 @@ editing, handwriting conversion. Here:
     SceneController    the page's paper and content geometry, and its layers
     PagePickerModel    the pages for the page overview grid
     SceneLayersModel   the page's layers for the layers foldout
-The other members (editing, selection, conversion) exist so the QML binds, and do
-nothing: this client does not edit pages (generated.py).
+Editing so far is images on notebook pages, where the library allows editing
+(LibrarySource.editable): an image file dropped on a page
+(SceneController.insertImageFileAsSceneItem), and an image selected
+(selectImageAtPoint) then moved, resized, turned or deleted through the app's own
+SceneSelectionHandler (moveSelectedItems, scaleSelectedItems, rotateSelectedItems,
+deleteSelectedItems), with SelectionImage drawing the selected image while it is
+dragged. The other editing members (pens, text, conversion, copying) exist so the QML
+binds, and do nothing yet (generated.py).
 
 Scene coordinates are the app's: tablet pixels at 226 DPI, x = 0 on the page's vertical
 centre line, y = 0 at its top (ui/pages.py uses x = 0 at the left edge). The tile
@@ -21,19 +27,23 @@ manager's view coordinates are the SceneView item's.
 from __future__ import annotations
 
 import logging
+import time
 from enum import IntEnum
 from typing import Callable
 
 import shiboken6
 
 from PySide6.QtCore import (QAbstractListModel, QModelIndex, QObject, QPointF, QRect, QRectF, QSize, QSizeF, Qt,
-                            QThreadPool, QTimer, Signal, Slot)
+                            QThreadPool, QTimer, QUrl, Signal, Slot)
 from PySide6.QtGui import QImage, QPainter, QTransform
 from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
+from core.edits import EditError
 from core.models import FileType
 from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH
 
+from ... import editing
+from ...editing import prepare_image
 from ...library import pdf_name
 from ...pages import DocumentPages, PageContent, render_content
 from ...workers import EXPECTED_ERRORS, _Job, emit_from_worker
@@ -47,6 +57,8 @@ PORTRAIT = QRectF(-HALF_WIDTH, 0, PAGE_WIDTH, PAGE_HEIGHT)
 MAX_PIXELS = 32_000_000
 
 _source: Callable[[], object] = lambda: None
+# Tells the user why an edit was not made (the app shows it as a notification).
+_notify: Callable[[str], None] = lambda message: log.warning("%s", message)
 
 # The transform (center, scale) each DocumentViewport last showed a page at, by viewport
 # item. DocumentViewport turns a page by changing currentPage, which re-fits viewportScale
@@ -65,6 +77,11 @@ def set_page_source(provider: Callable[[], object]) -> None:
     """Where SceneView and the page models load documents from (the app's LibrarySource)."""
     global _source
     _source = provider
+
+
+def set_edit_notifier(notify: Callable[[str], None]) -> None:
+    global _notify
+    _notify = notify
 
 
 def to_scene(rect: QRectF) -> QRectF:
@@ -139,9 +156,49 @@ class _PaintedNothing:
         pass
 
 
-# Search highlights and selection previews: nothing to show without search/selection.
+# Search highlights: nothing to show without search.
 PageSearchResultOverlayItem = qml_class("PageSearchResultOverlayItem", QQuickPaintedItem, _PaintedNothing)
-SelectionImage = qml_class("SelectionImage", QQuickPaintedItem, _PaintedNothing)
+
+
+class _SelectionImage:
+    """What SceneSelectionHandler's SelectionPreview shows inside the selection box: the
+    selected image, fitted to the box, so it follows the box while it is dragged or
+    resized (the page is drawn without it meanwhile)."""
+
+    def __init__(self, parent: QQuickItem | None = None) -> None:
+        QQuickPaintedItem.__init__(self, parent)
+        self._picture: QImage | None = None
+        self._matrix = None                 # image pixels -> scene
+        self._rect = QRectF()               # the scene area the box stands for
+
+    @Slot(QObject, int, int, QRectF, QTransform)
+    def updateImage(self, worker, page: int, layer: int, scene_rect: QRectF, preview: QTransform) -> None:
+        self._picture, self._matrix, self._rect = None, None, QRectF(scene_rect)
+        selected = worker.selected_image() if hasattr(worker, "selected_image") else None
+        if selected is not None:
+            self._picture, self._matrix = selected
+        self.update()
+
+    @Slot()
+    def reset(self) -> None:
+        self._picture, self._matrix = None, None
+        self.update()
+
+    @Slot(result=QImage)
+    def image(self) -> QImage:
+        return self._picture if self._picture is not None else QImage()
+
+    def paint(self, painter: QPainter) -> None:
+        if self._picture is None or self._matrix is None or self._rect.width() <= 0 or self._rect.height() <= 0:
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.scale(self.width() / self._rect.width(), self.height() / self._rect.height())
+        painter.translate(-self._rect.x(), -self._rect.y())
+        painter.setTransform(QTransform(*self._matrix), True)
+        painter.drawImage(QPointF(0, 0), self._picture)
+
+
+SelectionImage = qml_class("SelectionImage", QQuickPaintedItem, _SelectionImage)
 DocumentSearchController = qml_class("DocumentSearchController")
 
 
@@ -293,6 +350,9 @@ class _Controller:
         QObject.__init__(self, parent)
         self.layers: list = []
         self.links: list[dict] = []
+        # Set by the SceneView showing the page: (file url, scene position) -> None.
+        self.insert_image: Callable[[QUrl, QPointF], None] | None = None
+        self.view = None                    # that SceneView: selecting and changing images
 
     def set_page(self, frame: QRectF, bounds: QRectF, layers: list, links: list[dict]) -> None:
         """The loaded page: its frame (paper), content bounds and links, in scene
@@ -310,6 +370,70 @@ class _Controller:
             if link["rect"].contains(QPointF(pos)):
                 return {k: v for k, v in link.items() if k != "rect"}
         return {"valid": False, "index": -1}
+
+    @Slot(QUrl, QPointF)
+    def insertImageFileAsSceneItem(self, url: QUrl, pos: QPointF) -> None:
+        """An image file dropped on the page (DocumentViewport's drop area), centred on
+        the scene position `pos`."""
+        if self.insert_image is not None:
+            self.insert_image(QUrl(url), QPointF(pos))
+
+    # -- selection (DocumentViewport, SceneSelectionHandler) --
+    @Slot(QPointF, int, result=bool)
+    def selectImageAtPoint(self, pos: QPointF, layer: int) -> bool:
+        """Select the topmost image of the layer at a scene position: the selection box
+        opens on it (areaSelected). False where there is none, or the page may not be
+        edited here."""
+        return self.view is not None and self.view.select_image_at(QPointF(pos), int(layer))
+
+    @Slot()
+    def clearSelectedItems(self) -> None:
+        if self.view is not None:
+            self.view.clear_selection()
+
+    @Slot(int, QPointF)
+    def moveSelectedItems(self, layer: int, offset: QPointF) -> None:
+        if self.view is not None:
+            self.view.transform_selection(int(layer), lambda v: editing.moved(v, offset.x(), offset.y()))
+
+    @Slot(int, QPointF, float, float)
+    def scaleSelectedItems(self, layer: int, origin: QPointF, x_scale: float, y_scale: float) -> None:
+        if self.view is not None:
+            self.view.transform_selection(int(layer), lambda v: editing.scaled(v, origin.x(), origin.y(), x_scale, y_scale))
+
+    @Slot(int, QPointF, float)
+    def rotateSelectedItems(self, layer: int, origin: QPointF, rotation: float) -> None:
+        if self.view is not None:
+            self.view.transform_selection(int(layer), lambda v: editing.rotated(v, origin.x(), origin.y(), rotation))
+
+    @Slot(int)
+    def deleteSelectedItems(self, layer: int) -> None:
+        if self.view is not None:
+            self.view.delete_selection(int(layer))
+
+    @Slot(int, float, result="QVariantList")
+    def cloneSelectedItems(self, layer: int, scale_factor: float) -> list:
+        """Copying (and so cutting, and converting to text) is not built yet. Cut and
+        convert delete the selection right after copying it: that delete is refused
+        too, so the image is not lost."""
+        if self.view is not None:
+            self.view.refuse_copy()
+        return []
+
+    @Slot(result="QVariantList")
+    @Slot(QRect, result="QVariantList")
+    def getLineBoundingRectsToBeSelected(self, area: QRect | None = None) -> list:
+        """The outlines DocumentViewport draws around each selected stroke: none, as
+        strokes cannot be selected yet (an image's outline is the selection box)."""
+        return []
+
+    @Slot(int)
+    def applyPendingEdit(self, layer: int) -> None:
+        """Each move is saved when it ends: nothing is left pending."""
+
+    @Slot()
+    def cancelPendingEdit(self) -> None:
+        pass
 
     @Slot(int, result=bool)
     def isLayerVisible(self, index: int) -> bool:
@@ -332,12 +456,19 @@ class _SceneView:
                  "limitScrollingToPaper": True, "tileAntialiasing": True}
     _loaded = Signal(object)
     _rendered = Signal(object)
+    _edited = Signal(object)
 
     def __init__(self, parent: QQuickItem | None = None) -> None:
         QQuickPaintedItem.__init__(self, parent)
         self.setAntialiasing(True)
         self.__dict__.setdefault("_values", {})
         self._controller = SceneController(self)
+        self._controller.insert_image = self._insert_image
+        self._controller.view = self
+        self._values["worker"] = self       # SelectionImage asks it for the selected image
+        self._selected: bytes | None = None     # images-table key of the selected image
+        self._reselect = False              # open the selection box again once the page reloads
+        self._copy_refused = False
         self._tiles = SceneTileManager(self)
         self._values["controller"] = self._controller
         self._values["tileManager"] = self._tiles
@@ -345,16 +476,19 @@ class _SceneView:
         self._values["keyHandler"] = SceneKeyHandler(self)
         self._pages: DocumentPages | None = None
         self._content: PageContent | None = None
+        self._page_id = ""                  # of the page shown (its id in the document)
         self._bounds = QRectF()             # content bounds, scene coordinates
         self._image: QImage | None = None   # the page rendered at self._image_scale
         self._image_scale = 0.0
         self._rendering = False
+        self._render_again = False
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
         self._refresh = QTimer(self, singleShot=True)
         self._refresh.timeout.connect(self._render)
         self._loaded.connect(self._on_loaded)
         self._rendered.connect(self._on_rendered)
+        self._edited.connect(self._on_edited)
         self._tiles.transformChanged.connect(self._transform_changed)
         self._device_ratio = 1.0
         self.windowChanged.connect(self._window_changed)
@@ -369,18 +503,21 @@ class _SceneView:
 
     def _property_changed(self, name: str) -> None:
         if name in ("pageId", "document") and self.isComponentComplete():
+            self._set_selected(None)
             self._load()
 
-    def _load(self) -> None:
+    def _load(self, quiet: bool = False) -> None:
         """Load the page `pageId` (the first page if the id is empty or unknown: the
         document's page count may only be known once its PDF is open, see
         DocumentWrapper.learn_pdf_page_count). Always ends Active or with a page error,
-        never left Updating: DocumentViewport shows its loading dots until then."""
+        never left Updating: DocumentViewport shows its loading dots until then.
+        `quiet` reloads a page already shown (after an edit) without those dots."""
         document, page_id, source = self._get("document"), self._get("pageId"), _source()
         node = getattr(document, "node", None)
         if node is None or source is None:
             return
-        self._set("status", 1)  # Updating
+        if not quiet:
+            self._set("status", 1)  # Updating
 
         def job():
             pages = None
@@ -389,26 +526,27 @@ class _SceneView:
                 if not pages.pages:
                     raise ValueError(no_pages_reason(node))
                 ids = [p.page_id for p in pages.pages]
-                content = pages.content(ids.index(page_id) if page_id in ids else 0)
+                index = ids.index(page_id) if page_id in ids else 0
+                content = pages.content(index)
                 frame = content.frame()
                 bounds = QRectF(*content.bounds("page"))
                 links = []
                 if content.has_pdf_page:
                     page_of_pdf = {p.pdf_page: i for i, p in enumerate(pages.pages) if p.pdf_page is not None}
                     links = pdf_links(content.pdf, content.pdf_page, frame, page_of_pdf)
-                result = (pages, content, to_scene(frame), to_scene(bounds), links, None)
+                result = (pages, content, to_scene(frame), to_scene(bounds), links, None, ids[index])
             except Exception as err:      # anything left unreported would keep the loading dots up
                 if not isinstance(err, EXPECTED_ERRORS):
                     log.exception("loading page %r of %s", page_id, node.id)
                     err = RuntimeError(f"{type(err).__name__}: {err}")
                 if pages is not None:
                     pages.close()
-                result = (None, None, None, None, [], err)
+                result = (None, None, None, None, [], err, "")
             emit_from_worker(self, lambda: self._loaded.emit(result))
         self._pool.start(_Job(job))
 
     def _on_loaded(self, result) -> None:
-        pages, content, frame, bounds, links, error = result
+        pages, content, frame, bounds, links, error, shown = result
         if error is not None:
             log.warning("cannot load page %s: %s", self._get("pageId"), error)
             self._set("pageStatus", PAGE_LOAD_ERROR)
@@ -417,9 +555,12 @@ class _SceneView:
             return
         if self._pages is not None:
             self._pages.close()
-        self._pages, self._content, self._bounds = pages, content, bounds
+        self._pages, self._content, self._bounds, self._page_id = pages, content, bounds, shown
         layers = content.scene.layers if content.scene is not None else []
         self._controller.set_page(frame, bounds, layers, links)
+        # The layer edits go to: Layer 1, the one the app uses until another is chosen.
+        node_ids = [layer.node_id for layer in layers]
+        self._controller._set("currentLayer", node_ids.index((0, 11)) if (0, 11) in node_ids else max(len(layers) - 1, 0))
         self._tiles._set("sceneBoundingRect", bounds)
         self._update_viewport()
         self._set("defaultCenter", QPointF(0, frame.height() / 2))
@@ -427,12 +568,178 @@ class _SceneView:
         self._set("pageStatus", PAGE_READY)
         self._set("awaitingInitialTileSet", False)
         self._set("status", 2)  # Active
+        if self._reselect:
+            self._reselect = False
+            self._reopen_selection()
         self._render()
         # Last: when this gives the document its page count, the viewport reopens the
         # page through its new id, replacing this view.
         learn = getattr(self._get("document"), "learn_pdf_page_count", None)
         if learn is not None and pages.pdf is not None:
             learn(pages.pdf.page_count)
+
+    # -- editing --
+    def _insert_image(self, url: QUrl, pos: QPointF) -> None:
+        """Put an image file on the page shown, centred on a scene position: prepared
+        as the app stores one (ui/editing.py) and kept as a pending edit of the library
+        (LibrarySource.insert_image), then the page is drawn again with it. Whatever
+        stops it is told to the user, and nothing is changed."""
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        if source is None or node is None or self._content is None or not self._page_id:
+            return
+        refusal = source.edit_refusal(node)
+        if not refusal and self._content.has_pdf_page:
+            refusal = "Images can only be put on notebook pages"
+        if not refusal and not url.isLocalFile():
+            refusal = "Only image files on this computer can be inserted"
+        if refusal:
+            _notify(refusal)
+            return
+        path, page_id, x, y, now_ms = url.toLocalFile(), self._page_id, pos.x(), pos.y(), int(time.time() * 1000)
+
+        def job():
+            error = select = None
+            try:
+                data, extension, vertices = prepare_image(path, x, y)
+                select = bytes.fromhex(source.insert_image(node, page_id, data, extension, vertices, now_ms).key)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:      # an edit never takes the page view down with it
+                log.exception("inserting an image on page %s", page_id)
+                error = f"The image could not be inserted: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._edited.emit((error, select)))
+        self._pool.start(_Job(job))
+
+    def _on_edited(self, result) -> None:
+        """An edit was made (or refused): draw the page again, with the image it
+        concerns selected (`select`: its key; the image just dropped, as the app selects
+        it), or without a selection."""
+        error, select = result
+        if error is not None:
+            _notify(str(error))
+        if select is not None:
+            self._selected, self._reselect = select, True
+        self._load(quiet=True)
+
+    # -- the selection --
+    def _editable(self) -> bool:
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        return (source is not None and node is not None and self._content is not None
+                and not self._content.has_pdf_page and source.can_edit(node))
+
+    def _set_selected(self, key: bytes | None) -> None:
+        changed = key != self._selected
+        self._selected = key
+        self._controller._set("selectionContainsImage", key is not None)
+        self._controller._set("selectionItemCount", 1 if key is not None else 0)
+        if changed and self._content is not None:
+            self._render()
+
+    def select_image_at(self, pos: QPointF, layer: int) -> bool:
+        if not self._editable():
+            return False
+        image = editing.image_at(self._content.scene, layer, pos.x(), pos.y())
+        if image is None:
+            return False
+        self._set_selected(image.image_ref)
+        # After the QML that asked has switched to selecting (it does so once this
+        # returns), as the app answers from its worker.
+        QTimer.singleShot(0, self._reopen_selection)
+        return True
+
+    def _reopen_selection(self) -> None:
+        """Open the selection box on the selected image where it is now, or close it
+        when the image is gone."""
+        found = editing.find_image(self._content.scene if self._content else None, self._selected) \
+            if self._selected is not None else None
+        if found is None:
+            if self._selected is not None:
+                self._set_selected(None)
+                self._controller.selectionCleared.emit()
+            return
+        layer, image = found
+        self._set_selected(image.image_ref)
+        x, y, w, h = editing.corner_bounds(image.vertices)
+        self._controller.areaSelected.emit(layer, QRectF(x, y, w, h))
+
+    def clear_selection(self) -> None:
+        self._set_selected(None)
+
+    def selected_image(self):
+        """(picture, image pixels -> scene matrix) of the selected image, for SelectionImage."""
+        from viewer.renderer import image_matrix
+        found = editing.find_image(self._content.scene if self._content else None, self._selected) \
+            if self._selected is not None else None
+        if found is None or not found[1].data:
+            return None
+        image = found[1]
+        picture = getattr(image, "_qimage", None) or QImage.fromData(image.data)
+        image._qimage = picture
+        matrix = image_matrix(self._content.scene, image, picture.width(), picture.height())
+        if picture.isNull() or matrix is None:
+            return None
+        a, b, c, d, e, f = matrix                   # to page coordinates (x 0 at the left edge)...
+        return picture, (a, b, c, d, e - self._content.scene.x_origin, f)       # ...to scene coordinates
+
+    def _selection_change(self, layer: int):
+        """(source, document, page id, the selected image) for an edit of the selection,
+        or None (nothing selected, another layer, or not editable)."""
+        if self._selected is None or not self._editable():
+            return None
+        found = editing.find_image(self._content.scene, self._selected)
+        if found is None or found[0] != layer:
+            return None
+        return _source(), self._get("document").node, self._page_id, found[1]
+
+    def transform_selection(self, layer: int, change) -> None:
+        """Move, scale or turn the selected image (`change`: its corners -> new corners),
+        saved as a pending edit of the library, then the page is drawn again with the
+        selection box on the image's new place."""
+        target = self._selection_change(layer)
+        if target is None:
+            return
+        source, node, page_id, image = target
+        key, corners, now_ms = image.image_ref, change(list(image.vertices)), int(time.time() * 1000)
+
+        def job():
+            error = None
+            try:
+                source.transform_image(node, page_id, key, corners, now_ms)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("changing an image on page %s", page_id)
+                error = f"The image could not be changed: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._edited.emit((error, key)))
+        self._pool.start(_Job(job))
+
+    def refuse_copy(self) -> None:
+        _notify("Copying images is not available on Linux yet")
+        self._copy_refused = True
+        QTimer.singleShot(0, lambda: setattr(self, "_copy_refused", False))
+
+    def delete_selection(self, layer: int) -> None:
+        if self._copy_refused:          # cut or convert: copy, then delete; the copy failed
+            return
+        target = self._selection_change(layer)
+        if target is None:
+            return
+        source, node, page_id, image = target
+        key, now_ms = image.image_ref, int(time.time() * 1000)
+        self._set_selected(None)
+        self._controller.selectionCleared.emit()
+
+        def job():
+            error = None
+            try:
+                source.delete_image(node, page_id, key, now_ms)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("deleting an image on page %s", page_id)
+                error = f"The image could not be deleted: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._edited.emit((error, None)))
+        self._pool.start(_Job(job))
 
     # -- geometry --
     def geometryChange(self, new: QRectF, old: QRectF) -> None:
@@ -464,13 +771,20 @@ class _SceneView:
 
     # -- rendering --
     def _render(self) -> None:
-        if self._content is None or self._rendering:
+        if self._content is None:
+            return
+        if self._rendering:
+            # The render under way may be of the page as it was (reloaded after an
+            # edit): render once more when it is done.
+            self._render_again = True
             return
         scale = self._tiles._get("scale") * self._dpr()
         area = self._bounds.width() * self._bounds.height() * scale * scale
         if area > MAX_PIXELS:
             scale *= (MAX_PIXELS / area) ** 0.5
         content = self._content
+        if self._selected is not None and content.scene is not None:
+            content = _without_image(content, self._selected)    # SelectionImage shows it
         self._rendering = True
 
         def job():
@@ -488,6 +802,10 @@ class _SceneView:
         if image is not None:
             self._image, self._image_scale = image, scale
             self.update()
+        if self._render_again:
+            self._render_again = False
+            self._render()
+            return
         wanted = self._tiles._get("scale") * self._dpr()
         capped = self._bounds.width() * self._bounds.height() * wanted * wanted > MAX_PIXELS
         if not capped and abs(self._image_scale - wanted) / wanted > 0.01:
@@ -523,6 +841,9 @@ class _SceneView:
         that); without text editing, other keys do nothing."""
         actions = SceneKeyHandlerAction.Type
         kind = {int(Qt.Key.Key_PageUp.value): actions["PageUp"], int(Qt.Key.Key_PageDown.value): actions["PageDown"]}
+        if int(key) in (int(Qt.Key.Key_Backspace.value), int(Qt.Key.Key_Delete.value)) and self._selected is not None:
+            # Delete comes as the selection handler's shortcut; Backspace reaches here.
+            self.delete_selection(self._controller._get("currentLayer"))
         return {"type": int(kind.get(int(key), actions["None"]))}
 
     @Slot(result=bool)
@@ -531,6 +852,14 @@ class _SceneView:
 
 
 SceneView = qml_class("SceneView", QQuickPaintedItem, _SceneView)
+
+
+def _without_image(content: PageContent, key: bytes) -> PageContent:
+    """The page with the image `key` left out (it is being moved)."""
+    from dataclasses import replace
+    scene = content.scene
+    layers = [replace(layer, images=[i for i in layer.images if i.image_ref != key]) for layer in scene.layers]
+    return replace(content, scene=replace(scene, layers=layers))
 
 
 # -- models ---------------------------------------------------------------------------

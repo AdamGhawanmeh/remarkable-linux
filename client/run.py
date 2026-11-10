@@ -68,7 +68,7 @@ def make_app(args: argparse.Namespace, workdir: Path) -> tuple[QuickApp, bool]:
     auth = AuthClient()
     if args.offline and not auth.is_paired:
         print("Not logged in: showing the cached library only. Run without --offline to log in.")
-    source = LibrarySource(SyncClient(auth), cached_only=args.offline)
+    source = LibrarySource(SyncClient(auth), cached_only=args.offline, editable=tuple(args.edit_notebook))
     liveview = None if args.offline else (lambda emit: LiveViewService(auth, emit))
     quick = QuickApp(source, cache_dir(), config_dir=config_dir(), liveview_factory=liveview)
     return quick, not args.offline
@@ -170,6 +170,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--demo", action="store_true", help="use the built-in demo library")
     mode.add_argument("--self-test", action="store_true",
                       help="start on the demo library, check the interface loads, and quit")
+    parser.add_argument("--edit-notebook", action="append", default=[], metavar="NAME",
+                        help="experimental: turn editing on for the notebook with this name (so far: drop an "
+                             "image file on a page). Edits stay on this computer until "
+                             "client/tools/push_edits.py uploads them")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 

@@ -139,7 +139,9 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(unique_name("Folder", set()), "Folder")
         self.assertEqual(unique_name("Folder", {"Folder", "Folder 2"}), "Folder 3")
         data = json_bytes({"visibleName": "Ünïcode", "b": [], "a": 1})
-        self.assertEqual(data, '{\n    "a": 1,\n    "b": [],\n    "visibleName": "Ünïcode"\n}\n'.encode())
+        # As Qt's QJsonDocument writes it (an empty array on two lines): parsing a file the
+        # tablet wrote and writing it again gives the same bytes.
+        self.assertEqual(data, '{\n    "a": 1,\n    "b": [\n    ],\n    "visibleName": "Ünïcode"\n}\n'.encode())
         self.assertNotIn("lastOpened", new_metadata("F", "", "CollectionType", "1"))
 
     def test_tree_cycle_is_safe(self):

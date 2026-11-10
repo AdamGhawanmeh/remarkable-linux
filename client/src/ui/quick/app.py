@@ -46,7 +46,7 @@ from .bridge.platform import (LOGIN_RESULTS, ArkIconProvider, ArkTokensSettings,
                               DocumentController, HandwritingLanguageModel, LanguageSettings, LinkProvider,
                               NetworkClient, PlatformApp, PlatformHelpers, Settings, SettingsStore, UserInfo,
                               login_result)
-from .bridge.scene import Recognizer, set_page_source
+from .bridge.scene import Recognizer, set_edit_notifier, set_page_source
 from .bridge.screenshare import ScreenShareClient
 
 log = logging.getLogger("rm.ui.quick")
@@ -135,6 +135,7 @@ class QuickApp:
         # FileImportDialog hands picked files to PlatformHelpers.documentAccepted.
         s.platform_helpers.documentAccepted.connect(
             lambda url, name, parent_id, scanned, delete_later: s.importer.importFromUrls([url], parent_id))
+        self.library.openDocumentsChanged.connect(self._update_editing)
         self.mutator.finished.connect(lambda tree, message: self.set_tree(tree))
         self.mutator.failed.connect(self.library.errorMessage.emit)
         self.syncer.started.connect(lambda: s.document_sync.set_status(SyncStatus.Syncing))
@@ -159,6 +160,12 @@ class QuickApp:
         if self.source.writable and self.logged_in:
             self.mutator.run("Saving the reading position",
                              lambda sync, _: sync.set_reading_position(doc_id, page, opened_ms), "", quiet=True)
+
+    def _update_editing(self) -> None:
+        """The app's editing interface (UserInfo.featureToggles.clientEdit) is on while
+        every document shown is one the library lets this client edit."""
+        shown = self.library.open_documents()
+        self.singletons.user_info.set_client_edit(bool(shown) and all(self.source.can_edit(d) for d in shown))
 
     @property
     def logged_in(self) -> bool:
@@ -256,6 +263,7 @@ class QuickApp:
             QFontDatabase.addApplicationFont(font)
         register_types()
         set_page_source(lambda: self.source)
+        set_edit_notifier(self.library.errorMessage.emit)
         self.translator = QTranslator()
         self._translate(self.singletons.language.languageCode)
         self.singletons.language.on_change = self._language_changed
@@ -295,6 +303,7 @@ class QuickApp:
 
     def set_tree(self, tree: DocumentTree) -> None:
         self.library.set_tree(tree)
+        self._update_editing()
 
     def start(self, sync: bool = True) -> None:
         """Show the cached library; logged in, also start Screen Share and (`sync`) a sync.

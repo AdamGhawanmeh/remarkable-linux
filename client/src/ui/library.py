@@ -18,7 +18,8 @@ from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.sync import SyncClient, SyncError
+from core.edits import Edit, EditError, ImageDelete, ImageInsert, ImageTransform, document_files, page_with_edits
+from core.sync import SyncClient, SyncError, sha256_hex
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
@@ -302,11 +303,18 @@ class LibrarySource:
 
     `cached_only` keeps every read local (offline mode). Parsed scenes are kept in a
     small LRU so flipping pages back and forth does not re-parse.
+
+    `editable` names the notebooks whose pages may be edited here (none by default):
+    editing is being built feature by feature, and is tried on notebooks named for it.
+    Edits are kept locally (SyncClient.edits) and drawn over the cached pages; uploading
+    them is SyncClient.push_edits.
     """
 
-    def __init__(self, sync: SyncClient, *, cached_only: bool = False, scene_cache: int = 64) -> None:
+    def __init__(self, sync: SyncClient, *, cached_only: bool = False, scene_cache: int = 64,
+                 editable: tuple[str, ...] = ()) -> None:
         self.sync = sync
         self.cached_only = cached_only
+        self.editable = tuple(editable)
         self._scenes: OrderedDict[str, PageScene | None] = OrderedDict()
         self._scene_cache = scene_cache
         self._lock = threading.Lock()
@@ -334,19 +342,107 @@ class LibrarySource:
     def blob(self, doc: Document, name: str) -> bytes:
         return self.sync.get_blob(doc.files[name], name, cached_only=self.cached_only)
 
+    # -- editing ------------------------------------------------------------------
+
+    def edit_refusal(self, doc: Document | None) -> str:
+        """Why `doc` may not be edited here ("": it may): only a notebook, not in the
+        trash, whose name is one of `editable` and the only notebook of that name, so
+        an edit can never land on a document it was not meant for."""
+        if not self.editable:
+            return "Editing is not turned on"
+        tree = self.sync.tree
+        if not isinstance(doc, Document) or tree.get(doc.id) is None:
+            return "This document is not in the library"
+        if doc.name not in self.editable:
+            return f"Editing is only turned on for the notebook named {' or '.join(map(repr, self.editable))}"
+        if doc.file_type is not FileType.NOTEBOOK:
+            return "Only notebooks can be edited"
+        if tree.is_trashed(doc.id):
+            return "A document in the trash cannot be edited"
+        same = [n for n in tree.nodes.values() if isinstance(n, Document) and n.name == doc.name
+                and n.file_type is FileType.NOTEBOOK and not tree.is_trashed(n.id)]
+        if len(same) != 1:
+            return f"{len(same)} notebooks are named {doc.name!r}: editing needs the name to be of one notebook only"
+        return ""
+
+    def can_edit(self, doc: Document | None) -> bool:
+        return not self.edit_refusal(doc)
+
+    def pending_edits(self, doc: Document, page_id: str | None = None) -> list[Edit]:
+        return [e for e in self.sync.edits.of(doc.id) if page_id is None or e.page_id == page_id]
+
+    def insert_image(self, doc: Document, page_id: str, data: bytes, extension: str, vertices,
+                     now_ms: int) -> ImageInsert:
+        """Put an image (`data`: a PNG or JPEG file as the app stores one, see
+        ui.editing.encode_image) on a page, here only: the edit is kept with the cache
+        and drawn over the page until SyncClient.push_edits uploads it. EditError when
+        `doc` may not be edited, or the page cannot take the image safely."""
+        doc = self._editable(doc, page_id)
+        edit = ImageInsert.new(doc.id, page_id, extension, vertices, sha256_hex(data), len(data), now_ms)
+        self._add_edit(doc, edit, data)
+        return edit
+
+    def transform_image(self, doc: Document, page_id: str, key: bytes, vertices, now_ms: int) -> ImageTransform:
+        """Move, scale or turn an image of a page to new corners, here only (as
+        insert_image). EditError when not allowed or not possible safely."""
+        doc = self._editable(doc, page_id)
+        edit = ImageTransform.new(doc.id, page_id, key, vertices, now_ms)
+        self._add_edit(doc, edit)
+        return edit
+
+    def delete_image(self, doc: Document, page_id: str, key: bytes, now_ms: int) -> ImageDelete:
+        """Delete an image of a page, here only (as insert_image)."""
+        doc = self._editable(doc, page_id)
+        edit = ImageDelete.new(doc.id, page_id, key, now_ms)
+        self._add_edit(doc, edit)
+        return edit
+
+    def _editable(self, doc: Document, page_id: str) -> Document:
+        refusal = self.edit_refusal(doc)
+        if refusal:
+            raise EditError(refusal)
+        doc = self.sync.tree.get(doc.id)                # the document as last synced
+        if page_id not in {p.id for p in doc.content.pages if not p.deleted}:
+            raise EditError("this page is not in the document's page list")
+        return doc
+
+    def _add_edit(self, doc: Document, edit: Edit, data: bytes | None = None) -> None:
+        """Work the document out with `edit` before keeping it: an edit the writer refuses
+        leaves nothing behind."""
+        document_files(doc, self.sync.edits.of(doc.id) + [edit], lambda name: self.blob(doc, name),
+                       lambda e: data if e is edit else self.sync.edits.data(e), self.sync.author())
+        self.sync.edits.add(edit, data)
+        with self._lock:
+            self._scenes.clear()
+
+    def _page_data(self, doc: Document, page: PageRef) -> bytes | None:
+        """A page's .rm as it is to be shown: the cloud's file (None: the page has
+        none) with the pending edits of the page made to it."""
+        data = self.blob(doc, page.rm_name) if page.rm_name else None
+        edits = self.pending_edits(doc, page.page_id)
+        if not edits:
+            return data
+        try:
+            return page_with_edits(data, edits, self.sync.author())
+        except (EditError, RmParseError, ValueError) as err:
+            log.error("cannot show the pending edits of page %s: %s", page.page_id, err)
+            return data
+
     def page_scene(self, doc: Document, page: PageRef) -> PageScene | None:
-        """Parsed strokes/text for a page; None if the page has no .rm file."""
-        if page.rm_name is None:
+        """Parsed strokes/text for a page, with the edits made here that are not
+        uploaded yet; None if the page has no .rm file and no such edit."""
+        if page.rm_name is None and not self.pending_edits(doc, page.page_id):
             return None
-        key = doc.files[page.rm_name]
+        key = (doc.files.get(page.rm_name or "") or "", tuple(self.pending_edits(doc, page.page_id)))
         with self._lock:
             if key in self._scenes:
                 self._scenes.move_to_end(key)
                 return self._scenes[key]
         try:
-            scene = parse(self.blob(doc, page.rm_name))
+            data = self._page_data(doc, page)
+            scene = parse(data) if data is not None else None
         except RmParseError as err:
-            log.error("cannot parse %s: %s", page.rm_name, err)
+            log.error("cannot parse page %s: %s", page.page_id, err)
             scene = None
         if scene is not None:
             self._attach_images(doc, page, scene)
@@ -359,16 +455,17 @@ class LibrarySource:
     def _attach_images(self, doc: Document, page: PageRef, scene: PageScene) -> None:
         """Give each image item its file, stored with the document as
         "<doc>/<page>/<file name>". One that is missing or not cached stays undrawn."""
-        folder = page.rm_name.removesuffix(".rm")
+        folder = f"{doc.id}/{page.page_id}"
+        pending = {e.path: e for e in self.pending_edits(doc, page.page_id) if isinstance(e, ImageInsert)}
         for image in scene.placed_images:
             name = f"{folder}/{image.file_name}"
-            if not image.file_name or name not in doc.files:
-                log.warning("%s: image %s has no file %r", page.rm_name, image.item_id, image.file_name)
+            if not image.file_name or (name not in doc.files and name not in pending):
+                log.warning("%s: image %s has no file %r", folder, image.item_id, image.file_name)
                 continue
             try:
-                image.data = self.blob(doc, name)
-            except (SyncError, OSError) as err:
-                log.warning("%s: image %s: %s", page.rm_name, image.file_name, err)
+                image.data = self.blob(doc, name) if name in doc.files else self.sync.edits.data(pending[name])
+            except (SyncError, EditError, OSError) as err:
+                log.warning("%s: image %s: %s", folder, image.file_name, err)
 
     def pagedata(self, doc: Document) -> list[str] | None:
         """Legacy per-page template names, when the document has a .pagedata file."""

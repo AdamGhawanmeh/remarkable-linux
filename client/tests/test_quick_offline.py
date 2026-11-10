@@ -912,6 +912,202 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue((self.out / "after.pdf").exists())
 
 
+class EditingTests(unittest.TestCase):
+    """Editing, through the app's own QML: its editing interface is on only in the notebook
+    the library lets this client edit, and an image file dropped there (DocumentViewport's
+    drop area -> SceneController.insertImageFileAsSceneItem) is put on the page here,
+    without anything being uploaded."""
+
+    wait_for, qml, scene_views = WorkflowTests.wait_for, WorkflowTests.qml, WorkflowTests.scene_views
+    open_document, close_document = WorkflowTests.open_document, WorkflowTests.close_document
+
+    @classmethod
+    def setUpClass(cls):
+        from test_edits_offline import OTHER, PAGE1, THROWAWAY, build_cloud, png
+        cls.THROWAWAY, cls.OTHER, cls.PAGE1 = THROWAWAY, OTHER, PAGE1
+        cls.tmp = tempfile.TemporaryDirectory()
+        tmp = cls.dir = Path(cls.tmp.name)
+        cls.cloud = build_cloud()
+        cls.source = LibrarySource(SyncClient(paired_auth(tmp / "auth", cls.cloud), tmp / "cache"),
+                                   editable=("throwaway",))
+        cls.source.refresh()
+        cls.app = QuickApp(cls.source, tmp / "cache", config_dir=tmp)
+        cls.app.load()
+        cls.app.start(sync=False)
+        wait(800)
+        cls.window = cls.app.window
+        cls.window.resize(1270, 875)
+        cls.notices: list[str] = []
+        cls.app.library.errorMessage.connect(cls.notices.append)
+        cls.picture = tmp / "picture.png"
+        cls.picture.write_bytes(png(200, 100, color="#d02020"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.app.shutdown()
+        del cls.window
+        gc.collect()
+        cls.app.engine.deleteLater()
+        wait(50)
+        cls.tmp.cleanup()
+
+    def setUp(self):
+        self.notices.clear()
+
+    def tearDown(self):
+        self.close_document()
+        self.source.sync.edits.clear()
+
+    def editing(self) -> bool:
+        return self.app.singletons.user_info.property("featureToggles")["clientEdit"]
+
+    def drop_area(self) -> QObject:
+        return next(o for o in self.window.findChildren(QObject)
+                    if o.metaObject().indexOfMethod("dropSupportedImages(QVariant,QVariant)") >= 0)
+
+    def pending(self) -> list:
+        return self.source.sync.edits.all()
+
+    def test_the_editing_interface_is_on_only_in_the_notebook_that_may_be_edited(self):
+        self.assertFalse(self.editing())
+        self.open_document(self.OTHER)
+        self.assertFalse(self.editing())
+        self.assertFalse(self.drop_area().property("enabled"))
+        self.close_document()
+        self.open_document(self.THROWAWAY)
+        self.assertTrue(self.editing())
+        self.assertTrue(self.wait_for(lambda: self.drop_area().property("enabled")))
+        wait(300)
+        self.close_document()
+        self.assertFalse(self.editing())
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_an_image_dropped_on_the_page_is_put_there_and_stays_on_this_computer(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.assertTrue(self.wait_for(lambda: view._image is not None))
+        files = dict(self.cloud.item(self.THROWAWAY))
+        point = QPointF(view.width() / 2 + 40, 300)
+        target = view._tiles.viewToScene(point)
+        QMetaObject.invokeMethod(self.drop_area(), "dropSupportedImages",
+                                 Q_ARG("QVariant", [QUrl.fromLocalFile(str(self.picture))]), Q_ARG("QVariant", point))
+        self.assertTrue(self.wait_for(self.pending), self.notices)
+        [edit] = self.pending()
+        self.assertEqual((edit.doc_id, edit.page_id, edit.file_name[-4:]), (self.THROWAWAY, self.PAGE1, ".png"))
+        xs, ys = [v[0] for v in edit.vertices], [v[1] for v in edit.vertices]
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2, target.x(), places=3)   # centred where it was dropped
+        self.assertAlmostEqual((min(ys) + max(ys)) / 2, target.y(), places=3)
+        self.assertEqual((max(xs) - min(xs), max(ys) - min(ys)), (200, 100))    # a scene unit a pixel
+        # The page is drawn again with the picture on it.
+        self.assertTrue(self.wait_for(lambda: view._content is not None and view._content.scene is not None
+                                      and len(view._content.scene.placed_images) == 1))
+        # It is selected (drawn in the selection box): once the selection ends, the page has it.
+        self.assertTrue(self.wait_for(lambda: self.handler().property("visible")))
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "endItemSelection")
+        self.assertTrue(self.wait_for(lambda: view._selected is None))
+
+        def red_where_dropped() -> bool:
+            image, spot = view._image, view._tiles.sceneToView(target)
+            box = view._tiles.sceneToView(view._bounds)
+            x = round((spot.x() - box.x()) * image.width() / box.width())
+            y = round((spot.y() - box.y()) * image.height() / box.height())
+            color = QColor(image.pixel(x, y))
+            return color.red() > 180 and color.green() < 80
+        self.assertTrue(self.wait_for(red_where_dropped))
+        self.assertEqual(view.property("status"), 2)
+        self.assertEqual(self.cloud.item(self.THROWAWAY), files)                # the cloud's copy is untouched
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def handler(self) -> QObject:
+        return next(o for o in self.window.findChildren(QObject)
+                    if o.metaObject().indexOfMethod("moveSelectedItems(QVariant,QVariant)") >= 0
+                    and o.metaObject().indexOfProperty("sceneSelectionRect") >= 0)
+
+    def test_a_dropped_image_is_selected_then_moves_resizes_and_deletes(self):
+        from core.edits import ImageDelete, ImageInsert, ImageTransform
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        viewport = self.qml("DocumentViewport")
+        point = QPointF(view.width() / 2, 300)
+        QMetaObject.invokeMethod(self.drop_area(), "dropSupportedImages",
+                                 Q_ARG("QVariant", [QUrl.fromLocalFile(str(self.picture))]), Q_ARG("QVariant", point))
+        handler = self.handler()
+        # Dropped: selected at once, the app's selection box on it.
+        self.assertTrue(self.wait_for(lambda: handler.property("visible")), self.notices)
+        [insert] = self.pending()
+        rect = handler.property("sceneSelectionRect")
+        xs = [v[0] for v in insert.vertices]
+        self.assertAlmostEqual(rect.x(), min(xs), places=2)
+        self.assertEqual((rect.width(), rect.height()), (200, 100))
+        self.assertTrue(view._controller.property("selectionContainsImage"))
+        self.assertTrue(self.wait_for(lambda: view.selected_image() is not None))
+        # Dragging the box moves the image (SceneSelectionHandler.moveSelectedItems).
+        QMetaObject.invokeMethod(handler, "moveSelectedItems", Q_ARG("QVariant", 30), Q_ARG("QVariant", 40))
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2))
+        move = self.pending()[1]
+        self.assertIsInstance(move, ImageTransform)
+        self.assertEqual(move.key, insert.key)
+        self.assertEqual(move.vertices[0][:2], (insert.vertices[0][0] + 30, insert.vertices[0][1] + 40))
+        self.assertTrue(self.wait_for(lambda: handler.property("sceneSelectionRect").x() == rect.x() + 30))
+        # A corner handle scales about the opposite corner.
+        view._controller.scaleSelectedItems(view._controller.property("currentLayer"),
+                                            QPointF(min(xs) + 30, rect.y() + 40), 2.0, 2.0)
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 3))
+        self.assertTrue(self.wait_for(lambda: handler.property("sceneSelectionRect").width() == 400))
+        # Clicking elsewhere ends the selection; clicking the image selects it again.
+        QMetaObject.invokeMethod(viewport, "endItemSelection")
+        self.assertTrue(self.wait_for(lambda: not handler.property("visible")))
+        self.assertIsNone(view._selected)
+        inside = QPointF(min(xs) + 30 + 50, rect.y() + 40 + 50)
+        self.assertTrue(view._controller.selectImageAtPoint(inside, view._controller.property("currentLayer")))
+        viewport.setProperty("selectionMode", True)
+        self.assertTrue(self.wait_for(lambda: handler.property("visible")))
+        self.assertFalse(view._controller.selectImageAtPoint(QPointF(600, 1800), 0))
+        # Backspace deletes it.
+        view.processKey(int(Qt.Key.Key_Backspace.value), 0, False, "")
+        self.assertTrue(self.wait_for(lambda: isinstance(self.pending()[-1], ImageDelete)))
+        self.assertTrue(self.wait_for(lambda: not handler.property("visible")))
+        self.assertTrue(self.wait_for(lambda: view._content.scene is not None
+                                      and len(view._content.scene.placed_images) == 0))
+        self.assertEqual([type(e) for e in self.pending()], [ImageInsert, ImageTransform, ImageTransform, ImageDelete])
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_cut_does_not_lose_the_image(self):
+        from core.edits import ImageDelete
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        QMetaObject.invokeMethod(self.drop_area(), "dropSupportedImages",
+                                 Q_ARG("QVariant", [QUrl.fromLocalFile(str(self.picture))]),
+                                 Q_ARG("QVariant", QPointF(view.width() / 2, 300)))
+        self.assertTrue(self.wait_for(lambda: self.handler().property("visible")))
+        layer = view._controller.property("currentLayer")
+        view._controller.cloneSelectedItems(layer, 1.0)            # what Cut does: copy...
+        view._controller.deleteSelectedItems(layer)                # ...then delete
+        wait(300)
+        self.assertFalse(any(isinstance(e, ImageDelete) for e in self.pending()))
+        self.assertIn("Copying images is not available on Linux yet", self.notices)
+
+    def test_another_notebook_is_never_edited(self):
+        view = self.open_document(self.OTHER)
+        view._controller.insertImageFileAsSceneItem(QUrl.fromLocalFile(str(self.picture)), QPointF(0, 300))
+        wait(300)
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("only turned on for the notebook named 'throwaway'", self.notices[0])
+
+    def test_a_file_that_is_not_an_image_changes_nothing(self):
+        broken = self.dir / "broken.png"
+        broken.write_bytes(b"not an image")
+        view = self.open_document(self.THROWAWAY)
+        view._controller.insertImageFileAsSceneItem(QUrl.fromLocalFile(str(broken)), QPointF(0, 300))
+        self.assertTrue(self.wait_for(lambda: self.notices))
+        self.assertIn("Could not read the image broken.png", self.notices[0])
+        view._controller.insertImageFileAsSceneItem(QUrl("https://example.com/a.png"), QPointF(0, 300))
+        self.assertTrue(self.wait_for(lambda: len(self.notices) == 2))
+        self.assertIn("on this computer", self.notices[1])
+        self.assertEqual(self.pending(), [])
+        self.assertEqual(view.property("status"), 2)
+
+
 class FakeNetwork(QObject):
     """Stands in for QNetworkInformation (LinkProvider's `information`)."""
 

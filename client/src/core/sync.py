@@ -61,6 +61,7 @@ from typing import Any, Callable, Iterable
 
 from .auth import AuthClient, HttpResponse
 from .config import atomic_write_json, cache_dir, ensure_private_dir, read_json
+from .edits import EditError, ImageDelete, ImageInsert, ImageTransform, PendingEdits, document_files
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
                      new_document_content, new_folder_content, new_metadata)
@@ -319,6 +320,98 @@ class ItemChange:
     data: dict[str, bytes] = field(default_factory=dict)
 
 
+@dataclass
+class FileChange:
+    """One file an upload adds (old_* None) or replaces."""
+    name: str
+    size: int
+    sha256: str
+    old_sha256: str | None
+    old_size: int | None
+
+
+def json_changes(old: Any, new: Any, path: str = "") -> list[tuple[str, Any, Any]]:
+    """(field, old value, new value) for each difference between two JSON values; a
+    field of an entry of a list of objects with ids reads "pages[id=...].field"."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        out = []
+        for key in sorted(set(old) | set(new)):
+            where = f"{path}.{key}" if path else str(key)
+            if key not in old:
+                out.append((where, None, new[key]))
+            elif key not in new:
+                out.append((where, old[key], None))
+            else:
+                out += json_changes(old[key], new[key], where)
+        return out
+    if isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
+        out = []
+        for n, (a, b) in enumerate(zip(old, new)):
+            label = f"id={b['id']}" if isinstance(b, dict) and isinstance(a, dict) and a.get("id") == b.get("id") \
+                and "id" in b else str(n)
+            out += json_changes(a, b, f"{path}[{label}]")
+        return out
+    return [] if old == new and type(old) is type(new) else [(path, old, new)]
+
+
+@dataclass
+class PushPlan:
+    """What uploading a document's pending edits would send (SyncClient.push_plan)."""
+    doc_id: str
+    edits: list  # core.edits.Edit
+    generation: int                 # of the cached root the plan was worked out from
+    root_hash: str
+    schema: int
+    files: list[FileChange]         # document files to upload, in upload order
+    fields: dict[str, list[tuple[str, Any, Any]]]    # .content/.metadata: (field, old, new)
+    index_hash: str                 # the document's new index (<id>.docSchema)
+    index_data: bytes
+    old_index_hash: str
+    trashed: bool
+    removed: list[FileChange] = field(default_factory=list)     # files the document no longer has
+
+    def describe(self) -> str:
+        lines = [f"Document  {self.doc_id}" + ("   (IN THE TRASH: the upload would be refused)" if self.trashed else ""),
+                 f"Based on  root generation {self.generation}, root index {self.root_hash[:12]}… (schema {self.schema}), "
+                 f"as cached; the upload re-reads the cloud first"]
+        if not self.files:
+            return "\n".join(lines + ["Nothing to upload: the document already has these edits."])
+        lines.append(f"Edits     {len(self.edits)}, applied in this order")
+        for e in self.edits:
+            if isinstance(e, ImageDelete):
+                lines.append(f"  delete image {e.key} on page {e.page_id}")
+                continue
+            xs, ys = [v[0] for v in e.vertices], [v[1] for v in e.vertices]
+            where = f"x {min(xs):g}..{max(xs):g}, y {min(ys):g}..{max(ys):g} (scene units, x 0 = page centre)"
+            if isinstance(e, ImageTransform):
+                lines.append(f"  move/resize image {e.key} on page {e.page_id}\n    to {where}")
+            else:
+                lines.append(f"  image on page {e.page_id}\n"
+                             f"    file {e.file_name}  ({e.size} bytes, sha256 {e.sha256[:12]}…), images-table key {e.key}\n"
+                             f"    placed {where}")
+        for name, changes in self.fields.items():
+            lines.append(f"Fields changed in {name}")
+            lines += [f"  {field}: {json.dumps(old)} -> {json.dumps(new)}" for field, old, new in changes] or ["  (none)"]
+        lines.append(f"Files to upload ({len(self.files)} document files, then 2 indexes)")
+        for n, f in enumerate(self.files, 1):
+            what = "new" if f.old_sha256 is None else f"replaces {f.old_size} bytes, sha256 {f.old_sha256[:12]}…"
+            lines.append(f"  {n}. PUT {FILES_PATH}{f.sha256}\n       rm-filename: {f.name}   {f.size} bytes   ({what})")
+        for f in self.removed:
+            lines.append(f"  (removed from the document's index, not deleted from the cloud's storage: "
+                         f"{f.name}, {f.old_size} bytes)")
+        n = len(self.files)
+        lines.append(f"  {n + 1}. PUT {FILES_PATH}{self.index_hash}\n       rm-filename: {self.doc_id}.docSchema   "
+                     f"{len(self.index_data)} bytes   (the document's index; replaces {self.old_index_hash[:12]}…)")
+        lines.append(f"  {n + 2}. PUT {FILES_PATH}<new root index>\n       rm-filename: {ROOT_INDEX_NAME}   "
+                     f"(the root index with this document's row changed; every other row as the cloud has it)")
+        lines.append(f"Then      PUT {ROOT_V3_PATH}  {{\"generation\": <current, {self.generation} as cached>, "
+                     f"\"hash\": <new root index>}}\n"
+                     f"          refused by the cloud if another device synced meanwhile: then re-read, re-apply, retry")
+        lines.append("The document's new index:")
+        lines += ["  " + row for row in self.index_data.decode().splitlines()]
+        return "\n".join(lines)
+
+
 # ------------------------------------------------------------------ blob cache
 
 class BlobCache:
@@ -405,6 +498,7 @@ class SyncClient:
         self.tree = DocumentTree()
         self.root_index: Index | None = None
         self.throttled = False                # the cloud answered 429 during this refresh
+        self.edits = PendingEdits(self.root_dir / "pending")    # made here, not uploaded yet
 
     # -- transport ------------------------------------------------------------
 
@@ -563,6 +657,7 @@ class SyncClient:
             self.root = None
             self.root_index = None
             self.tree = DocumentTree()
+            self.edits.clear()
 
     def _apply_root(self, root: RootInfo,
                     progress: Callable[[int, int, bool], None] | None = None) -> DocumentTree:
@@ -901,6 +996,85 @@ class SyncClient:
         with self._busy:
             tree = self.refresh()
             return self.delete(n.id for n in tree.nodes.values() if n.in_trash)
+
+    # -- edits made here ---------------------------------------------------------
+
+    def author(self) -> bytes:
+        """This device's author UUID in the pages it edits (viewer.rm_writer.author_uuid)."""
+        from viewer.rm_writer import author_uuid
+        device_id = self.auth.state.device_id if self.auth.is_paired else ""
+        if not device_id:
+            raise EditError("editing needs this app to be logged in: pages record who changed them")
+        return author_uuid(device_id)
+
+    def staged_files(self, doc: Document, cached_only: bool = True,
+                     edits: list | None = None) -> dict[str, bytes | None]:
+        """The files of `doc` that its pending edits add or change, by name
+        (core.edits.document_files): what the viewer shows and push_edits uploads."""
+        edits = self.edits.of(doc.id) if edits is None else edits
+        if not edits:
+            return {}
+        return document_files(doc, edits, lambda name: self.get_blob(doc.files[name], name, cached_only=cached_only),
+                              self.edits.data, self.author())
+
+    def push_plan(self, doc_id: str) -> "PushPlan":
+        """What push_edits(doc_id) would upload, worked out from the cached library
+        without any network access."""
+        if self.root is None:
+            self.load_cached()
+        doc = self._document(doc_id)
+        edits = self.edits.of(doc_id)
+        files = self.staged_files(doc, cached_only=True, edits=edits)
+        entries = {e.id: e for e in self.get_index(doc.hash, f"{doc.id}.docSchema", cached_only=True).entries}
+        changes, fields = [], {}
+        removed = []
+        for name, data in sorted(files.items()):
+            old = entries.get(name)
+            if data is None:
+                entries.pop(name, None)
+                removed.append(FileChange(name, 0, "", old.hash if old else None, old.size if old else None))
+                continue
+            entries[name] = entry = file_entry(name, data)
+            changes.append(FileChange(name, entry.size, entry.hash, old.hash if old else None, old.size if old else None))
+            if name.endswith((".content", ".metadata")) and old is not None:
+                before = json.loads(self.get_blob(old.hash, name, cached_only=True))
+                fields[name] = json_changes(before, json.loads(data))
+        index_hash, index_data = build_index(self.root.schema_version, entries.values(), doc.id)
+        return PushPlan(doc.id, edits, self.root.generation, self.root.hash, self.root.schema_version, changes,
+                        fields, index_hash, index_data, doc.hash, self.tree.is_trashed(doc_id), removed)
+
+    def push_edits(self, doc_id: str, progress: Callable[[int, int], None] | None = None) -> DocumentTree:
+        """Upload the pending edits of a document: its changed files, its index, the
+        root (_commit). The edits are applied to the document as the cloud has it at
+        that moment, so what another device changed meanwhile is kept; once the cloud
+        has them they are no longer pending."""
+        edits = self.edits.of(doc_id)
+        if not edits:
+            return self.tree
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            node = tree.get(doc_id)
+            if not isinstance(node, Document) or tree.is_trashed(doc_id):
+                raise SyncError("the edited document is no longer in the library")
+            try:
+                files = self.staged_files(node, cached_only=False, edits=edits)
+            except EditError as err:
+                raise SyncError(str(err)) from err
+            if not files:
+                return []                               # the cloud has these edits already
+            entries = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
+            data: dict[str, bytes] = {}
+            for name, blob in files.items():
+                if blob is None:                        # no longer used: out of the document
+                    entries.pop(name, None)
+                    continue
+                entries[name] = entry = file_entry(name, blob)
+                data[entry.hash] = blob
+            return [ItemChange(node.id, entries, data)]
+
+        tree = self._commit(f"edits of {doc_id}", edit, progress)
+        self.edits.discard(edits)
+        return tree
 
     # -- local vs remote state --------------------------------------------------
 

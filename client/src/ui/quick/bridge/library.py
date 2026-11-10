@@ -858,6 +858,7 @@ class Library(QObject):
     changing = Signal()          # before `changed`: LibraryView takes its new ids
     changed = Signal()
     statusChanged = Signal(str)
+    openDocumentsChanged = Signal()     # a DocumentViewport opened or closed a document
 
     def __init__(self, parent: QObject | None = None, now: Callable[[], datetime] | None = None) -> None:
         super().__init__(parent)
@@ -898,12 +899,18 @@ class Library(QObject):
             entry.reading_position_changed()
         self._save_timer.start()
 
+    def open_documents(self) -> list:
+        """The documents shown in a DocumentViewport, as the tree has them now."""
+        return [node for node in map(self.tree.get, sorted(self._open)) if node is not None]
+
     def document_opened(self, doc_id: str) -> None:
         self._open.add(doc_id)
+        self.openDocumentsChanged.emit()
 
     def document_closed(self, doc_id: str) -> None:
         self._open.discard(doc_id)
         self._save_timer.start()
+        self.openDocumentsChanged.emit()
 
     def save_reading_positions(self, include_open: bool = False) -> None:
         """Send unsaved reading positions to the cloud: of closed documents only (saving

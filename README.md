@@ -144,8 +144,11 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 319 offline tests use a fake cloud and synthetic documents; they need no account
+The 403 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
+`client/tools/rm_roundtrip.py` checks the page writer against your own cached pages:
+every page must come back byte for byte, and take an image without any existing block
+changing (it prints counts only).
 
 ## Feature status and roadmap
 
@@ -178,6 +181,7 @@ when you use them.
 | Area | Status |
 |---|---|
 | Editing pages | Drawing, typed text (creating or editing text notes), new notebooks and quick sheets are not available. The app's own client-editing feature is off, so the UI hides or disables them, as the official app does without it. |
+| Images on notebook pages (experimental) | Being built first of the editing features, and off unless asked for: `client/run.py --edit-notebook NAME` turns the app's editing interface on for the one notebook with that name. There, a PNG or JPEG file dropped on a page is put on it, stored as the official app stores one (scaled to at most 3200 px, PNG with transparency or else JPEG, at most 3 MiB); the page's existing content is kept byte for byte. The dropped image is selected in the app's own selection box; clicking an image (also one placed on the tablet) selects it. Drag the box to move it, a corner to resize, the round handle to turn it; Delete, Backspace or the bin icon deletes it. A move is saved the way the tablet saves one (the old item deleted, a new one with a `moveId`), and a deleted image's file leaves the document. The edit stays on this computer until `client/tools/push_edits.py` uploads it: run without arguments it prints exactly what would be sent, and uploads only with `--confirm DOCUMENT_ID`. Copy, cut, undo and selecting strokes are not there yet (cut refuses rather than deleting), and the other editing tools the interface shows (pens, text, page actions) do nothing yet. The first time editing turns on, the official app's "Desktop note-taking" introduction is shown. |
 | Page management | Adding, moving, copying, duplicating and deleting pages are part of editing: disabled. |
 | Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
 | Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |

@@ -749,6 +749,7 @@ class UserInfo(QObject):
         self._values = {"id": "", "name": "", "username": "", "email": email, "tectonic": ""}
         self._account_type = 2
         self._created_at = 0
+        self._client_edit = False
 
     def _value(key: str):
         return lambda self: self._values[key]
@@ -788,8 +789,15 @@ class UserInfo(QObject):
         self._created_at = int(value)
         self.createdAtChanged.emit(self._created_at)
 
-    # clientEdit: notebook editing in the desktop app, which this client does not do.
-    featureToggles = Property("QVariantMap", lambda self: {"clientEdit": False}, notify=scopesChanged)
+    def set_client_edit(self, on: bool) -> None:
+        """Turn the app's notebook editing interface on or off (main.qml:
+        actions.canEditDocuments). On only while the document shown may be edited here
+        (LibrarySource.editable): elsewhere the interface stays the reader's."""
+        if bool(on) != self._client_edit:
+            self._client_edit = bool(on)
+            self.scopesChanged.emit([])
+
+    featureToggles = Property("QVariantMap", lambda self: {"clientEdit": self._client_edit}, notify=scopesChanged)
     id = Property(str, _value("id"), notify=idChanged)
     name = Property(str, _value("name"), notify=nameChanged)
     username = Property(str, _value("username"), notify=usernameChanged)
