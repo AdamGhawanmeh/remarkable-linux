@@ -153,8 +153,14 @@ def text_item(item, left, right=ZERO, text: str | None = None, deleted: int = 0,
     return tag(0, 0xC) + struct.pack("<I", len(body)) + body
 
 
-def paragraph_format(char_id, style: int, timestamp=TS) -> bytes:
-    return bytes([char_id[0]]) + varuint(char_id[1]) + f_id(1, timestamp) + f_sub(2, bytes([17, style]))
+def paragraph_format(char_id, style: int, timestamp=TS, base: int | None = None,
+                     properties: int | None = None) -> bytes:
+    """A paragraph style entry. `style` is the "style_legacy" byte (1 body text, 2 title,
+    3 subheading 2, 4 bullet, ...); `base` and `properties` are the newer fields."""
+    value = f_u8(1, style)
+    if base is not None:
+        value += f_u8(2, base) + f_u32(3, properties or 0)
+    return bytes([char_id[0]]) + varuint(char_id[1]) + f_id(1, timestamp) + f_sub(2, value)
 
 
 def root_text(items: list[bytes], formats: list[bytes], *, x: float = -468.0, y: float = 234.0,
@@ -167,26 +173,65 @@ def root_text(items: list[bytes], formats: list[bytes], *, x: float = -468.0, y:
     return block(0x07, payload)
 
 
+def encode_root_text(root) -> bytes:
+    """The payload of a RootText block from its parts (a viewer.rm_parser.RootText, or
+    anything shaped like one), written out the way reMarkable.exe does it (0x14091ff90,
+    0x1409203b0, 0x14091fd50, 0x14091f9d0, 0x1409103b0): the fields in their order, a
+    value only on entries with nothing deleted, the format only when it is set, the
+    newer style fields only when given, unknown bytes at the end of their level."""
+    unknown = root.unknown.get
+    items = []
+    for item in root.items:
+        body = f_id(2, item.item_id) + f_id(3, item.left) + f_id(4, item.right) + f_u32(5, item.deleted_length)
+        if item.data is not None:
+            value = varuint(len(item.data)) + bytes([item.utf_type]) + item.data
+            if item.format:
+                value += f_u32(2, item.format)
+            body += f_sub(6, value + item.value_rest)
+        items.append(f_sub(0, body + item.rest))
+    styles = []
+    for entry in root.styles:
+        value = b"" if entry.legacy is None else f_u8(1, entry.legacy)
+        if entry.base_style is not None:
+            value += f_u8(2, entry.base_style)
+        if entry.properties is not None:
+            value += f_u32(3, entry.properties)
+        styles.append(bytes([entry.char_id[0]]) + varuint(entry.char_id[1]) + f_id(1, entry.timestamp)
+                      + f_sub(2, value + entry.rest))
+    sequence = f_sub(1, varuint(len(items)) + b"".join(items) + unknown("items", b"")) + unknown("sequence", b"")
+    formatting = (f_sub(1, varuint(len(styles)) + b"".join(styles) + unknown("styles", b""))
+                  + unknown("formatting", b""))
+    payload = (f_id(1, root.block_id)
+               + f_sub(2, f_sub(1, sequence) + f_sub(2, formatting) + unknown("text", b""))
+               + f_sub(3, struct.pack("<dd", root.x, root.y) + unknown("position", b""))
+               + f_f32(4, root.width_legacy))
+    if root.width is not None or "settings" in root.unknown:
+        lww = b"" if root.width is None else \
+            f_sub(1, f_id(1, root.width_timestamp) + f_f32(2, root.width) + unknown("width", b""))
+        payload += f_sub(5, lww + unknown("settings", b""))
+    return payload + unknown("root", b"")
+
+
 def sample_text_block() -> bytes:
     """'TiXtle' (Title) + bullet 'Hello' with 'Hel' bold.
 
-    Items are deliberately out of file order: 'X' is inserted inside 'Title' and
-    listed first; a deleted run and a later-timestamped style override are included.
+    'X' was put inside 'Title' and the bold markers around 'Hel' afterwards; a deleted
+    run and a later-timestamped style override are included.
     """
     return root_text(
-        items=[
-            text_item((1, 50), left=(1, 2), right=(1, 3), text="X"),
+        items=[                                                       # by rising id, as typed
             text_item((1, 1), left=ZERO, text="Title"),
             text_item((1, 6), left=(1, 5), text="\n"),
-            text_item((1, 40), left=(1, 6), right=(1, 7), fmt=1),     # bold on
-            text_item((1, 7), left=(1, 40), text="Hello"),
-            text_item((1, 41), left=(1, 9), right=(1, 10), fmt=2),    # bold off
+            text_item((1, 7), left=(1, 6), text="Hello"),
             text_item((1, 30), left=(1, 11), deleted=2),
+            text_item((1, 40), left=(1, 6), right=(1, 7), fmt=1),     # bold from here ...
+            text_item((1, 41), left=(1, 9), right=(1, 10), fmt=2),    # ... to here
+            text_item((1, 50), left=(1, 2), right=(1, 3), text="X"),
         ],
         formats=[
-            paragraph_format(ZERO, 0),                       # Title
-            paragraph_format((1, 6), 2, timestamp=(1, 1)),   # Paragraph ...
-            paragraph_format((1, 6), 3, timestamp=(1, 9)),   # ... overridden: Bulletpoint
+            paragraph_format(ZERO, 2),                       # Title
+            paragraph_format((1, 6), 1, timestamp=(1, 1)),   # Paragraph ...
+            paragraph_format((1, 6), 4, timestamp=(1, 9)),   # ... overridden: Bulletpoint
         ],
         lww_width=1000.0)
 

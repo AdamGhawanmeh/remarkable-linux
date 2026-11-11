@@ -20,7 +20,7 @@ v6: a sequence of blocks, each framed as
     Block types and names come from reMarkable.exe's own table (BLOCK_NAMES).
     Layers are TreeNode blocks (0x02) attached under the root node (0:1) by
     group items (0x04); strokes are line items (0x05) whose parent is the layer;
-    typed text is a RootText block (0x07, see _decode_root_text); inserted images
+    typed text is a RootText block (0x07, see decode_root_text); inserted images
     are CrdtImageItem (0x0F) plus a SceneImagesTable (0x0E). Line points are 14 bytes in block version 2
     (f32 x, f32 y, u16 speed*4, u16 width*4, u8 direction*255/2pi, u8 pressure*255)
     and six f32 (24 bytes) in version 1.
@@ -215,7 +215,9 @@ class Layer:
 
 
 class ParagraphStyle(IntEnum):
-    """Paragraph types; values are the index into reMarkable.exe's name table."""
+    """Paragraph types as the app's text menu names them (scene::ParagraphStyle::Type;
+    the value is the index into reMarkable.exe's name table). A file does not store
+    these numbers: see StyleEntry."""
 
     TITLE = 0
     SUBHEADING_2 = 1
@@ -230,14 +232,137 @@ class ParagraphStyle(IntEnum):
     NUMBERED_LIST_INDENTED = 10
     IMAGE_BLOCK = 11
     SUBHEADING = 12
-    UNKNOWN = -1
 
-    @classmethod
-    def parse(cls, value: int) -> "ParagraphStyle":
-        try:
-            return cls(value)
-        except ValueError:
-            return cls.UNKNOWN
+
+# A paragraph's style in memory is {u8 base, u32 properties} (the first byte of the
+# properties is the heading level):
+#   base 1 nothing; 2 text, level 0 body, 1 title, 2 subheading 2, 3 subheading;
+#        3 list, properties = indent | kind << 4 | state << 8, kind 0 bullet, 1 checkbox,
+#          2 numbered, state 1 checked; 4 image.
+STYLE_NONE, STYLE_TEXT, STYLE_LIST, STYLE_IMAGE = 1, 2, 3, 4
+
+
+def _style_from_legacy(legacy: int) -> tuple[int, int]:
+    """(base, properties) of a "style_legacy" byte (0x140a92600)."""
+    if 1 <= legacy <= 3:
+        return STYLE_TEXT, legacy - 1
+    if 4 <= legacy <= 11:
+        kind = 0 if legacy < 6 else 1 if legacy < 10 else 2
+        return STYLE_LIST, (legacy in (5, 8, 9, 11)) | kind << 4 | (legacy in (7, 9)) << 8
+    return (STYLE_IMAGE, 0) if legacy == 12 else (STYLE_NONE, 0)
+
+
+def _style_to_legacy(base: int, properties: int) -> int:
+    """The "style_legacy" byte of a style (0x140a93100)."""
+    if base == STYLE_TEXT:
+        return {1: 2, 2: 3, 3: 3}.get(properties & 0xFF, 1)
+    if base == STYLE_LIST:
+        indented, kind = bool(properties & 0xF), properties >> 4 & 0xF
+        if kind == 1:
+            return (7 if properties >> 8 & 7 == 1 else 6) + 2 * indented
+        return (10 if kind == 2 else 4) + indented
+    return 12 if base == STYLE_IMAGE else 0
+
+
+# "style_legacy" -> Type (0x1408b6340); 0 (nothing) and 1 (body) are both Paragraph.
+_LEGACY_TYPE = {2: ParagraphStyle.TITLE, 3: ParagraphStyle.SUBHEADING_2,
+                **{legacy: ParagraphStyle(legacy - 1) for legacy in range(4, 13)}}
+
+
+@dataclass(frozen=True)
+class TextItem:
+    """One entry of a RootText's character sequence, as the file stores it.
+
+    An entry is a run of text typed in one go, a run of deleted characters, or one
+    inline format marker. Its characters have the ids item_id, item_id + 1, ...: one
+    per UTF-16 unit (the app counts in QString units), one for a marker,
+    `deleted_length` for a deleted run. `left` and `right` are the ids the run was put
+    between ((0, 0): the start, the end)."""
+
+    item_id: tuple[int, int]
+    left: tuple[int, int]
+    right: tuple[int, int]
+    deleted_length: int = 0
+    data: bytes | None = None       # the string's bytes; None: the entry has no value
+    utf_type: int = 1               # the byte after the string's length; the app reads only 1 (UTF-8)
+    format: int = 0                 # FORMAT_*; 0: text
+    value_rest: bytes = b""         # bytes of the value this parser does not know
+    rest: bytes = b""               # bytes of the entry this parser does not know
+
+    @property
+    def text(self) -> str:
+        if self.data is None or self.utf_type != 1:
+            return ""
+        return self.data.decode("utf-8", errors="replace")
+
+    @property
+    def kind(self) -> str:
+        """"deleted", "format" or "text"."""
+        return "deleted" if self.deleted_length or self.data is None else "format" if self.format else "text"
+
+    @property
+    def length(self) -> int:
+        """How many ids the entry takes (0x1409164b0)."""
+        if self.deleted_length:
+            return self.deleted_length
+        return 1 if self.format else len(self.text.encode("utf-16-le")) // 2
+
+
+@dataclass(frozen=True)
+class StyleEntry:
+    """The style of one paragraph, as the file stores it: keyed by the id of the
+    newline that starts the paragraph ((0, 0): the first paragraph), last write wins.
+
+    `legacy` is the "style_legacy" byte every writer stores: 0 nothing, 1 body text,
+    2 title, 3 subheading 2, 4 bullet, 5 indented bullet, 6 checkbox, 7 checked,
+    8 indented checkbox, 9 indented and checked, 10 numbered, 11 indented numbered,
+    12 image. `base_style` and `properties` are stored as well when the legacy byte
+    cannot say it all (a "Subheading", level 3, and every indented list: 0x140a92b30),
+    and then they are what the app reads."""
+
+    char_id: tuple[int, int]
+    timestamp: tuple[int, int]
+    legacy: int | None = None
+    base_style: int | None = None
+    properties: int | None = None
+    rest: bytes = b""               # bytes of the value this parser does not know
+
+    @property
+    def base(self) -> tuple[int, int]:
+        """(base, properties) as the app holds the style (0x140917460)."""
+        if self.base_style:
+            return self.base_style, self.properties or 0
+        return _style_from_legacy(self.legacy or 0)
+
+    @property
+    def style(self) -> ParagraphStyle:
+        base, properties = self.base
+        if base == STYLE_TEXT and properties & 0xFF == 3:
+            return ParagraphStyle.SUBHEADING
+        return _LEGACY_TYPE.get(_style_to_legacy(base, properties), ParagraphStyle.PARAGRAPH)
+
+
+@dataclass
+class RootText:
+    """A RootText block (0x07) as stored: everything in it, nothing interpreted.
+    `items` and `styles` are in the file's order."""
+
+    block_id: tuple[int, int]
+    items: list[TextItem]
+    styles: list[StyleEntry]
+    x: float
+    y: float
+    width_legacy: float                         # "textWidthLegacy"
+    width: float | None = None                  # settings "textWidth"; newer files only
+    width_timestamp: tuple[int, int] | None = None
+    # Bytes this parser does not know, by where they are: "root", "text", "sequence",
+    # "items", "formatting", "styles", "position", "settings", "width".
+    unknown: dict[str, bytes] = field(default_factory=dict)
+
+    @property
+    def text_width(self) -> float:
+        """The width in use: the newer one when it is set (0x140943e50)."""
+        return self.width if self.width is not None and self.width > 0 else self.width_legacy
 
 
 @dataclass
@@ -245,6 +370,7 @@ class TextSpan:
     text: str
     bold: bool = False
     italic: bool = False
+    link: bool = False
 
 
 @dataclass
@@ -268,6 +394,7 @@ class TextBlock:
     # Every character id (including deleted ones and markers) -> paragraph index;
     # anchors refer to these. A newline belongs to the paragraph it ends.
     char_paragraph: dict[tuple[int, int], int] = field(default_factory=dict)
+    root: RootText | None = field(default=None, repr=False, compare=False)    # as stored
 
     @property
     def text(self) -> str:
@@ -534,11 +661,18 @@ class _Char:
     fmt: int | None = None
 
 
-# Inline format markers carried on text items (community-documented encoding;
-# no samples in the validation data): 1/2 bold on/off, 3/4 italic on/off.
-FMT_BOLD_ON, FMT_BOLD_OFF, FMT_ITALIC_ON, FMT_ITALIC_OFF = 1, 2, 3, 4
+# Inline format markers (TextItem.format): each is an entry of its own in the
+# sequence, and the text from a start to its end has the style. The app makes the two
+# together, the end's id one after the start's (0x140aab3c0 pairs them so).
+FORMAT_BOLD_START, FORMAT_BOLD_END, FORMAT_ITALIC_START, FORMAT_ITALIC_END = 1, 2, 3, 4
+FORMAT_LINK_START, FORMAT_LINK_END = 5, 6
 
 _NO_ID = (0, 0)
+
+
+def _id_key(value: tuple[int, int]) -> tuple[int, int]:
+    """Ids order by counter, then author (0x140a98550)."""
+    return value[1], value[0]
 
 
 def _order_chars(chars: list[_Char]) -> list[_Char]:
@@ -576,99 +710,197 @@ def _order_chars(chars: list[_Char]) -> list[_Char]:
     return out
 
 
-def _decode_root_text(payload: bytes) -> TextBlock:
-    """RootText block:
+def _float32(raw: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", raw))[0]
 
-        1: block id
-        2: { 1: { 1: varuint n, n × subblock(0) text item }
-             2: { 1: varuint m, m × (id, 1: timestamp, 2: {u8 17, u8 style}) } }
-        3: { f64 x, f64 y }
-        4: f32 width
-        5: { 1: { 1: timestamp, 2: f32 width } }   (newer files; last write wins)
 
-    Text item: 2 item id, 3 left id, 4 right id, 5 deleted length,
-               6 { varuint len, u8 is_ascii, utf-8 bytes [, 2: u32 format] }.
+def _decode_text_item(data: bytes) -> TextItem:
+    """parentId is not stored for text; 2 id, 3 left, 4 right, 5 deletedLength,
+    6 value { varuint byte length, u8 utf type, the bytes [, 2: u32 format] }
+    (0x1409152a0, 0x140917c70; written by 0x14091f9d0, the value only when nothing
+    is deleted)."""
+    r = _Values(data, "text item")
+    item_id, left, right = r.need(2, TAG_ID), r.need(3, TAG_ID), r.need(4, TAG_ID)
+    deleted_length = r.need(5, TAG_BYTE4)
+    value = r.get(6, TAG_LENGTH4)
+    if value is None:
+        return TextItem(item_id, left, right, deleted_length, rest=r.rest())
+    v = _Values(value, "text item value")
+    length = v.varuint()
+    utf_type = v.u8()
+    string = v.take(length)
+    return TextItem(item_id, left, right, deleted_length, string, utf_type,
+                    v.get(2, TAG_BYTE4) or 0, v.rest(), r.rest())
+
+
+def _decode_style_entry(r: _Values) -> StyleEntry:
+    """A paragraph style: the character's id (not tagged), 1 timestamp,
+    2 { 1: u8 style_legacy [, 2: u8 base_style, 3: u32 style_properties] }
+    (0x1409160e0, 0x140917460; written by 0x1409103b0)."""
+    char_id = r.crdt_id()
+    timestamp = r.get(1, TAG_ID)
+    if timestamp is None:
+        raise RmParseError("paragraph format is missing its timestamp")
+    value = r.get(2, TAG_LENGTH4)
+    if value is None:
+        raise RmParseError("paragraph format is missing its value")
+    v = _Values(value, "paragraph format")
+    return StyleEntry(char_id, timestamp, v.get(1, TAG_BYTE1), v.get(2, TAG_BYTE1),
+                      v.get(3, TAG_BYTE4), v.rest())
+
+
+def decode_root_text(payload: bytes) -> RootText:
+    """The payload of a RootText block, field for field (read by 0x140916ab0, written
+    by 0x14091ff90; the names are the app's own, from its JSON form of a scene):
+
+        1: parentId, the id of the text: (0, 0)
+        2: text { 1: sequence   { 1: { varuint n, n x (0: sub-block, a text item) } }
+                  2: formatting { 1: styles { varuint m, m x style entry } } }
+        3: position { f64 x, f64 y }
+        4: textWidthLegacy, f32
+        5: settings { 1: textWidth { 1: timestamp, 2: f32 } }   (newer files)
+
+    A page has at most one. Every level may end in bytes of a newer format, which
+    the app keeps and writes back; they are in RootText.unknown.
     """
-    f = _read_fields(payload)
-    contents = _read_fields(_field(f, 2, TAG_LENGTH4, "root text").raw)
-    items_raw = _field(_read_fields(_field(contents, 1, TAG_LENGTH4, "root text").raw),
-                       1, TAG_LENGTH4, "root text items").raw
-    formats_raw = _field(_read_fields(_field(contents, 2, TAG_LENGTH4, "root text").raw),
-                         1, TAG_LENGTH4, "root text formats").raw
+    unknown: dict[str, bytes] = {}
 
-    chars: list[_Char] = []
-    r = _Reader(items_raw)
-    for _ in range(r.varuint()):
-        if r.varuint() != (0 << 4) | TAG_LENGTH4:
+    def done(reader: _Values, where: str) -> None:
+        tail = reader.rest()
+        if tail:
+            unknown[where] = tail
+
+    r = _Values(payload, "root text")
+    block_id = r.need(1, TAG_ID)
+    text = _Values(r.need(2, TAG_LENGTH4), "root text")
+    sequence = _Values(text.need(1, TAG_LENGTH4), "root text")
+    listed = _Values(sequence.need(1, TAG_LENGTH4), "root text items")
+    items = []
+    for _ in range(listed.varuint()):
+        if listed.varuint() != (0 << 4) | TAG_LENGTH4:
             raise RmParseError("text item is not a sub-block")
-        it = _read_fields(r.take(r.unpack("<I")[0]))
-        author, counter = _field(it, 2, TAG_ID, "text item").raw
-        left = _field(it, 3, TAG_ID, "text item").raw
-        right = _field(it, 4, TAG_ID, "text item").raw
-        deleted_length = _field(it, 5, TAG_BYTE4, "text item").as_int()
-        text, fmt = "", None
-        if 6 in it:
-            sr = _Reader(_field(it, 6, TAG_LENGTH4, "text item").raw)
-            length = sr.varuint()
-            sr.u8()  # is_ascii
-            text = sr.take(length).decode("utf-8", errors="replace")
-            if sr.pos < len(sr.data):
-                extra = _read_fields(sr.data[sr.pos:])
-                fmt = extra[2].as_int() if 2 in extra else None
-        if text:
-            for i, ch in enumerate(text):
-                chars.append(_Char((author, counter + i),
-                                   left if i == 0 else (author, counter + i - 1), right, ch))
-        elif fmt is not None:
-            chars.append(_Char((author, counter), left, right, None, fmt))
-        else:
-            # Deleted run: keeps its ids so other items can still refer to them.
-            for i in range(max(deleted_length, 1)):
-                chars.append(_Char((author, counter + i),
-                                   left if i == 0 else (author, counter + i - 1), right, None))
+        items.append(_decode_text_item(listed.take(listed.unpack("<I")[0])))
+    done(listed, "items")
+    done(sequence, "sequence")
+    formatting = _Values(text.need(2, TAG_LENGTH4), "root text")
+    listed = _Values(formatting.need(1, TAG_LENGTH4), "root text formats")
+    styles = [_decode_style_entry(listed) for _ in range(listed.varuint())]
+    done(listed, "styles")
+    done(formatting, "formatting")
+    done(text, "text")
+    position = _Values(r.need(3, TAG_LENGTH4), "root text position")
+    x, y = position.unpack("<dd")
+    done(position, "position")
+    width_legacy = _float32(r.need(4, TAG_BYTE4))
+    width = width_timestamp = None
+    settings = r.get(5, TAG_LENGTH4)
+    if settings is not None:
+        settings = _Values(settings, "root text settings")
+        lww = settings.get(1, TAG_LENGTH4)
+        if lww is not None:
+            lww = _Values(lww, "root text width")
+            width_timestamp = lww.need(1, TAG_ID)
+            width = _float32(lww.need(2, TAG_BYTE4))
+            done(lww, "width")
+        done(settings, "settings")
+    done(r, "root")
+    return RootText(block_id, items, styles, x, y, width_legacy, width, width_timestamp, unknown)
 
-    styles: dict[tuple, tuple[tuple, int]] = {}
-    r = _Reader(formats_raw)
-    for _ in range(r.varuint()):
-        char_id = r.crdt_id()
-        if r.varuint() != (1 << 4) | TAG_ID:
-            raise RmParseError("paragraph format is missing its timestamp")
-        timestamp = r.crdt_id()
-        if r.varuint() != (2 << 4) | TAG_LENGTH4:
-            raise RmParseError("paragraph format is missing its value")
-        value = r.take(r.unpack("<I")[0])
-        if len(value) != 2:
-            raise RmParseError(f"paragraph format value has {len(value)} bytes, expected 2")
-        if char_id not in styles or timestamp >= styles[char_id][0]:
-            styles[char_id] = (timestamp, value[1])
 
-    x, y = struct.unpack("<dd", _field(f, 3, TAG_LENGTH4, "root text").raw)
-    width = _field(f, 4, TAG_BYTE4, "root text").as_float32()
-    if 5 in f:
-        lww = _read_fields(_field(_read_fields(f[5].raw), 1, TAG_LENGTH4, "root text width").raw)
-        width = _field(lww, 2, TAG_BYTE4, "root text width").as_float32()
+def _item_chars(item: TextItem) -> list[_Char]:
+    """The characters of an entry, each with its id; one that takes no id (an empty
+    string) still gets its own, so that others can stand next to it."""
+    out: list[_Char] = []
+    author, counter = item.item_id
+
+    def add(char: str | None, fmt: int | None = None, units: int = 1) -> None:
+        nonlocal counter
+        left = item.left if not out else out[-1].id
+        out.append(_Char((author, counter), left, item.right, char, fmt))
+        counter += units
+
+    if item.kind == "deleted":
+        for _ in range(max(item.deleted_length, 1)):
+            add(None)
+    elif item.kind == "format":
+        add(None, item.format)
+    else:
+        for char in item.text:
+            add(char, units=2 if ord(char) > 0xFFFF else 1)
+        if not out:
+            add(None)
+    return out
+
+
+def text_order(items: list[TextItem]) -> list[_Char]:
+    """The characters of a text in their order, deleted ones and markers included.
+
+    As the app loads them (0x1409164b0): entries that are not listed by rising id
+    are in their order already, which is how it writes them. Entries listed by rising
+    id are put in one by one, each after its `left`. That is the whole of it while
+    every entry finds its `right` just there, as on every real page seen; where two
+    devices typed at one place at once the app decides between them (0x1409350a0),
+    which is not rebuilt here: such text is ordered by its left and right only.
+    """
+    runs = [_item_chars(item) for item in items]
+    chars = [c for run in runs for c in run]
+    keys = [_id_key(item.item_id) for item in items]
+    if any(b < a for a, b in zip(keys, keys[1:])):
+        return chars
+    after: dict[tuple, tuple | None] = {}
+    by_id: dict[tuple, _Char] = {}
+    for c in chars:
+        fits = c.id not in by_id and (c.left == _NO_ID or c.left in by_id)
+        if not fits or (after.get(c.left) or _NO_ID) != c.right:
+            return _order_chars(chars)
+        after[c.id], after[c.left] = after.get(c.left), c.id
+        by_id[c.id] = c
+    out, this = [], after.get(_NO_ID)
+    while this is not None:
+        out.append(by_id[this])
+        this = after.get(this)
+    return out
+
+
+def text_block(root: RootText) -> TextBlock:
+    """The text as it reads: paragraphs with their styles, bold, italic and links."""
+    styles: dict[tuple, StyleEntry] = {}
+    for entry in root.styles:
+        known = styles.get(entry.char_id)
+        if known is None or _id_key(entry.timestamp) >= _id_key(known.timestamp):
+            styles[entry.char_id] = entry
 
     def style_of(start_id) -> ParagraphStyle:
-        return ParagraphStyle.parse(styles[start_id][1]) if start_id in styles \
-            else ParagraphStyle.PARAGRAPH
+        return styles[start_id].style if start_id in styles else ParagraphStyle.PARAGRAPH
 
     paragraphs = [Paragraph(style_of(_NO_ID))]
     char_paragraph: dict[tuple[int, int], int] = {}
-    bold = italic = False
-    for c in _order_chars(chars):
+    on = {"bold": False, "italic": False, "link": False}
+    markers = {FORMAT_BOLD_START: ("bold", True), FORMAT_BOLD_END: ("bold", False),
+               FORMAT_ITALIC_START: ("italic", True), FORMAT_ITALIC_END: ("italic", False),
+               FORMAT_LINK_START: ("link", True), FORMAT_LINK_END: ("link", False)}
+    for c in text_order(root.items):
         char_paragraph[c.id] = len(paragraphs) - 1
+        if c.char is not None and ord(c.char) > 0xFFFF:
+            char_paragraph[(c.id[0], c.id[1] + 1)] = len(paragraphs) - 1    # its second unit
         if c.fmt is not None:
-            bold = {FMT_BOLD_ON: True, FMT_BOLD_OFF: False}.get(c.fmt, bold)
-            italic = {FMT_ITALIC_ON: True, FMT_ITALIC_OFF: False}.get(c.fmt, italic)
+            if c.fmt in markers:
+                name, value = markers[c.fmt]
+                on[name] = value
         elif c.char == "\n":
             paragraphs.append(Paragraph(style_of(c.id)))
         elif c.char is not None:
             spans = paragraphs[-1].spans
-            if spans and (spans[-1].bold, spans[-1].italic) == (bold, italic):
+            if spans and (spans[-1].bold, spans[-1].italic, spans[-1].link) == tuple(on.values()):
                 spans[-1].text += c.char
             else:
-                spans.append(TextSpan(c.char, bold, italic))
-    return TextBlock(x=x, y=y, width=width, paragraphs=paragraphs, char_paragraph=char_paragraph)
+                spans.append(TextSpan(c.char, **on))
+    return TextBlock(x=root.x, y=root.y, width=root.text_width, paragraphs=paragraphs,
+                     char_paragraph=char_paragraph, root=root)
+
+
+def _decode_root_text(payload: bytes) -> TextBlock:
+    return text_block(decode_root_text(payload))
 
 
 def _left(f) -> tuple[int, int]:
@@ -947,3 +1179,43 @@ class _Reader:
 
     def crdt_id(self) -> tuple[int, int]:
         return self.u8(), self.varuint()
+
+
+class _Values(_Reader):
+    """Tagged values read the way the app reads an object: its fields in their order,
+    each one there or not; what follows the last one it knows is kept as it is."""
+
+    def __init__(self, data: bytes, what: str) -> None:
+        super().__init__(data)
+        self.what = what
+
+    def get(self, index: int, kind: int):
+        """The value of field `index` when it is next, else None."""
+        if self.pos >= len(self.data):
+            return None
+        start = self.pos
+        tag = self.varuint()
+        if tag >> 4 != index:
+            self.pos = start
+            return None
+        if tag & 0xF != kind:
+            raise RmParseError(f"{self.what}: field {index} has type {tag & 0xF:#x}, expected {kind:#x}")
+        if kind == TAG_BYTE1:
+            return self.u8()
+        if kind == TAG_BYTE4:
+            return self.unpack("<I")[0]
+        if kind == TAG_BYTE8:
+            return self.unpack("<d")[0]
+        if kind == TAG_LENGTH4:
+            return self.take(self.unpack("<I")[0])
+        return self.crdt_id()
+
+    def need(self, index: int, kind: int):
+        value = self.get(index, kind)
+        if value is None:
+            raise RmParseError(f"{self.what}: missing field {index} of type {kind:#x}")
+        return value
+
+    def rest(self) -> bytes:
+        chunk, self.pos = self.data[self.pos:], len(self.data)
+        return chunk

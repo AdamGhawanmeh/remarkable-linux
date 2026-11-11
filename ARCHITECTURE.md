@@ -517,12 +517,19 @@ that `strings -n 4` hides):
 9 Uuid2Index, 10 PageStats, 11 Array, 12 MigrationInfo, 13 SceneInfo,
 14 SceneImagesTable, 15 CrdtImageItem. So 14/15 are images, not typed text.
 
-**Paragraph styles** [O]: magic_enum names at 0xc89000; the lookup is
-`cmp edx,0xc; names[edx]`, so stored value = index: 0 Title, 1 Subheading2, 2 Paragraph
-(default), 3 Bulletpoint, 4 BulletpointIndented, 5 CheckboxUnchecked, 6 CheckboxChecked,
-7/8 the indented checkbox variants, 9 NumberedList, 10 NumberedListIndented, 11 ImageBlock,
-12 Subheading. This differs from the community "2 = heading" mapping. Inline styles:
-`SceneTextItem::TextStyle { None, Bold, Italic }` (TextFormatting.qml).
+**Paragraph styles** [O]: the menu's types (`scene::ParagraphStyle::Type`, magic_enum names at
+0xc89000, `cmp edx,0xc; names[edx]`): 0 Title, 1 Subheading2, 2 Paragraph (default), 3 Bulletpoint,
+4 BulletpointIndented, 5 CheckboxUnchecked, 6 CheckboxChecked, 7/8 the indented checkbox variants,
+9 NumberedList, 10 NumberedListIndented, 11 ImageBlock, 12 Subheading. A file does not store that
+index. It stores a `style_legacy` byte (0 nothing, 1 body text, 2 title, 3 subheading 2, 4 bullet,
+5 indented bullet, 6 checkbox, 7 checked, 8/9 the indented ones, 10 numbered, 11 indented numbered,
+12 image; 0x140a92600 reads it, 0x140a93100 writes it, 0x1408b6340 maps it to the type), which is the
+community's numbering (2 = heading), and `base_style` + `style_properties` beside it where the byte
+cannot say it all. A new text box starts with a title (`createRootDocument(ParagraphStyle.Type.Title)`,
+DocumentViewport.qml), which is the `0:0 -> 2` every real page has. Inline styles are marker entries in
+the character sequence: 1/2 bold start/end, 3/4 italic, 5/6 link (`scene::CharacterStyle::Type
+{ None, Bold, Italic, Link }`; 0x140aab3c0 pairs an end with the start whose id is one less).
+See `viewer.rm_parser.decode_root_text` for the whole block.
 
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in

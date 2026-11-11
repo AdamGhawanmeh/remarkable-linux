@@ -73,6 +73,8 @@ class PageBuilder:
                      for t in range(41)], **kw)
 
     def text(self, paragraphs: list[tuple[int, str]], x: float = 234, y: float = 234, width: float = 936) -> None:
+        """Typed text; each paragraph with its stored style (1 body text, 2 title,
+        4 bullet, 7 checked checkbox, ...)."""
         body = "\n".join(t for _, t in paragraphs)
         start, formats, pos = 1000, [], 0
         for i, (style, t) in enumerate(paragraphs):
@@ -163,8 +165,8 @@ def build_demo_cloud() -> FakeCloud:
     a.handwriting("Done!", 900, 700, size=52, color=7)                         # red
     a.circle(1000, 690, 110, color=6, width=3)                                 # blue circle
     b = PageBuilder()
-    b.text([(0, "Action items"), (2, "Typed with the Type Folio:"), (3, "Pair a device"),
-            (3, "Sync the library"), (6, "Open a notebook")])
+    b.text([(2, "Action items"), (1, "Typed with the Type Folio:"), (4, "Pair a device"),
+            (4, "Sync the library"), (7, "Open a notebook")])
     b.handwriting("signed off", 820, 820, size=40, color=6)
     cloud.put_item(notes, _meta("Meeting notes", projects, 0.2, last_opened_page=0),
                    _content("notebook", [p1, p2], tags=["work"], templates=["P Lines small", "Blank"]),

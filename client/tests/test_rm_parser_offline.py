@@ -19,16 +19,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from rmfixtures import (  # noqa: E402
-    ROOT, ZERO, block, f_id, f_sub, group_item, header, image_entries, image_item, image_value, images_table,
-    line_item, paragraph_format, points_v1, points_v2, root_text, sample_text_block, scene_tree,
-    text_item, tombstone, tree_node, v5_file, v6_file)
+    ROOT, ZERO, block, encode_root_text, f_id, f_sub, f_u8, group_item, header, image_entries, image_item,
+    image_value, images_table, line_item, paragraph_format, points_v1, points_v2, root_text, sample_text_block,
+    scene_tree, text_item, tombstone, tree_node, v5_file, v6_file)
 
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from viewer.rm_parser import (  # noqa: E402
-    ANCHOR_SENTINEL_START, Anchor, Color, PageScene, ParagraphStyle, Point, RmParseError,
-    Stroke, Tool, block_name, parse, parse_file, parse_header)
+    ANCHOR_SENTINEL_START, FORMAT_LINK_END, FORMAT_LINK_START, Anchor, Color, PageScene, ParagraphStyle, Point,
+    RmParseError, RootText, Stroke, StyleEntry, TextItem, Tool, block_name, decode_root_text, parse, parse_file,
+    parse_header, text_block, text_order)
 from viewer.renderer import (  # noqa: E402
     LINE_PX, PALETTE_ARGB, estimate_width, image_matrix, image_size, layout_text, render_bounds, render_image,
     render_svg, stroke_offsets, stroke_runs, stroke_style)
@@ -252,16 +253,19 @@ class TextAndImageTests(unittest.TestCase):
                 parse(v6_file(root_text(payload, [])))
         bad_formats = (
             (bytes([0, 0]) + f_sub(2, bytes([17, 2])), "missing its timestamp"),
-            (bytes([0, 0]) + f_id(1, (1, 1)) + f_id(2, (1, 1)), "missing its value"),
-            (bytes([0, 0]) + f_id(1, (1, 1)) + f_sub(2, b"\x11"), "expected 2"),
+            (bytes([0, 0]) + f_id(1, (1, 1)), "missing its value"),
+            (bytes([0, 0]) + f_id(1, (1, 1)) + f_id(2, (1, 1)), "field 2 has type 0xf"),
+            (bytes([0, 0]) + f_id(1, (1, 1)) + f_sub(2, b"\x11"), "unexpected end"),
+            (bytes([0, 0]) + f_id(1, (1, 1)) + f_sub(2, b"\x14\x02\x00\x00\x00"), "field 1 has type 0x4"),
         )
         for fmt, message in bad_formats:
             with self.assertRaisesRegex(RmParseError, message):
                 parse(v6_file(root_text([good_item], [fmt])))
 
     def test_unknown_paragraph_style(self):
+        # A style byte the app does not know is body text to it (0x140a92600).
         data = v6_file(root_text([text_item((1, 1), ZERO, text="a")], [paragraph_format(ZERO, 99)]))
-        self.assertEqual(parse(data).text.paragraphs[0].style, ParagraphStyle.UNKNOWN)
+        self.assertEqual(parse(data).text.paragraphs[0].style, ParagraphStyle.PARAGRAPH)
 
     def test_live_and_deleted_images(self):
         data = v6_file(images_table(), image_item(LAYER_A, (1, 1), value=b"\x05payload"),
@@ -309,6 +313,205 @@ def image_page(*extra: bytes, vertices=None) -> bytes:
                    image_item(LAYER, (1, 18), image_value(KEY, vertices or placed(100, 200, 300, 300), move_id=(1, 16)),
                               left=(1, 17)),
                    *extra)
+
+
+class RootTextTests(unittest.TestCase):
+    """Typed text as the file stores it (block 0x07). The blocks here are made up, in
+    the shapes a real library's have; CachedLibraryTextTests checks the real ones."""
+
+    # A page's text box with nothing in it: no entries, the first paragraph a title
+    # (what the app sets on a new one). 68 bytes, as on a real page.
+    EMPTY = bytes.fromhex(
+        "1f0000" "2c22000000"                                   # parentId 0:0; text {
+        "1c06000000" "1c01000000" "00"                          #   sequence { { 0 entries } }
+        "2c12000000" "1c0d000000" "01"                          #   formatting { styles { 1 entry:
+        "0000" "1f010f" "2c02000000" "1102"                     #     0:0, set at 1:15, { style_legacy 2 } } } }
+        "3c10000000" "0000000000407dc0" "0000000000406d40"      # position { -468.0, 234.0 }
+        "4400006a44")                                           # textWidthLegacy 936.0
+    # One line typed, and the width set: 118 bytes, as on a real page.
+    TITLE = bytes.fromhex(
+        "1f0000" "2c42000000"
+        "1c26000000" "1c21000000" "01"                          #   sequence { { 1 entry:
+        "0c1b000000" "2f0110" "3f0000" "4f0000" "5400000000"    #     { id 1:16, left 0:0, right 0:0, none deleted,
+        "6c08000000" "06" "01" "53616d706c65"                   #       value { 6 bytes, UTF-8, "Sample" } } } }
+        "2c12000000" "1c0d000000" "01" "0000" "1f010f" "2c02000000" "1102"
+        "3c10000000" "0000000000407dc0" "0000000000406d40"
+        "4400006a44"
+        "5c0d000000" "1c08000000" "1f0002" "2400006a44")        # settings { textWidth { set at 0:2, 936.0 } }
+
+    def test_empty_box_field_for_field(self):
+        root = decode_root_text(self.EMPTY)
+        self.assertEqual(root, RootText(block_id=(0, 0), items=[], styles=[StyleEntry((0, 0), (1, 15), legacy=2)],
+                                        x=-468.0, y=234.0, width_legacy=936.0))
+        self.assertEqual((root.width, root.width_timestamp, root.unknown, root.text_width), (None, None, {}, 936.0))
+        self.assertEqual(encode_root_text(root), self.EMPTY)                 # nothing lost
+        text = text_block(root)
+        self.assertEqual([(p.style, p.text) for p in text.paragraphs], [(ParagraphStyle.TITLE, "")])
+        self.assertTrue(text.is_blank)
+        self.assertIs(parse(v6_file(block(0x07, self.EMPTY))).text.root.styles[0].legacy, 2)
+
+    def test_title_and_width_setting_field_for_field(self):
+        root = decode_root_text(self.TITLE)
+        self.assertEqual(root.items, [TextItem((1, 16), (0, 0), (0, 0), 0, b"Sample", 1)])
+        self.assertEqual((root.items[0].kind, root.items[0].text, root.items[0].length, root.items[0].format),
+                         ("text", "Sample", 6, 0))
+        self.assertEqual((root.width_legacy, root.width, root.width_timestamp), (936.0, 936.0, (0, 2)))
+        self.assertEqual(encode_root_text(root), self.TITLE)
+        text = text_block(root)
+        self.assertEqual([(p.style, p.text) for p in text.paragraphs], [(ParagraphStyle.TITLE, "Sample")])
+        self.assertEqual(text.char_paragraph, {(1, n): 0 for n in range(16, 22)})
+
+    def test_every_stored_part_survives(self):
+        # Text of every kind, both forms of a style, and bytes of a newer format at
+        # the end of every level: all of it is kept where it was.
+        root = RootText(
+            block_id=(0, 0),
+            items=[TextItem((1, 20), (0, 0), (0, 0), 0, "Grüße ✓\n".encode(), 1),
+                   TextItem((1, 28), (1, 27), (0, 0), 0, b"", 1, FORMAT_LINK_START),
+                   TextItem((2, 300), (1, 28), (0, 0), 0, b"x", 1, 0, value_rest=f_u8(9, 7), rest=f_u8(8, 1)),
+                   TextItem((1, 301), (2, 300), (0, 0), 0, b"", 1, FORMAT_LINK_END),
+                   TextItem((1, 302), (1, 301), (0, 0), 4),
+                   TextItem((1, 306), (1, 305), (0, 0), 0, b"\xff?", 2)],
+            styles=[StyleEntry((0, 0), (1, 19), legacy=1),
+                    StyleEntry((1, 27), (2, 400), legacy=3, base_style=2, properties=3, rest=f_u8(7, 1)),
+                    StyleEntry((1, 27), (1, 399), legacy=5, base_style=3, properties=1)],
+            x=-576.0, y=234.0, width_legacy=1152.0, width=1000.5, width_timestamp=(1, 141),
+            unknown={where: f_u8(12, n) for n, where in enumerate(
+                ("items", "sequence", "styles", "formatting", "text", "position", "width", "settings", "root"))})
+        payload = encode_root_text(root)
+        again = decode_root_text(payload)
+        self.assertEqual(again, root)
+        self.assertEqual(encode_root_text(again), payload)
+        self.assertEqual([i.kind for i in again.items], ["text", "format", "text", "format", "deleted", "text"])
+        self.assertEqual([i.length for i in again.items], [8, 1, 1, 1, 4, 0])
+        self.assertEqual(again.items[5].text, "")                # a string type the app does not read
+        self.assertEqual(again.text_width, 1000.5)
+        text = text_block(again)
+        self.assertEqual([(p.style, [(s.text, s.link) for s in p.spans]) for p in text.paragraphs],
+                         [(ParagraphStyle.PARAGRAPH, [("Grüße ✓", False)]),
+                          (ParagraphStyle.SUBHEADING, [("x", True)])])    # the later write of 1:27 wins
+
+    def test_ids_count_utf16_units(self):
+        # "a", an emoji (two units), "b", newline: the newline is 1:14, and so is its style.
+        root = decode_root_text(root_text([text_item((1, 10), ZERO, text="a\U0001F600b\nnext")],
+                                          [paragraph_format((1, 14), 4)])[8:])
+        self.assertEqual(root.items[0].length, 9)
+        self.assertEqual([c.id[1] for c in text_order(root.items)], [10, 11, 13, 14, 15, 16, 17, 18])
+        text = text_block(root)
+        self.assertEqual([(p.style, p.text) for p in text.paragraphs],
+                         [(ParagraphStyle.PARAGRAPH, "a\U0001F600b"), (ParagraphStyle.BULLETPOINT, "next")])
+        self.assertEqual([text.char_paragraph[(1, n)] for n in range(10, 19)], [0, 0, 0, 0, 0, 1, 1, 1, 1])
+
+    def test_order_is_the_files_unless_listed_by_rising_id(self):
+        # As the app writes a page: in reading order, here not by rising id. Shaped
+        # like a real one: runs put inside earlier runs, then all deleted or not.
+        written = [text_item((1, 100), ZERO, text="abcdefghijklmno"),
+                   text_item((1, 220), (1, 114), (1, 200), text="123"),
+                   text_item((1, 200), (1, 114), text="xyz"),
+                   text_item((1, 230), (1, 202), deleted=3)]
+        self.assertEqual(text_block(decode_root_text(root_text(written, [])[8:])).text, "abcdefghijklmno123xyz")
+        # The same entries by rising id (as they were typed) are put in one by one.
+        typed = sorted(written, key=lambda item: decode_root_text(root_text([item], [])[8:]).items[0].item_id[1])
+        self.assertEqual(text_block(decode_root_text(root_text(typed, [])[8:])).text, "abcdefghijklmno123xyz")
+        # Not by rising id, the listed order is taken as it is, whatever the neighbours say.
+        odd = [text_item((1, 5), ZERO, text="b"), text_item((1, 1), ZERO, (1, 5), text="a")]
+        self.assertEqual(text_block(decode_root_text(root_text(odd, [])[8:])).text, "ba")
+        # Ids order by counter first, then author.
+        both = [text_item((2, 1), ZERO, text="a"), text_item((1, 2), (2, 1), text="b")]
+        self.assertEqual(text_block(decode_root_text(root_text(both, [])[8:])).text, "ab")
+        # Two devices typing at one place at once: both stay, each after its left.
+        at_once = [text_item((1, 1), ZERO, text="ab"), text_item((1, 3), (1, 1), (1, 2), text="X"),
+                   text_item((2, 3), (1, 1), (1, 2), text="Y")]
+        text = text_block(decode_root_text(root_text(at_once, [])[8:])).text
+        self.assertEqual((text[0], text[-1], sorted(text[1:3])), ("a", "b", ["X", "Y"]))
+
+    def test_stored_style_codes(self):
+        names = ["PARAGRAPH", "PARAGRAPH", "TITLE", "SUBHEADING_2", "BULLETPOINT", "BULLETPOINT_INDENTED",
+                 "CHECKBOX_UNCHECKED", "CHECKBOX_CHECKED", "CHECKBOX_UNCHECKED_INDENTED",
+                 "CHECKBOX_CHECKED_INDENTED", "NUMBERED_LIST", "NUMBERED_LIST_INDENTED", "IMAGE_BLOCK", "PARAGRAPH"]
+        self.assertEqual([StyleEntry(ZERO, (1, 1), legacy).style.name for legacy in range(14)], names)
+        # The newer fields are what counts when they are there (base, properties).
+        for base, properties, name in ((2, 0, "PARAGRAPH"), (2, 1, "TITLE"), (2, 2, "SUBHEADING_2"),
+                                       (2, 3, "SUBHEADING"), (3, 0x000, "BULLETPOINT"),
+                                       (3, 0x002, "BULLETPOINT_INDENTED"), (3, 0x010, "CHECKBOX_UNCHECKED"),
+                                       (3, 0x110, "CHECKBOX_CHECKED"), (3, 0x111, "CHECKBOX_CHECKED_INDENTED"),
+                                       (3, 0x210, "CHECKBOX_UNCHECKED"), (3, 0x021, "NUMBERED_LIST_INDENTED"),
+                                       (4, 0, "IMAGE_BLOCK"), (1, 0, "PARAGRAPH"), (9, 0, "PARAGRAPH")):
+            self.assertEqual(StyleEntry(ZERO, (1, 1), 2, base, properties).style.name, name, (base, properties))
+        self.assertEqual(StyleEntry(ZERO, (1, 1), 4, 0, 0x111).style, ParagraphStyle.BULLETPOINT)   # base 0: not set
+        self.assertEqual(StyleEntry(ZERO, (1, 1)).style, ParagraphStyle.PARAGRAPH)
+        entry = decode_root_text(root_text([], [paragraph_format((1, 6), 5, (1, 7), base=3, properties=1)])[8:]).styles
+        self.assertEqual(entry, [StyleEntry((1, 6), (1, 7), 5, 3, 1)])
+
+    def test_bold_italic_and_link_markers(self):
+        items = [text_item((1, 1), ZERO, text="a"), text_item((1, 2), (1, 1), fmt=1),
+                 text_item((1, 3), (1, 2), text="b"), text_item((1, 4), (1, 3), fmt=3),
+                 text_item((1, 5), (1, 4), text="c"), text_item((1, 6), (1, 5), fmt=2),
+                 text_item((1, 7), (1, 6), fmt=5), text_item((1, 8), (1, 7), text="d"),
+                 text_item((1, 9), (1, 8), fmt=4), text_item((1, 10), (1, 9), fmt=6),
+                 text_item((1, 11), (1, 10), fmt=7), text_item((1, 12), (1, 11), text="e"),
+                 text_item((1, 13), (1, 12), deleted=1), text_item((1, 14), (1, 13), text="f")]   # a marker, deleted
+        spans = text_block(decode_root_text(root_text(items, [])[8:])).paragraphs[0].spans
+        self.assertEqual([(s.text, s.bold, s.italic, s.link) for s in spans],
+                         [("a", False, False, False), ("b", True, False, False), ("c", True, True, False),
+                          ("d", False, True, True), ("ef", False, False, False)])
+
+    def test_broken_blocks(self):
+        for payload, message in ((self.EMPTY[:-3], "unexpected end"), (self.EMPTY[3:], "missing field 1"),
+                                 (self.EMPTY[:3] + b"\x24" + self.EMPTY[4:], "field 2 has type 0x4"),
+                                 (self.TITLE.replace(b"\x2f\x01\x10", b"\x3f\x01\x10", 1), "text item: missing field 2")):
+            with self.assertRaisesRegex(RmParseError, message):
+                decode_root_text(payload)
+
+
+@unittest.skipUnless(os.environ.get("RM_TEST_CACHED_LIBRARY"),
+                     "set RM_TEST_CACHED_LIBRARY=1 to check the typed text of the library cached on this machine")
+class CachedLibraryTextTests(unittest.TestCase):
+    """Every typed-text block of the pages cached on this machine (read from disk only;
+    nothing of them is printed): each is read whole and written back byte for byte."""
+
+    def test_every_cached_text_block_is_read_whole(self):
+        from core.auth import AuthClient
+        from core.sync import NotCachedError, SyncClient
+
+        def no_network(*args):
+            raise AssertionError("network used while reading the cache")
+
+        sync = SyncClient(AuthClient(transport=no_network))
+        seen = unknown = 0
+        for doc in sync.load_cached().documents():
+            for name, blob in doc.files.items():
+                if not name.endswith(".rm"):
+                    continue
+                try:
+                    data = sync.get_blob(blob, name, cached_only=True)
+                except NotCachedError:
+                    continue
+                if not data.startswith(b"reMarkable .lines file, version=6"):
+                    continue
+                pos, scene = 43, None
+                while pos + 8 <= len(data):
+                    length, block_type = int.from_bytes(data[pos:pos + 4], "little"), data[pos + 7]
+                    payload = data[pos + 8:pos + 8 + length]
+                    pos += 8 + length
+                    if block_type != 0x07:
+                        continue
+                    seen += 1
+                    root = decode_root_text(payload)
+                    self.assertEqual(encode_root_text(root), payload, "a text block is not read whole")
+                    unknown += bool(root.unknown or any(i.rest or i.value_rest for i in root.items)
+                                    or any(s.rest for s in root.styles))
+                    # Read in the order listed, the entries name their neighbours rightly.
+                    chars = [c for item in root.items for c in text_order([item])]
+                    ordered = text_order(root.items)
+                    self.assertEqual(len(ordered), len(chars))
+                    after = dict(zip([(0, 0)] + [c.id for c in ordered], [c.id for c in ordered] + [(0, 0)]))
+                    for item in root.items:
+                        self.assertIn(item.left, after)
+                    scene = scene or parse(data)
+                    self.assertEqual(scene.text.root, root)
+        self.assertGreater(seen, 0, "no typed text in the cache")
+        self.assertEqual(unknown, 0, "bytes of a newer format: look at them")
 
 
 class ImageItemTests(unittest.TestCase):
@@ -394,7 +597,7 @@ def anchored_page(anchor_char=(1, 7), origin_x=-464.0) -> bytes:
         group_item(ROOT, (1, 1), LAYER),
         group_item(LAYER, (1, 2), GROUP),
         group_item(GROUP, (1, 3), NESTED),
-        root_text([text_item((1, 1), ZERO, text="Title\nHello")], [paragraph_format(ZERO, 2)]),
+        root_text([text_item((1, 1), ZERO, text="Title\nHello")], [paragraph_format(ZERO, 1)]),
         line_item(NESTED, (1, 10), tool=17, color=0, points=points_v2([(10, -5, 0, 0, 3, 255), (60, 5, 0, 0, 3, 255)])),
         line_item(LAYER, (1, 11), tool=17, color=0, points=points_v2([(0, 900, 0, 0, 3, 255), (5, 905, 0, 0, 3, 255)])))
 
@@ -584,7 +787,7 @@ class RendererTests(unittest.TestCase):
 
     def test_text_layout_wraps_and_marks_lists(self):
         items = [text_item((1, 1), ZERO, text="one two three four five six seven eight\nnext\nlast")]
-        formats = [paragraph_format((1, 40), 9), paragraph_format((1, 45), 6)]
+        formats = [paragraph_format((1, 40), 10), paragraph_format((1, 45), 7)]     # numbered, checked
         scene = parse(v6_file(root_text(items, formats, width=300)))
         lines = layout_text(scene)
         texts = ["".join(t for t, _ in line.pieces) for line in lines]
@@ -606,13 +809,13 @@ class RendererTests(unittest.TestCase):
                          [[("boldword", True)], [("w" * 30, False)]])
 
     def test_list_markers(self):
-        cases = {3: "•", 4: "•", 5: "☐", 7: "☐", 8: "☑", 9: "1.", 10: "1.", 0: ""}
+        cases = {4: "•", 5: "•", 6: "☐", 8: "☐", 9: "☑", 10: "1.", 11: "1.", 2: "", 1: "", 0: ""}
         for style, marker in cases.items():
             scene = parse(v6_file(root_text([text_item((1, 1), ZERO, text="x")],
                                             [paragraph_format(ZERO, style)])))
             self.assertEqual(layout_text(scene)[0].marker, marker, style)
         indented = parse(v6_file(root_text([text_item((1, 1), ZERO, text="x")],
-                                           [paragraph_format(ZERO, 4)])))
+                                           [paragraph_format(ZERO, 5)])))
         self.assertEqual(layout_text(indented)[0].x, 234 + 96)
 
     def test_text_in_svg_and_image(self):
