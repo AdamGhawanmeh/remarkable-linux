@@ -531,6 +531,7 @@ BLOCK_TREE_NODE = 0x02
 BLOCK_SCENE_GROUP = 0x04
 BLOCK_SCENE_LINE = 0x05
 BLOCK_ROOT_TEXT = 0x07
+BLOCK_AUTHORS = 0x09
 BLOCK_TOMBSTONE = 0x08
 BLOCK_IMAGES_TABLE = 0x0E
 BLOCK_IMAGE_ITEM = 0x0F
@@ -832,38 +833,42 @@ def _item_chars(item: TextItem) -> list[_Char]:
     return out
 
 
-def text_order(items: list[TextItem]) -> list[_Char]:
-    """The characters of a text in their order, deleted ones and markers included.
-
-    As the app loads them (0x1409164b0): entries that are not listed by rising id
-    are in their order already, which is how it writes them. Entries listed by rising
-    id are put in one by one, each after its `left`. That is the whole of it while
-    every entry finds its `right` just there, as on every real page seen; where two
-    devices typed at one place at once the app decides between them (0x1409350a0),
-    which is not rebuilt here: such text is ordered by its left and right only.
-    """
-    runs = [_item_chars(item) for item in items]
-    chars = [c for run in runs for c in run]
-    keys = [_id_key(item.item_id) for item in items]
-    if any(b < a for a, b in zip(keys, keys[1:])):
-        return chars
-    after: dict[tuple, tuple | None] = {}
-    by_id: dict[tuple, _Char] = {}
-    for c in chars:
-        fits = c.id not in by_id and (c.left == _NO_ID or c.left in by_id)
-        if not fits or (after.get(c.left) or _NO_ID) != c.right:
-            return _order_chars(chars)
-        after[c.id], after[c.left] = after.get(c.left), c.id
-        by_id[c.id] = c
-    out, this = [], after.get(_NO_ID)
-    while this is not None:
-        out.append(by_id[this])
-        this = after.get(this)
+def _run_chars(run) -> list[_Char]:
+    """The characters of a run of rm_text's sequence."""
+    if run.deleted or run.format or not run.text:
+        return [_Char((run.id[0], run.id[1] + n), run.left, run.right, None,
+                      run.format if n == 0 and run.format and not run.deleted else None)
+                for n in range(max(run.length, 1))]
+    out, at = [], run.id[1]
+    for char in run.text:
+        out.append(_Char((run.id[0], at), run.left, run.right, char))
+        at += 2 if ord(char) > 0xFFFF else 1
     return out
 
 
-def text_block(root: RootText) -> TextBlock:
-    """The text as it reads: paragraphs with their styles, bold, italic and links."""
+def text_order(items: list[TextItem], authors: dict[int, bytes] | None = None) -> list[_Char]:
+    """The characters of a text in their order, deleted ones and markers included.
+
+    As the app loads them (rm_text.TextSequence, 0x1409164b0): entries that are not
+    listed by rising id are in their order already, which is how it writes them;
+    entries listed by rising id are put in one by one, each after its `left`, and
+    where two devices typed at one place at once the authors' UUIDs (`authors`: author
+    index -> UUID) decide. An entry the app drops (its neighbours are not older than
+    it) is not in the text. Text that holds an id twice, which the app would have to
+    merge, is ordered by its left and right only.
+    """
+    from . import rm_text
+    try:
+        runs = rm_text.TextSequence.load(items, authors).runs
+    except RmParseError:
+        return _order_chars([c for item in items for c in _item_chars(item)])
+    return [c for run in runs for c in _run_chars(run)]
+
+
+def text_block(root: RootText, authors: dict[int, bytes] | None = None) -> TextBlock:
+    """The text as it reads: paragraphs with their styles, bold, italic and links.
+    A style holds from a start marker to its end; one started twice ends with its
+    second end (the app counts them, 0x140aa5cb0)."""
     styles: dict[tuple, StyleEntry] = {}
     for entry in root.styles:
         known = styles.get(entry.char_id)
@@ -875,22 +880,22 @@ def text_block(root: RootText) -> TextBlock:
 
     paragraphs = [Paragraph(style_of(_NO_ID))]
     char_paragraph: dict[tuple[int, int], int] = {}
-    on = {"bold": False, "italic": False, "link": False}
-    markers = {FORMAT_BOLD_START: ("bold", True), FORMAT_BOLD_END: ("bold", False),
-               FORMAT_ITALIC_START: ("italic", True), FORMAT_ITALIC_END: ("italic", False),
-               FORMAT_LINK_START: ("link", True), FORMAT_LINK_END: ("link", False)}
-    for c in text_order(root.items):
+    depth = {"bold": 0, "italic": 0, "link": 0}
+    markers = {FORMAT_BOLD_START: ("bold", 1), FORMAT_BOLD_END: ("bold", -1),
+               FORMAT_ITALIC_START: ("italic", 1), FORMAT_ITALIC_END: ("italic", -1),
+               FORMAT_LINK_START: ("link", 1), FORMAT_LINK_END: ("link", -1)}
+    for c in text_order(root.items, authors):
         char_paragraph[c.id] = len(paragraphs) - 1
         if c.char is not None and ord(c.char) > 0xFFFF:
             char_paragraph[(c.id[0], c.id[1] + 1)] = len(paragraphs) - 1    # its second unit
         if c.fmt is not None:
             if c.fmt in markers:
-                name, value = markers[c.fmt]
-                on[name] = value
+                name, step = markers[c.fmt]
+                depth[name] += step
         elif c.char == "\n":
             paragraphs.append(Paragraph(style_of(c.id)))
         elif c.char is not None:
-            spans = paragraphs[-1].spans
+            spans, on = paragraphs[-1].spans, {name: n > 0 for name, n in depth.items()}
             if spans and (spans[-1].bold, spans[-1].italic, spans[-1].link) == tuple(on.values()):
                 spans[-1].text += c.char
             else:
@@ -899,8 +904,17 @@ def text_block(root: RootText) -> TextBlock:
                      char_paragraph=char_paragraph, root=root)
 
 
-def _decode_root_text(payload: bytes) -> TextBlock:
-    return text_block(decode_root_text(payload))
+def _decode_root_text(payload: bytes, authors: dict[int, bytes] | None = None) -> TextBlock:
+    return text_block(decode_root_text(payload), authors)
+
+
+def _decode_authors(payload: bytes) -> dict[int, bytes]:
+    """Author index -> UUID (block 0x09); nothing when it is not understood."""
+    from . import rm_writer
+    try:
+        return {index: uuid for uuid, index in rm_writer.decode_authors(payload)}
+    except RmParseError:
+        return {}
 
 
 def _left(f) -> tuple[int, int]:
@@ -955,6 +969,7 @@ def _parse_v6(data: bytes) -> PageScene:
     skipped: dict[int, int] = {}
     counts: dict[int, int] = {}
     text: TextBlock | None = None
+    authors: dict[int, bytes] = {}          # author index -> UUID (block 0x09)
     images: list[ImageItem] = []
     image_files: dict[bytes, str] = {}      # imageRef -> file name (SceneImagesTable)
     node_parent: dict[tuple, tuple] = {}    # group node -> parent node (group items)
@@ -968,7 +983,9 @@ def _parse_v6(data: bytes) -> PageScene:
         payload = r.take(length)
         counts[block_type] = counts.get(block_type, 0) + 1
         try:
-            if block_type == BLOCK_TREE_NODE:
+            if block_type == BLOCK_AUTHORS:
+                authors = _decode_authors(payload)
+            elif block_type == BLOCK_TREE_NODE:
                 f = _read_fields(payload)
                 node = _field(f, 1, TAG_ID, "tree node").raw
                 if 2 in f:
@@ -998,7 +1015,7 @@ def _parse_v6(data: bytes) -> PageScene:
                     stroke.seq = counts_total(counts)
                     lines.append((parent, stroke))
             elif block_type == BLOCK_ROOT_TEXT:
-                text = _decode_root_text(payload)
+                text = _decode_root_text(payload, authors)
             elif block_type == BLOCK_IMAGE_ITEM:
                 # Same item header as other scene items; the value is kept raw.
                 f = _read_fields(payload)

@@ -118,9 +118,11 @@ def lww(timestamp: tuple[int, int], value: bytes) -> bytes:
 
 
 def string_value(text: str) -> bytes:
-    """A string as stored in sub-blocks: varuint byte length, u8 is_ascii, UTF-8 bytes."""
+    """A string as stored in sub-blocks: varuint byte length, u8 1 (UTF-8, the only
+    kind the app reads: 0x1409150e0 skips any other with "Utf type {} is not handled"),
+    the bytes."""
     data = text.encode("utf-8")
-    return varuint(len(data)) + bytes([int(text.isascii())]) + data
+    return varuint(len(data)) + b"\x01" + data
 
 
 # ------------------------------------------------------------------ scene items
