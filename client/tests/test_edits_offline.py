@@ -1674,6 +1674,12 @@ class DocumentControllerTests(Base):
         self.assertTrue(self.controller.addPageWithTemplateAndPageSize(THROWAWAY))
         self.assertEqual(self.entry.templateForPage(2), "Blank")
 
+    def test_calls_the_app_makes_by_itself_stay_silent(self):
+        # Quick sheets and new notebooks set a template and paper size on their own.
+        self.controller.setTemplateForPage(THROWAWAY, 0, "Blank")
+        self.controller.setViewBackgroundFilter(THROWAWAY, "")
+        self.assertEqual(self.messages, [])
+
     def test_what_cannot_be_done_is_said(self):
         self.assertFalse(self.controller.copyPages(THROWAWAY, [0], OTHER, 0))
         self.assertFalse(self.controller.deletePages(OTHER, [0]))
@@ -1884,6 +1890,61 @@ class TagSyncTests(Base):
         content = self.content()
         self.assertEqual([t["name"] for t in content["tags"]], ["work"])
         self.assertIn(f"{THROWAWAY}/{PAGE1}/{image.file_name}", self.cloud.item(THROWAWAY))
+
+
+class CopyChainTests(ImagePageBase):
+    """A copy of a copy: A -> B, then B (never opened) -> C, as Copy, then Paste, twice."""
+
+    def test_copying_a_copy_makes_a_third_document(self):
+        b = self.sync.clone_document(THROWAWAY, "", "throwaway copy")
+        tree = self.source.refresh()
+        c = self.sync.clone_document(b, "", "throwaway copy copy")
+        tree = self.source.refresh()
+        a_doc, b_doc, c_doc = tree.get(THROWAWAY), tree.get(b), tree.get(c)
+        self.assertEqual(len({THROWAWAY, b, c}), 3)
+        self.assertEqual((b_doc.name, c_doc.name), ("throwaway copy", "throwaway copy copy"))
+        self.assertEqual((b_doc.page_count, c_doc.page_count), (2, 2))
+        # Every copy has page ids of its own, and the same page bytes as the first document.
+        pages = [d.content.page_ids for d in (a_doc, b_doc, c_doc)]
+        self.assertEqual(len(set(sum(pages, []))), 6)
+        rm = lambda d: self.cloud.item(d.id)[f"{d.id}/{d.content.page_ids[0]}.rm"]      # noqa: E731
+        self.assertEqual(rm(c_doc), rm(a_doc))
+        self.assertEqual(self.cloud.item(c)[f"{c}/{c_doc.content.page_ids[0]}/{self.FILE}"], self.image)
+        # The copy of the copy is a document like any other: its metadata has the same fields.
+        self.assertEqual(sorted(self.cloud.metadata(c)), sorted(self.cloud.metadata(b)))
+        self.assertEqual(self.cloud.metadata(c)["visibleName"], "throwaway copy copy")
+
+
+class PendingEditsAcrossProcessesTests(unittest.TestCase):
+    """The app and tools/push_edits.py share <cache>/pending: what one uploads and
+    discards, the other must not write back (it did: uploaded edits came back)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "pending"
+
+    def edit(self, n: int) -> ImageDelete:
+        return ImageDelete.new(THROWAWAY, PAGE1, bytes([n]) * 16, NOW + n)
+
+    def test_edits_uploaded_by_another_process_are_not_written_back(self):
+        app = PendingEdits(self.root)
+        app.add(self.edit(1))
+        app.add(self.edit(2))
+        tool = PendingEdits(self.root)                 # push_edits.py --confirm, later
+        tool.discard(tool.all())
+        app.add(self.edit(3))                          # the app, still open, edits again
+        self.assertEqual(PendingEdits(self.root).all(), [self.edit(3)])
+        self.assertEqual(app.all(), [self.edit(3)])
+
+    def test_each_process_sees_the_others_edits(self):
+        app, tool = PendingEdits(self.root), PendingEdits(self.root)
+        app.add(self.edit(1))
+        self.assertEqual(tool.all(), [self.edit(1)])
+        tool.add(self.edit(2))
+        self.assertEqual(app.of(THROWAWAY), [self.edit(1), self.edit(2)])
+        app.discard([self.edit(1)])
+        self.assertEqual(tool.all(), [self.edit(2)])
 
 
 if __name__ == "__main__":

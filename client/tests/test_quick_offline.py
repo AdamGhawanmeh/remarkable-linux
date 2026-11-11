@@ -844,6 +844,64 @@ class WorkflowTests(unittest.TestCase):
         controller.cloneEntry(demo_id("Personal"), "")                 # Copy, then Paste of a folder
         self.assertEqual(self.notices[notices:], ["Only documents can be copied"])
 
+    def test_paste_from_qml_copies_the_document(self):
+        # The exact call NavigatorSelection.paste() makes after Copy: two arguments, from QML.
+        from PySide6.QtQml import QQmlComponent
+        lib, notices = self.app.library, len(self.notices)
+        source = lib.tree.get(demo_id("Sketchbook"))
+        before = set(lib.tree.nodes)
+        component = QQmlComponent(self.app.engine)
+        component.setData(b"""
+            import QtQuick
+            import xofm.libs.library
+            QtObject {
+                property string source
+                property string target
+                function paste() { LibraryController.cloneEntry(source, target); }
+            }""", QUrl())
+        selection = component.create()
+        self.assertIsNotNone(selection, component.errorString())
+        selection.setProperty("source", source.id)
+        selection.setProperty("target", "")
+        QMetaObject.invokeMethod(selection, "paste")
+        self.assertTrue(self.wait_for(lambda: set(lib.tree.nodes) - before), self.notices[notices:])
+        [copy_id] = set(lib.tree.nodes) - before
+        self.assertTrue(lib.tree.get(copy_id).name.startswith(f"{source.name} copy"))
+        self.assertEqual(self.notices[notices:], [])
+        selection.deleteLater()
+
+    def test_a_copy_of_a_copy_from_qml(self):
+        # A -> B, then B (a copy, never opened) -> C, each through NavigatorSelection.paste()'s call.
+        from PySide6.QtQml import QQmlComponent
+        lib, notices = self.app.library, len(self.notices)
+        component = QQmlComponent(self.app.engine)
+        component.setData(b"""
+            import QtQuick
+            import xofm.libs.library
+            QtObject {
+                property string source
+                function paste() { LibraryController.cloneEntry(source, ""); }
+            }""", QUrl())
+        selection = component.create()
+        self.assertIsNotNone(selection, component.errorString())
+
+        def paste(source_id):
+            before = set(lib.tree.nodes)
+            selection.setProperty("source", source_id)
+            QMetaObject.invokeMethod(selection, "paste")
+            self.assertTrue(self.wait_for(lambda: set(lib.tree.nodes) - before), self.notices[notices:])
+            [new] = set(lib.tree.nodes) - before
+            return lib.tree.get(new)
+
+        a = lib.tree.get(demo_id("Sketchbook"))
+        b = paste(a.id)
+        c = paste(b.id)
+        self.assertTrue(b.name.startswith(f"{a.name} copy"))
+        self.assertTrue(c.name.startswith(f"{b.name} copy"))
+        self.assertEqual(c.page_count, a.page_count)
+        self.assertEqual(self.notices[notices:], [])
+        selection.deleteLater()
+
     def test_the_tag_dialog_tags_documents_and_pages(self):
         # TagSelectionPopup.onAccepted -> LibraryController.setEntryTags / setPageTags.
         controller, lib = self.app.singletons.controller, self.app.library
@@ -886,17 +944,22 @@ class WorkflowTests(unittest.TestCase):
         source = lib.tree.get(demo_id("Sketchbook"))
         added = []
         lib.entryAdded.connect(added.append)
+        from core.models import unique_name
+        taken = lambda: {n.name for n in lib.tree.nodes.values()}                  # noqa: E731
+        first = unique_name(f"{source.name} copy", taken())                       # other tests may have copied it
         copy_id = controller.cloneEntry(source.id, demo_id("Personal"))
         self.assertTrue(self.wait_for(lambda: lib.tree.get(copy_id) is not None))
         copy = lib.tree.get(copy_id)
-        self.assertEqual((copy.name, copy.parent_id), (f"{source.name} copy", demo_id("Personal")))
+        self.assertEqual((copy.name, copy.parent_id), (first, demo_id("Personal")))
         self.assertEqual(copy.page_count, source.page_count)
         self.assertEqual(added, [copy_id])
-        self.assertEqual(self.cloud_metadata(copy_id)["visibleName"], f"{source.name} copy")
+        self.assertEqual(self.cloud_metadata(copy_id)["visibleName"], first)
         # Pasted again: the name is made unique, as uniqueVisibleName does.
+        second = unique_name(f"{source.name} copy", taken())
+        self.assertNotEqual(second, first)
         again = controller.cloneEntry(source.id, demo_id("Personal"))
         self.assertTrue(self.wait_for(lambda: lib.tree.get(again) is not None))
-        self.assertEqual(lib.tree.get(again).name, f"{source.name} copy 2")
+        self.assertEqual(lib.tree.get(again).name, second)
 
     def test_export_png(self):
         paper = demo_id("Research paper")

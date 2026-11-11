@@ -857,9 +857,14 @@ class DocumentController(QObject):
     library = Property(QObject, lambda self: self._library, _set_library, notify=libraryChanged)
     isRunningTasks = Property(bool, lambda self: False, notify=isRunningTasksChanged)
 
-    def _unsupported(self, what: str) -> None:
-        log.info("%s: not available in this client yet", what)
-        self.notify("Not available on Linux yet")
+    def _unsupported(self, what: str, tell: bool = False) -> None:
+        """A call this client does not make yet: logged (WARNING, so that it is in the
+        journal, with its arguments). `tell`: the user asked for it (pages pasted into
+        another document), so say so; calls the app makes on its own (a template or
+        paper size set while opening a quick sheet) stay silent, as they were."""
+        log.warning("not available in this client yet: %s", what)
+        if tell:
+            self.notify("Not available on Linux yet")
 
     def _now_ms(self) -> int:
         now = getattr(self._library, "now_ms", None)
@@ -894,7 +899,7 @@ class DocumentController(QObject):
     @Slot(str, int, str)
     @Slot(str, int, str, QSizeF)
     def setTemplateForPage(self, document_id: str, page: int, template: str, paper_size=None) -> None:
-        self._unsupported("setTemplateForPage")
+        self._unsupported(f"setTemplateForPage({document_id!r}, page {page}, {template!r})")
 
     def _add_page(self, document_id: str, insert_index: int = -1, template=None, callback=None,
                   page_uuid: str = "") -> bool:
@@ -938,7 +943,7 @@ class DocumentController(QObject):
     @Slot(str, "QVariantList", str, int, "QJSValue", result=bool)
     def movePages(self, document_id: str, pages: list, target_id: str, position: int, callback=None) -> bool:
         if target_id and target_id != document_id:
-            self._unsupported("movePages to another document")
+            self._unsupported(f"movePages({document_id!r}, pages {list(pages)}, to another document {target_id!r}, at {position})", tell=True)
             return False
         return self._edit(document_id, "move pages",
                           lambda source, node: source.move_pages(node, list(pages), position, self._now_ms()),
@@ -947,7 +952,7 @@ class DocumentController(QObject):
     @Slot(str, "QVariantList", str, int, result=bool)
     def copyPages(self, document_id: str, pages: list, target_id: str, position: int) -> bool:
         if target_id and target_id != document_id:
-            self._unsupported("copyPages to another document")
+            self._unsupported(f"copyPages({document_id!r}, pages {list(pages)}, to another document {target_id!r}, at {position})", tell=True)
             return False
 
         def run(source, node):

@@ -1209,7 +1209,8 @@ class LibraryController(QObject):
         self.submit = submit
 
     def _unsupported(self, what: str) -> None:
-        log.info("%s: not available in this client", what)
+        # WARNING, so that it is in the journal: which call the UI made that is not built.
+        log.warning("not available in this client: %s", what)
 
     def _unavailable(self, what: str, message: str) -> None:
         """A change the UI offers but this client cannot make yet: say so, rather than
@@ -1251,10 +1252,10 @@ class LibraryController(QObject):
         source); a "clean" copy (without annotations) is not made yet."""
         node = self.library.tree.get(str(entry_id))
         if clean:
-            self._unavailable("cloneEntry(clean)", "Not available on Linux yet")
+            self._unavailable(f"cloneEntry({entry_id!r}, {collection_id!r}, clean=True)", "Not available on Linux yet")
             return ""
         if not isinstance(node, DocumentNode):
-            self._unavailable("cloneEntry of a folder", "Only documents can be copied")
+            self._unavailable(f"cloneEntry({entry_id!r}, {collection_id!r}) of a folder", "Only documents can be copied")
             return ""
         from core.clone import copy_name
         target = collection_id or ROOT_ID

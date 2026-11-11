@@ -47,11 +47,13 @@ is drawn on it, and a page without one shows as empty paper (as PDF pages do).
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -342,18 +344,58 @@ KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransfor
 
 class PendingEdits:
     """The edits not uploaded yet, oldest first, kept in <root>/edits.json with the image
-    files beside it (by hash). Safe to use from several threads."""
+    files beside it (by hash). Safe to use from several threads and several processes
+    (the app and tools/push_edits.py): the file is the record, read again whenever
+    another process changed it, and every change is a read-modify-write of it under a
+    lock (<root>/.lock), so a process never writes back edits another one has uploaded
+    and discarded meanwhile."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self._lock = threading.Lock()
         self._edits: list[Edit] = []
+        self._seen: tuple | None = None               # (mtime_ns, size, inode) of the file read
+        with self._lock:
+            self._refresh()
+
+    def _stamp(self) -> tuple | None:
         try:
-            raw = read_json(root / EDITS_FILE) or {}
+            st = (self.root / EDITS_FILE).stat()
+        except OSError:
+            return None
+        return st.st_mtime_ns, st.st_size, st.st_ino
+
+    def _refresh(self) -> None:
+        """Read the file again if it is not the one last read (or written) here."""
+        stamp = self._stamp()
+        if stamp == self._seen and self._seen is not None:
+            return
+        self._seen = stamp
+        if stamp is None:
+            self._edits = []
+            return
+        try:
+            raw = read_json(self.root / EDITS_FILE) or {}
             self._edits = [KINDS[e["kind"]].load(e) for e in raw.get("edits") or []]
         except (ValueError, KeyError, TypeError, OSError, EditError) as err:
             # Edits that cannot be read are not uploaded as something else: start empty.
-            log.error("ignoring unreadable %s: %s", root / EDITS_FILE, err)
+            log.error("ignoring unreadable %s: %s", self.root / EDITS_FILE, err)
+            self._edits = []
+
+    @contextmanager
+    def _changing(self):
+        """The edits as the file has them now, to change; written back at the end."""
+        with self._lock:
+            ensure_private_dir(self.root)
+            with open(self.root / ".lock", "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    self._seen = None                   # always read what is on disk now
+                    self._refresh()
+                    yield
+                    self._save()
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _file(self, sha256: str) -> Path:
         if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
@@ -364,13 +406,16 @@ class PendingEdits:
         ensure_private_dir(self.root)
         atomic_write_json(self.root / EDITS_FILE,
                           {"version": 1, "edits": [{"kind": _kind(e), **asdict(e)} for e in self._edits]})
+        self._seen = self._stamp()
 
     def all(self) -> list[Edit]:
         with self._lock:
+            self._refresh()
             return list(self._edits)
 
     def of(self, doc_id: str) -> list[Edit]:
         with self._lock:
+            self._refresh()
             return [e for e in self._edits if e.doc_id == doc_id]
 
     def documents(self) -> list[str]:
@@ -379,18 +424,17 @@ class PendingEdits:
     def add(self, edit: Edit, data: bytes | None = None) -> None:
         """Keep `edit` (and an inserted image's file: first, so an edit on record always
         has its file)."""
-        with self._lock:
+        if isinstance(edit, ImageInsert) and (data is None or hashlib.sha256(data).hexdigest() != edit.sha256
+                                              or len(data) != edit.size):
+            raise EditError("the image is not the one the edit describes")
+        with self._changing():
             if isinstance(edit, ImageInsert):
-                if data is None or hashlib.sha256(data).hexdigest() != edit.sha256 or len(data) != edit.size:
-                    raise EditError("the image is not the one the edit describes")
                 path = self._file(edit.sha256)
-                ensure_private_dir(self.root)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_name(f".{path.name}.tmp")
                 tmp.write_bytes(data)
                 tmp.replace(path)
             self._edits.append(edit)
-            self._save()
 
     def data(self, edit: ImageInsert) -> bytes:
         try:
@@ -400,10 +444,9 @@ class PendingEdits:
 
     def discard(self, edits: list[Edit]) -> None:
         """Forget edits (uploaded, or given up), and image files no edit uses any more."""
-        with self._lock:
-            gone = set(edits)
+        gone = set(edits)
+        with self._changing():
             self._edits = [e for e in self._edits if e not in gone]
-            self._save()
             used = {e.sha256 for e in self._edits if isinstance(e, ImageInsert)}
             for sha in {e.sha256 for e in gone if isinstance(e, ImageInsert)} - used:
                 self._file(sha).unlink(missing_ok=True)
