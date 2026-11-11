@@ -962,6 +962,50 @@ class SyncClient:
         self._commit(f"import {path.name}", edit, progress)
         return doc_id
 
+    def clone_document(self, doc_id: str, parent: str, name: str, copy_id: str | None = None,
+                       progress: Callable[[int, int], None] | None = None) -> str:
+        """Copy a document into folder `parent` under `name` (core.clone: Copy, then Paste,
+        as reMarkable.exe makes it); returns the copy's id. The copy is of the document as
+        shown here, with its pending edits. Files it shares with the source keep their
+        content hash, so only its .content and .metadata are uploaded."""
+        from .clone import clone_files
+        copy_id = copy_id or str(uuid.uuid4())          # fixed across commit retries
+        now = int(ms_timestamp(self._clock()))
+        author = self.author()
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            self._check_folder(tree, parent)
+            node = tree.get(doc_id)
+            if not isinstance(node, Document) or tree.is_trashed(doc_id):
+                raise SyncError("the document to copy is no longer in the library")
+            entries = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
+            try:
+                staged = self.staged_files(node, cached_only=False) if self.edits.of(doc_id) else {}
+            except EditError as err:
+                raise SyncError(f"its pending edits no longer fit: {err}") from err
+            names = (set(entries) | {n for n, d in staged.items() if d is not None}) - \
+                {n for n, d in staged.items() if d is None}
+
+            def read(name: str) -> bytes:
+                return staged[name] if name in staged else self.get_blob(entries[name].hash, name)
+            copied, written = clone_files(node.id, names, read, copy_id=copy_id, name=name, parent=parent,
+                                          now_ms=now, author=author)
+            files: dict[str, IndexEntry] = {}
+            data: dict[str, bytes] = {}
+            for old, new in copied.items():
+                if old in staged:                       # a file only this client has yet
+                    files[new] = entry = file_entry(new, staged[old])
+                    data[entry.hash] = staged[old]
+                else:                                   # the cloud has these bytes already
+                    e = entries[old]
+                    files[new] = IndexEntry(e.hash, e.type, new, e.subfiles, e.size)
+            for new, blob in written.items():
+                files[new] = entry = file_entry(new, blob)
+                data[entry.hash] = blob
+            return [ItemChange(copy_id, files, data)]
+        self._commit(f"copy {doc_id}", edit, progress)
+        return copy_id
+
     def create_folder(self, name: str, parent: str = ROOT_ID) -> str:
         if not name.strip():
             raise ValueError("a folder needs a name")

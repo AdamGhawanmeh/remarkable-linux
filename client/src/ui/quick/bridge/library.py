@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Any, Callable
@@ -1243,9 +1244,26 @@ class LibraryController(QObject):
     @Slot(str, str, result=str)
     @Slot(str, str, bool, result=str)
     def cloneEntry(self, entry_id: str, collection_id: str, clean: bool = False) -> str:
-        # Copy, then Paste, in the library (NavigatorSelection.paste).
-        self._unavailable("cloneEntry", "Copying documents is not available on Linux yet")
-        return ""
+        """Copy, then Paste, in the library (NavigatorSelection.paste): a copy of the
+        document in `collection_id`, named as the app names it (tr "%1 copy", made unique
+        among all entries), committed like an import (SyncClient.clone_document). Returns
+        the copy's id. As in the app, only documents are copied (a folder is not a valid
+        source); a "clean" copy (without annotations) is not made yet."""
+        node = self.library.tree.get(str(entry_id))
+        if clean:
+            self._unavailable("cloneEntry(clean)", "Not available on Linux yet")
+            return ""
+        if not isinstance(node, DocumentNode):
+            self._unavailable("cloneEntry of a folder", "Only documents can be copied")
+            return ""
+        from core.clone import copy_name
+        target = collection_id or ROOT_ID
+        name = unique_name(copy_name(node.name, tr("xofm::libs::library::LibraryController", "%1 copy")),
+                           {n.name for n in self.library.tree.nodes.values()})
+        copy_id = str(uuid.uuid4())
+        self.submit(f"Copying {node.name}", lambda sync, _: sync.clone_document(node.id, target, name, copy_id),
+                    f"Copied {node.name}")
+        return copy_id
 
     @Slot("QStringList", str)
     def moveEntries(self, ids: list, collection_id: str) -> None:

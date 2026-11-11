@@ -182,7 +182,7 @@ when you use them.
 |---|---|
 | Editing pages | See [Editing (experimental)](#editing-experimental) below: images, undo/redo of image edits, and adding, duplicating, moving and deleting pages work; drawing, the eraser and typed text do not yet. |
 | Editing tags | Adding or removing tags says "not available on Linux yet". Tags made on the tablet show and filter. |
-| Duplicating documents | Copy, then Paste, of a document says "not available on Linux yet". Cut and Paste (moving) works. |
+| Duplicating documents | **Working.** Copy, then Paste, in the library makes a copy named as the official app names it ("Name copy", "Name copy 2", ...; translated), with new page ids and the same page files, as the app's copies are; it is uploaded at once like an import (only its `.content` and `.metadata` are new; the cloud already has the rest). A document with edits not uploaded yet is copied as shown, with them. Folders cannot be copied, as in the official app. |
 | Search in documents | The search bar inside a document opens but does not find anything yet. |
 | EPUBs | Shown through the PDF version your tablet makes of them. An EPUB imported here opens once the tablet has opened it and synced; until then the viewer says so. There is no reflowing, font or margin setting. |
 | Password-protected PDFs | Not supported. |

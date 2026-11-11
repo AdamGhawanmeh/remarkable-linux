@@ -1422,10 +1422,9 @@ def image_page(key: bytes, file_name: str) -> bytes:
     return rm_writer.append_image(drawn_page(), author=TABLET, key=key, file_name=file_name, vertices=box())
 
 
-class PageEditTests(Base):
-    """Pages added, duplicated, moved and deleted: kept as pending edits, shown at once
-    (LibrarySource.view) and uploaded by push_edits, as reMarkable.exe's DocumentWorker
-    changes a document."""
+class ImagePageBase(Base):
+    """The throwaway notebook with an image on its first page, an image file and a page
+    metadata file, as tablet pages have them."""
 
     KEY = bytes(range(32, 48))
     FILE = "cccccccc-0000-4000-8000-000000000001.png"
@@ -1440,6 +1439,13 @@ class PageEditTests(Base):
                              f"{THROWAWAY}/{PAGE1}-metadata.json": b'{"layers": [{"name": "Layer 1"}]}\n'})
         self.tree = self.source.refresh()
         self.doc = self.tree.get(THROWAWAY)
+
+
+
+class PageEditTests(ImagePageBase):
+    """Pages added, duplicated, moved and deleted: kept as pending edits, shown at once
+    (LibrarySource.view) and uploaded by push_edits, as reMarkable.exe's DocumentWorker
+    changes a document."""
 
     def staged(self) -> Staged:
         return self.source.staged(self.doc)
@@ -1673,6 +1679,104 @@ class DocumentControllerTests(Base):
         self.assertFalse(self.controller.movePages(THROWAWAY, [7], THROWAWAY, 0))
         self.assertEqual(len(self.messages), 3)
         self.assertEqual(self.sync.edits.all(), [])
+
+
+# ------------------------------------------------------------------ document copies
+
+class CloneTests(ImagePageBase):
+    """Copy, then Paste, of a document (core.clone, SyncClient.clone_document): a new
+    document with new page ids, its files the source's bytes, as the tablet's copies in
+    a real library are."""
+
+    def clone(self, name="throwaway copy", parent="", now=NOW, **kw):
+        from core.clone import clone_files
+        doc = kw.pop("doc", self.doc)
+        ids = iter(f"eeeeeeee-0000-4000-8000-{n:012d}" for n in range(1, 99))
+        return clone_files(doc.id, doc.files, lambda n: self.source.blob(doc, n), copy_id=COPY, name=name,
+                           parent=parent, now_ms=now, author=self.sync.author(), new_page_id=lambda: next(ids))
+
+    def test_the_copy_gets_new_ids_and_the_same_page_bytes(self):
+        copied, written = self.clone()
+        new1, new2 = "eeeeeeee-0000-4000-8000-000000000001", "eeeeeeee-0000-4000-8000-000000000002"
+        self.assertEqual(copied, {f"{THROWAWAY}/{PAGE1}.rm": f"{COPY}/{new1}.rm",
+                                  f"{THROWAWAY}/{PAGE1}/{self.FILE}": f"{COPY}/{new1}/{self.FILE}",
+                                  f"{THROWAWAY}/{PAGE1}-metadata.json": f"{COPY}/{new1}-metadata.json"})
+        self.assertEqual(sorted(written), [f"{COPY}.content", f"{COPY}.metadata"])
+        content = json.loads(written[f"{COPY}.content"])
+        cpages = content["cPages"]
+        self.assertEqual([(p["id"], p["idx"], p["template"]) for p in cpages["pages"]],
+                         [(new1, {"timestamp": "2:2", "value": "ba"}, {"timestamp": "2:2", "value": "Blank"}),
+                          (new2, {"timestamp": "2:2", "value": "bb"}, {"timestamp": "2:2", "value": "Blank"})])
+        self.assertEqual(cpages["lastOpened"], {"timestamp": "2:1", "value": new1})
+        self.assertEqual(cpages["original"], {"timestamp": "2:1", "value": -1})
+        self.assertEqual(cpages["uuids"][1:], [{"first": TABLET_UUID, "second": 1}])     # the source's authors
+        self.assertEqual(content["pageCount"], 2)
+        source = json.loads(self.source.blob(self.doc, f"{THROWAWAY}.content"))
+        self.assertEqual({k: v for k, v in content.items() if k not in ("cPages",)},
+                         {k: v for k, v in source.items() if k not in ("cPages",)})
+
+    def test_the_copy_is_named_placed_and_new(self):
+        _, written = self.clone(name="Mine", parent=OTHER)
+        metadata = json.loads(written[f"{COPY}.metadata"])
+        self.assertEqual({k: metadata[k] for k in ("visibleName", "parent", "createdTime", "lastModified",
+                                                    "lastOpened", "lastOpenedPage", "pinned", "type")},
+                         {"visibleName": "Mine", "parent": OTHER, "createdTime": str(NOW), "lastModified": str(NOW),
+                          "lastOpened": "0", "lastOpenedPage": 0, "pinned": False, "type": "DocumentType"})
+        from core.clone import copy_name
+        self.assertEqual(copy_name("throwaway"), "throwaway copy")
+        self.assertEqual(copy_name("Notes", "Copie %1"), "Copie Notes")        # as the French catalogue has it
+
+    def test_deleted_pages_and_their_tags_stay_behind(self):
+        self.source.delete_pages(self.doc, [1], NOW)
+        self.sync.push_edits(THROWAWAY)
+        doc = self.sync.tree.get(THROWAWAY)
+        content = json.loads(self.source.blob(doc, f"{THROWAWAY}.content"))
+        content["pageTags"] = [{"name": "a", "pageId": PAGE1, "timestamp": 1}, {"name": "b", "pageId": PAGE2, "timestamp": 1}]
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), content,
+                            {n: data for n, data in self.cloud.item(THROWAWAY).items()
+                             if not n.endswith((".content", ".metadata"))})
+        doc = self.source.refresh().get(THROWAWAY)
+        _, written = self.clone(doc=doc)
+        copy = json.loads(written[f"{COPY}.content"])
+        self.assertEqual(len(copy["cPages"]["pages"]), 1)
+        self.assertEqual(copy["pageTags"], [{"name": "a", "pageId": "eeeeeeee-0000-4000-8000-000000000001", "timestamp": 1}])
+
+    def test_paste_uploads_only_the_new_files(self):
+        copy_id = self.sync.clone_document(THROWAWAY, "", "throwaway copy", COPY)
+        self.assertEqual(copy_id, COPY)
+        uploaded = [w for w in self.writes() if not w.endswith(".docSchema") and w != "/sync/v3/root"]
+        self.assertEqual(sorted(uploaded), [f"{COPY}.content", f"{COPY}.metadata"])     # the rest by hash
+        item = self.cloud.item(COPY)
+        source = self.cloud.item(THROWAWAY)
+        page = next(n for n in item if n.endswith(".rm"))
+        self.assertEqual(item[page], source[f"{THROWAWAY}/{PAGE1}.rm"])
+        self.assertEqual(item[f"{page[:-3]}/{self.FILE}"], self.image)
+        tree = self.source.refresh()
+        copy = tree.get(COPY)
+        self.assertEqual((copy.name, copy.parent_id, copy.page_count), ("throwaway copy", "", 2))
+        self.assertFalse(set(copy.content.page_ids) & set(tree.get(THROWAWAY).content.page_ids))
+        self.assertEqual(tree.get(THROWAWAY).hash, self.doc.hash)                          # the source is untouched
+
+    def test_a_copy_has_the_pending_edits_of_its_source(self):
+        image = self.insert(PAGE1)
+        added = self.source.add_page(self.doc, 2, "Blank", NOW)
+        self.sync.clone_document(THROWAWAY, "", "throwaway copy", COPY)
+        item = self.cloud.item(COPY)
+        content = json.loads(item[f"{COPY}.content"])
+        self.assertEqual(content["pageCount"], 3)
+        first = content["cPages"]["pages"][0]["id"]
+        self.assertEqual(set(page_images(item[f"{COPY}/{first}.rm"]).values()), {self.FILE, image.file_name})
+        self.assertEqual(item[f"{COPY}/{first}/{image.file_name}"], self.image)
+        self.assertEqual(len(self.sync.edits.of(THROWAWAY)), 2)              # still pending on the source
+        self.assertNotEqual(content["cPages"]["pages"][2]["id"], added.new_id)   # a copy's pages are its own
+
+    def test_a_copy_cannot_go_into_a_folder_that_is_gone(self):
+        with self.assertRaises(SyncError):
+            self.sync.clone_document(THROWAWAY, "ffffffff-0000-4000-8000-000000000000", "x", COPY)
+        self.assertIsNone(self.source.refresh().get(COPY))
+
+
+COPY = "cccccccc-1111-4111-8111-111111111111"
 
 
 if __name__ == "__main__":

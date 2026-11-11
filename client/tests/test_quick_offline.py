@@ -841,10 +841,28 @@ class WorkflowTests(unittest.TestCase):
 
     def test_unavailable_changes_say_so(self):
         controller, notices = self.app.singletons.controller, len(self.notices)
-        controller.cloneEntry(demo_id("Sketchbook"), "")               # Copy, then Paste
+        controller.cloneEntry(demo_id("Personal"), "")                 # Copy, then Paste of a folder
         controller.setEntryTags(demo_id("Sketchbook"), ["work"], [])   # the Tag dialog
-        self.assertEqual(self.notices[notices:], ["Copying documents is not available on Linux yet",
+        self.assertEqual(self.notices[notices:], ["Only documents can be copied",
                                                   "Editing tags is not available on Linux yet"])
+
+    def test_copy_then_paste_makes_a_named_copy(self):
+        # NavigatorSelection.paste after Copy: LibraryController.cloneEntry(id, folder).
+        controller, lib = self.app.singletons.controller, self.app.library
+        source = lib.tree.get(demo_id("Sketchbook"))
+        added = []
+        lib.entryAdded.connect(added.append)
+        copy_id = controller.cloneEntry(source.id, demo_id("Personal"))
+        self.assertTrue(self.wait_for(lambda: lib.tree.get(copy_id) is not None))
+        copy = lib.tree.get(copy_id)
+        self.assertEqual((copy.name, copy.parent_id), (f"{source.name} copy", demo_id("Personal")))
+        self.assertEqual(copy.page_count, source.page_count)
+        self.assertEqual(added, [copy_id])
+        self.assertEqual(self.cloud_metadata(copy_id)["visibleName"], f"{source.name} copy")
+        # Pasted again: the name is made unique, as uniqueVisibleName does.
+        again = controller.cloneEntry(source.id, demo_id("Personal"))
+        self.assertTrue(self.wait_for(lambda: lib.tree.get(again) is not None))
+        self.assertEqual(lib.tree.get(again).name, f"{source.name} copy 2")
 
     def test_export_png(self):
         paper = demo_id("Research paper")
