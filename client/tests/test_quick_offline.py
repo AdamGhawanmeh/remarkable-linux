@@ -1370,6 +1370,34 @@ class EditingTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: any(v.property("status") == 2 for v in self.scene_views())))
         actions.deleteLater()
 
+    def test_page_copy_and_paste_with_the_keyboard_duplicates_the_page(self):
+        # Page overview: click a page, Ctrl+C (PageActions.copyPageAction), Ctrl+V
+        # (moveTo -> DocumentController.copyPages(doc, pages, doc, index)): the same document.
+        from PySide6.QtTest import QTest
+        self.open_document(self.THROWAWAY)
+        click = lambda x, y: QTest.mouseClick(self.window, Qt.MouseButton.LeftButton,      # noqa: E731
+                                              Qt.KeyboardModifier.NoModifier, QPoint(x, y))
+        if self.app.singletons.user_info.property("featureToggles")["clientEdit"]:
+            click(842, 143)                              # skip the editing introduction, if shown
+            wait(500)
+        self.window.requestActivate()
+        click(160, 500)                                  # focus the document
+        wait(300)
+        click(1082, 65)                                  # page overview
+        wait(1500)
+        click(100, 350)                                  # the first page
+        wait(500)
+        QTest.keyClick(self.window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+        wait(300)
+        QTest.keyClick(self.window, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+        self.assertTrue(self.wait_for(lambda: bool(self.pending())), self.notices)
+        [copy] = self.pending()
+        self.assertEqual((type(copy).__name__, copy.doc_id, copy.sources, copy.index),
+                         ("PageCopy", self.THROWAWAY, (self.PAGE1,), 1))
+        entry = self.app.library.entryForId(self.THROWAWAY)
+        self.assertTrue(self.wait_for(lambda: entry.property("pageCount") == 3))
+        self.assertEqual(self.notices, [])
+
     def test_another_notebook_is_never_edited(self):
         view = self.open_document(self.OTHER)
         view._controller.insertImageFileAsSceneItem(QUrl.fromLocalFile(str(self.picture)), QPointF(0, 300))

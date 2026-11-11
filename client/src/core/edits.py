@@ -853,6 +853,8 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
         return {}
     newest = max([*changed.values(), *(e.created_ms for e in staged.page_list_edits)])
     metadata = json.loads(read(metadata_name))
-    metadata["lastModified"] = _later(metadata.get("lastModified"), newest)
-    out[metadata_name] = json_bytes(metadata)
+    stamp = _later(metadata.get("lastModified"), newest)
+    if stamp != metadata.get("lastModified"):           # times never go back: it may stay as it is
+        metadata["lastModified"] = stamp
+        out[metadata_name] = json_bytes(metadata)
     return out

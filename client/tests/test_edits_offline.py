@@ -229,7 +229,7 @@ class DocumentFilesTests(Base):
 
     def test_times_never_go_back(self):
         files = self.files([self.edit(when=THEN - 5000)])
-        self.assertEqual(json.loads(files[f"{THROWAWAY}.metadata"])["lastModified"], str(THEN))
+        self.assertNotIn(f"{THROWAWAY}.metadata", files)              # lastModified stays: nothing to upload
         page = json.loads(files[f"{THROWAWAY}.content"])["cPages"]["pages"][0]
         self.assertEqual(page["modifed"], str(THEN - 5000))        # it had none: the time of the edit
 
