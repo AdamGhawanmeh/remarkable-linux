@@ -1024,6 +1024,63 @@ class SyncClient:
         self._commit(f"create folder {name!r}", edit)
         return folder_id
 
+    def _content_change(self, node: Node, change: Callable[[dict, int], bool]) -> ItemChange | None:
+        """`node` with its .content changed by `change(content, now_ms)` (False: nothing to
+        change) and lastModified set to now, as Entry::setLastModified does after a tag
+        change; None when nothing changes."""
+        files = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
+        content_name, metadata_name = f"{node.id}.content", f"{node.id}.metadata"
+        content = json.loads(self.get_blob(files[content_name].hash, content_name)) if content_name in files else {}
+        now = int(ms_timestamp(self._clock()))
+        if not change(content, now):
+            return None
+        data = {}
+        for name, raw in ((content_name, content), (metadata_name, {**node.metadata.raw, "lastModified": str(now)})):
+            blob = json_bytes(raw)
+            files[name] = entry = file_entry(name, blob)
+            data[entry.hash] = blob
+        return ItemChange(node.id, files, data)
+
+    def set_tags(self, item_ids: Iterable[str], tags: Iterable[str], keep: Iterable[str] = ()) -> DocumentTree:
+        """Set the tags of documents or folders as the app's tag dialog does
+        (core.tags.set_entry_tags: `tags` ticked, `keep` half ticked)."""
+        from .tags import set_entry_tags
+        item_ids, tags, keep = list(item_ids), list(tags), list(keep)
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            changes = []
+            for item_id in item_ids:
+                node = tree.get(item_id)
+                if node is None or tree.is_trashed(item_id):
+                    continue
+                change = self._content_change(node, lambda content, now: set_entry_tags(content, tags, keep, now))
+                if change is not None:
+                    changes.append(change)
+            return changes
+        return self._commit(f"tags of {', '.join(item_ids)}", edit)
+
+    def set_page_tags(self, doc_id: str, page_ids: Iterable[str], tags: Iterable[str],
+                      keep: Iterable[str] = ()) -> DocumentTree:
+        """Set the tags of pages of a document (core.tags.set_page_tags). The pages must be
+        in the document as the cloud has it (not only added here, still pending)."""
+        from .tags import set_page_tags
+        page_ids, tags, keep = list(page_ids), list(tags), list(keep)
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            node = tree.get(doc_id)
+            if not isinstance(node, Document) or tree.is_trashed(doc_id):
+                raise SyncError("the document is no longer in the library")
+            live = set(node.content.page_ids)
+            missing = [p for p in page_ids if p not in live]
+            if missing and not live:
+                raise SyncError("the document has no page list yet: open it once on your reMarkable")
+            if missing:
+                raise SyncError("a page to tag is not in the document in the cloud yet "
+                                "(upload its pending page edits first)")
+            change = self._content_change(node, lambda content, now: set_page_tags(content, page_ids, tags, keep, now))
+            return [change] if change is not None else []
+        return self._commit(f"page tags of {doc_id}", edit)
+
     def rename(self, item_id: str, name: str) -> DocumentTree:
         if not name.strip():
             raise ValueError("a name cannot be empty")

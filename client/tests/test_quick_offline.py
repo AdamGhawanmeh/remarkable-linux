@@ -842,9 +842,43 @@ class WorkflowTests(unittest.TestCase):
     def test_unavailable_changes_say_so(self):
         controller, notices = self.app.singletons.controller, len(self.notices)
         controller.cloneEntry(demo_id("Personal"), "")                 # Copy, then Paste of a folder
-        controller.setEntryTags(demo_id("Sketchbook"), ["work"], [])   # the Tag dialog
-        self.assertEqual(self.notices[notices:], ["Only documents can be copied",
-                                                  "Editing tags is not available on Linux yet"])
+        self.assertEqual(self.notices[notices:], ["Only documents can be copied"])
+
+    def test_the_tag_dialog_tags_documents_and_pages(self):
+        # TagSelectionPopup.onAccepted -> LibraryController.setEntryTags / setPageTags.
+        controller, lib = self.app.singletons.controller, self.app.library
+        doc_id = demo_id("Sketchbook")
+        entry = lib.entryForId(doc_id)
+        controller.setEntryTags(doc_id, ["work", "ideas"], [])
+        self.assertTrue(self.wait_for(lambda: sorted(entry.property("tags")) == ["ideas", "work"]))
+        self.assertIn("work", lib.tagLabels(True))
+        controller.setPageTags(doc_id, [0], ["todo"], [])
+        self.assertTrue(self.wait_for(lambda: entry.tagsForPage(0) == ["todo"]))
+        self.assertIn(doc_id, [r["documentId"] for r in lib.taggedPages()])
+        controller.setEntryTags(doc_id, ["ideas"], [])                 # "work" unticked
+        self.assertTrue(self.wait_for(lambda: entry.property("tags") == ["ideas"]))
+        fresh = SyncClient(paired_auth(self.dir / "auth-tags", self.cloud), Path(tempfile.mkdtemp(dir=self.dir)))
+        content = fresh.refresh().get(doc_id).content
+        self.assertEqual((content.tags, [t["name"] for t in content.raw["pageTags"]]), (["ideas"], ["todo"]))
+        # The same calls from QML, with JS arrays as TagSelectionPopup passes them.
+        from PySide6.QtQml import QQmlComponent
+        component = QQmlComponent(self.app.engine)
+        component.setData(b"""
+            import QtQuick
+            import xofm.libs.library
+            QtObject {
+                property string doc
+                function clear() {
+                    LibraryController.setEntryTags(doc, [], ["ideas"]);
+                    LibraryController.setPageTags(doc, [0], [], []);
+                }
+            }""", QUrl())
+        dialog = component.create()
+        self.assertIsNotNone(dialog, component.errorString())
+        dialog.setProperty("doc", doc_id)
+        QMetaObject.invokeMethod(dialog, "clear")
+        self.assertTrue(self.wait_for(lambda: entry.property("tags") == ["ideas"] and not entry.tagsForPage(0)))
+        dialog.deleteLater()
 
     def test_copy_then_paste_makes_a_named_copy(self):
         # NavigatorSelection.paste after Copy: LibraryController.cloneEntry(id, folder).

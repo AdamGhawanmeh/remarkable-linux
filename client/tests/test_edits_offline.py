@@ -33,6 +33,7 @@ from core.edits import (EditError, ImageDelete, ImageInsert, ImageRestore, Image
                         PageCopy, PageDelete, PageMove, PendingEdits, Staged, document_files, page_images,
                         page_with_edits)
 from core import pagemap  # noqa: E402
+from core.tags import set_entry_tags, set_page_tags  # noqa: E402
 from core.pagemap import PageMap, PageMapError, jump, key_after, keys_after, keys_between, not_before  # noqa: E402
 from core.models import Content, json_bytes  # noqa: E402
 from core.sync import SyncClient, SyncError, json_changes, parse_index  # noqa: E402
@@ -1777,6 +1778,112 @@ class CloneTests(ImagePageBase):
 
 
 COPY = "cccccccc-1111-4111-8111-111111111111"
+
+
+# ------------------------------------------------------------------ tags
+
+class TagRuleTests(unittest.TestCase):
+    """core.tags: the tag dialog's result applied as reMarkable.exe's EntryTags::set does."""
+
+    def test_ticked_tags_are_added_with_the_time_and_sorted(self):
+        content = {}
+        self.assertTrue(set_entry_tags(content, ["work", "ideas", "", "work"], [], NOW))
+        self.assertEqual(content["tags"], [{"name": "ideas", "timestamp": NOW}, {"name": "work", "timestamp": NOW}])
+        # Added later: after the older ones (sorted by time, then name).
+        self.assertTrue(set_entry_tags(content, ["work", "ideas", "alpha"], [], NOW + 5))
+        self.assertEqual([t["name"] for t in content["tags"]], ["ideas", "work", "alpha"])
+        self.assertEqual(content["tags"][0]["timestamp"], NOW)                   # kept tags keep their time
+
+    def test_unticked_tags_go_and_half_ticked_ones_stay(self):
+        content = {"tags": [{"name": "a", "timestamp": 1}, {"name": "b", "timestamp": 2}, {"name": "c", "timestamp": 3}]}
+        self.assertTrue(set_entry_tags(content, ["a"], ["c"], NOW))
+        self.assertEqual(content["tags"], [{"name": "a", "timestamp": 1}, {"name": "c", "timestamp": 3}])
+        self.assertFalse(set_entry_tags(content, ["a"], ["c"], NOW))             # nothing to change
+        self.assertTrue(set_entry_tags(content, [], [], NOW))
+        self.assertEqual(content["tags"], [])
+
+    def test_names_are_exact_and_duplicates_dropped(self):
+        content = {"tags": [{"name": "Work", "timestamp": 1}, {"name": "Work", "timestamp": 2}]}
+        set_entry_tags(content, ["Work", "work"], [], NOW)
+        self.assertEqual(content["tags"], [{"name": "Work", "timestamp": 1}, {"name": "work", "timestamp": NOW}])
+
+    def test_page_tags_change_only_the_chosen_pages(self):
+        content = {"pageTags": [{"name": "x", "pageId": P[0], "timestamp": 1},
+                                {"name": "x", "pageId": P[1], "timestamp": 1},
+                                {"name": "y", "pageId": P[1], "timestamp": 2}]}
+        self.assertTrue(set_page_tags(content, [P[1], P[2]], ["x", "z"], ["y"], NOW))
+        self.assertEqual(content["pageTags"], [
+            {"name": "x", "pageId": P[0], "timestamp": 1},                       # another page: untouched
+            {"name": "x", "pageId": P[1], "timestamp": 1},                       # kept, with its time
+            {"name": "y", "pageId": P[1], "timestamp": 2},                       # half ticked: kept
+            {"name": "z", "pageId": P[1], "timestamp": NOW},
+            {"name": "x", "pageId": P[2], "timestamp": NOW},
+            {"name": "z", "pageId": P[2], "timestamp": NOW}])
+        self.assertTrue(set_page_tags(content, [P[1]], [], [], NOW))
+        self.assertEqual({(t["pageId"], t["name"]) for t in content["pageTags"]},
+                         {(P[0], "x"), (P[2], "x"), (P[2], "z")})
+        self.assertFalse(set_page_tags(content, [P[1]], [], [], NOW))
+
+    def test_written_as_the_app_writes_them(self):
+        content = {"tags": []}
+        set_entry_tags(content, ["work"], [], NOW)
+        set_page_tags(content, [P[0]], ["todo"], [], NOW)
+        text = json_bytes(content).decode()
+        self.assertIn(f'"timestamp": {NOW}\n', text)                                # a number, not a string
+        self.assertEqual(Content.parse(content).tags, ["work"])
+
+
+class TagSyncTests(Base):
+    """Tags uploaded as a rename is: the item's .content and lastModified, at once."""
+
+    def content(self, item_id=THROWAWAY) -> dict:
+        return json.loads(self.cloud.item(item_id)[f"{item_id}.content"])
+
+    def test_document_tags_change_content_and_last_modified_only(self):
+        before = self.cloud.item(THROWAWAY)
+        self.sync._clock = lambda: NOW / 1000
+        self.sync.set_tags([THROWAWAY], ["work"], [])
+        after = self.cloud.item(THROWAWAY)
+        self.assertEqual(sorted(n for n in after if after[n] != before.get(n)),
+                         [f"{THROWAWAY}.content", f"{THROWAWAY}.metadata"])
+        self.assertEqual(self.content()["tags"], [{"name": "work", "timestamp": NOW}])
+        old = json.loads(before[f"{THROWAWAY}.content"])
+        self.assertEqual(json_changes(old, self.content()), [("tags", [], [{"name": "work", "timestamp": NOW}])])
+        self.assertEqual(json_changes(self.doc.metadata.raw, self.cloud.metadata(THROWAWAY)),
+                         [("lastModified", str(THEN), str(NOW))])
+        self.assertEqual(self.sync.tree.get(THROWAWAY).content.tags, ["work"])
+
+    def test_nothing_to_change_writes_nothing(self):
+        self.sync.set_tags([THROWAWAY], ["work"], [])
+        writes = len(self.writes())
+        self.sync.set_tags([THROWAWAY], ["work"], [])
+        self.assertEqual(len(self.writes()), writes)
+
+    def test_any_document_and_folders_can_be_tagged(self):
+        folder = self.sync.create_folder("Box")
+        self.sync.set_tags([OTHER, folder, "gone-id"], ["shared"], [])
+        self.assertEqual([t["name"] for t in self.content(OTHER)["tags"]], ["shared"])
+        self.assertEqual([t["name"] for t in self.content(folder)["tags"]], ["shared"])
+
+    def test_page_tags_are_uploaded(self):
+        self.sync.set_page_tags(THROWAWAY, [PAGE2], ["todo"], [])
+        self.assertEqual([(t["name"], t["pageId"]) for t in self.content()["pageTags"]], [("todo", PAGE2)])
+        self.assertEqual(self.sync.tree.get(THROWAWAY).content.raw["pageTags"][0]["pageId"], PAGE2)
+
+    def test_pages_the_cloud_does_not_have_cannot_be_tagged(self):
+        added = self.source.add_page(self.doc, 0, "Blank", NOW)            # pending, not uploaded
+        with self.assertRaises(SyncError):
+            self.sync.set_page_tags(THROWAWAY, [added.new_id], ["todo"], [])
+        with self.assertRaises(SyncError):
+            self.sync.set_page_tags(PDF, ["pdf-page-0"], ["todo"], [])     # no page list yet
+
+    def test_tags_and_pending_edits_both_reach_the_cloud(self):
+        image = self.insert()
+        self.sync.set_tags([THROWAWAY], ["work"], [])
+        self.sync.push_edits(THROWAWAY)
+        content = self.content()
+        self.assertEqual([t["name"] for t in content["tags"]], ["work"])
+        self.assertIn(f"{THROWAWAY}/{PAGE1}/{image.file_name}", self.cloud.item(THROWAWAY))
 
 
 if __name__ == "__main__":

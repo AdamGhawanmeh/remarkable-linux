@@ -1354,11 +1354,32 @@ class LibraryController(QObject):
 
     @Slot(str, "QStringList", "QStringList")
     def setEntryTags(self, entry_id: str, tags: list, keep_tags: list) -> None:
-        self._unavailable("setEntryTags", "Editing tags is not available on Linux yet")
+        """The tag dialog on documents or folders: `tags` ticked, `keep_tags` half ticked
+        (core.tags.set_entry_tags), committed like a rename."""
+        node = self.library.tree.get(str(entry_id))
+        if node is None:
+            return
+        tags, keep = [str(t) for t in tags or []], [str(t) for t in keep_tags or []]
+        self.submit("Tagging", lambda sync, _: sync.set_tags([node.id], tags, keep), "")
 
     @Slot(str, "QVariantList", "QStringList", "QStringList")
     def setPageTags(self, entry_id: str, pages: list, tags: list, keep_tags: list) -> None:
-        self._unavailable("setPageTags", "Editing tags is not available on Linux yet")
+        """The tag dialog on pages (page numbers of the document as shown)."""
+        node = self.library.tree.get(str(entry_id))
+        if not isinstance(node, DocumentNode):
+            return
+        ids = node.content.page_ids
+        try:
+            page_ids = [ids[int(p)] for p in pages or []]
+        except (IndexError, ValueError, TypeError):
+            self.library.errorMessage.emit("These pages cannot be tagged")
+            return
+        if not page_ids:
+            self.library.errorMessage.emit("This document's pages cannot be tagged until it has been opened on "
+                                           "your reMarkable")
+            return
+        tags, keep = [str(t) for t in tags or []], [str(t) for t in keep_tags or []]
+        self.submit("Tagging pages", lambda sync, _: sync.set_page_tags(node.id, page_ids, tags, keep), "")
 
     @Slot(str, int, result="QStringList")
     def tagsForPage(self, entry_id: str, page: int) -> list:
