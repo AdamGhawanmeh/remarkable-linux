@@ -1203,10 +1203,14 @@ class LibraryController(QObject):
     entryMoved = Signal(str)
 
     def __init__(self, library: Library, submit: Callable[[str, Callable, str], None],
-                 parent: QObject | None = None) -> None:
+                 parent: QObject | None = None,
+                 inherit_editing: Callable[[str, str], bool] | None = None) -> None:
         super().__init__(parent)
         self.library = library
         self.submit = submit
+        # (source id, copy id) after a copy is made: a copy of a notebook that may be
+        # edited may be edited too (LibrarySource.inherit_editing).
+        self.inherit_editing = inherit_editing or (lambda source_id, copy_id: False)
 
     def _unsupported(self, what: str) -> None:
         # WARNING, so that it is in the journal: which call the UI made that is not built.
@@ -1262,8 +1266,12 @@ class LibraryController(QObject):
         name = unique_name(copy_name(node.name, tr("xofm::libs::library::LibraryController", "%1 copy")),
                            {n.name for n in self.library.tree.nodes.values()})
         copy_id = str(uuid.uuid4())
-        self.submit(f"Copying {node.name}", lambda sync, _: sync.clone_document(node.id, target, name, copy_id),
-                    f"Copied {node.name}")
+        inherit = self.inherit_editing
+
+        def copy(sync, _):
+            sync.clone_document(node.id, target, name, copy_id)
+            inherit(node.id, copy_id)
+        self.submit(f"Copying {node.name}", copy, f"Copied {node.name}")
         return copy_id
 
     @Slot("QStringList", str)

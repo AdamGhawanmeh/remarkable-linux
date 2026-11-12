@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
@@ -24,10 +25,12 @@ from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, Fil
 from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageAdd,
                         PageCopy, PageDelete, PageHistory, PageMove, Staged, document_files, swapped)
 from core.sync import SyncClient, SyncError, sha256_hex
+from core.config import atomic_write_json, read_json
 from viewer import rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
+EDITABLE_COPIES = "editable-copies.json"    # in the cache: copies of editable notebooks (their ids)
 log = logging.getLogger("rm.ui.library")
 
 
@@ -311,6 +314,9 @@ class LibrarySource:
 
     `editable` names the notebooks whose pages may be edited here (none by default):
     editing is being built feature by feature, and is tried on notebooks named for it.
+    A copy made here of a notebook that may be edited may be edited too, and so on down
+    (inherit_editing): their ids are kept with the cache (EDITABLE_COPIES), so they stay
+    so after a restart.
     Edits are kept locally (SyncClient.edits) and drawn over the cached pages; uploading
     them is SyncClient.push_edits.
     """
@@ -320,6 +326,8 @@ class LibrarySource:
         self.sync = sync
         self.cached_only = cached_only
         self.editable = tuple(editable)
+        self._copies_file = Path(sync.root_dir) / EDITABLE_COPIES
+        self._copies: set[str] = self._read_copies()
         self._scenes: OrderedDict[str, PageScene | None] = OrderedDict()
         self._scene_cache = scene_cache
         self._lock = threading.Lock()
@@ -354,15 +362,43 @@ class LibrarySource:
 
     # -- editing ------------------------------------------------------------------
 
+    def _read_copies(self) -> set[str]:
+        try:
+            raw = read_json(self._copies_file) or {}
+            return {str(i) for i in raw.get("ids") or [] if isinstance(i, str) and i}
+        except (OSError, ValueError, AttributeError) as err:
+            log.error("ignoring unreadable %s: %s", self._copies_file, err)
+            return set()
+
+    def inherit_editing(self, source_id: str, copy_id: str) -> bool:
+        """A copy of document `source_id` was made (LibraryController.cloneEntry): when
+        the source may be edited here, so may the copy, from now on (kept with the
+        cache). Whether it may."""
+        source = self.sync.tree.get(source_id)
+        if not self.can_edit(source) or not copy_id:
+            return False
+        with self._lock:
+            self._copies = self._read_copies() | {str(copy_id)}
+            atomic_write_json(self._copies_file, {"version": 1, "ids": sorted(self._copies)})
+        log.info("copy %s of editable notebook %s may be edited too", copy_id, source_id)
+        return True
+
     def edit_refusal(self, doc: Document | None) -> str:
         """Why `doc` may not be edited here ("": it may): only a notebook, not in the
-        trash, whose name is one of `editable` and the only notebook of that name, so
-        an edit can never land on a document it was not meant for."""
+        trash, whose name is one of `editable` and the only notebook of that name, or a
+        copy made here of one that may be edited (by its id), so an edit can never land
+        on a document it was not meant for."""
         if not self.editable:
             return "Editing is not turned on"
         tree = self.sync.tree
         if not isinstance(doc, Document) or tree.get(doc.id) is None:
             return "This document is not in the library"
+        if doc.id in self._copies:
+            if doc.file_type is not FileType.NOTEBOOK:
+                return "Only notebooks can be edited"
+            if tree.is_trashed(doc.id):
+                return "A document in the trash cannot be edited"
+            return ""
         if doc.name not in self.editable:
             return f"Editing is only turned on for the notebook named {' or '.join(map(repr, self.editable))}"
         if doc.file_type is not FileType.NOTEBOOK:
@@ -620,12 +656,34 @@ class LibrarySource:
             if not source:
                 return False
             doc = self._editable(doc, page_id)
-            edits, back = swapped(source[-1], doc.id, page_id, now_ms)
+            edits, back = swapped(source[-1], doc.id, page_id, now_ms, history.aliases)
             self._add_edits(doc, [(e, None) for e in edits])
             source.pop()
             target.append(back)
             history.seen = self._seen(doc.id, page_id)
             return True
+
+    # -- typed text --
+
+    def text_page(self, doc: Document, page_id: str):
+        """(the page's .rm with its pending edits, None when it has none; what those
+        edits made, to name items in new ones: core.edits.Replay) for typing on it.
+        EditError when the page may not be edited here."""
+        doc = self._editable(doc, page_id)
+        return self.staged(doc).replay(page_id)
+
+    def add_text_edits(self, doc: Document, page_id: str, edits: list, steps: list) -> None:
+        """Keep text edits typed on a page (ui.textedit.TextSession.take), and their
+        undo steps, each one action for undo, as the app's text actions are."""
+        if not edits:
+            return
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            self._add_edits(doc, [(e, None) for e in edits])
+            for step in steps:
+                history.push(step)
+            history.seen = self._seen(doc.id, page_id)
 
     def forget_history(self, doc_id: str) -> None:
         """The document was closed: its undo and redo go, as the app's go with its pages."""

@@ -1097,6 +1097,35 @@ class EditingTests(unittest.TestCase):
         self.assertFalse(self.editing())
         self.assertEqual(real_warnings(self.app.warnings), [])
 
+    def test_a_copy_of_the_editable_notebook_may_be_edited_too(self):
+        controller = self.app.singletons.controller
+        copy_id = controller.cloneEntry(self.THROWAWAY, "")
+        self.assertTrue(self.wait_for(lambda: self.source.sync.tree.get(copy_id) is not None), self.notices)
+        copy = self.source.sync.tree.get(copy_id)
+        self.assertEqual(copy.name, "throwaway copy")
+        self.assertTrue(self.source.can_edit(copy))
+        self.open_document(copy_id)
+        self.assertTrue(self.wait_for(self.editing))                    # the bridge's edit interface is on
+        self.close_document()
+        # A copy of the copy inherits it; a copy of another notebook does not.
+        again = controller.cloneEntry(copy_id, "")
+        other = controller.cloneEntry(self.OTHER, "")
+        self.assertTrue(self.wait_for(lambda: self.source.sync.tree.get(again) is not None
+                                      and self.source.sync.tree.get(other) is not None), self.notices)
+        self.assertTrue(self.source.can_edit(self.source.sync.tree.get(again)))
+        self.assertFalse(self.source.can_edit(self.source.sync.tree.get(other)))
+        # Still so after a restart: kept with the cache.
+        restarted = LibrarySource(SyncClient(paired_auth(self.dir / "auth", self.cloud), self.dir / "cache"),
+                                  editable=("throwaway",))
+        restarted.refresh()
+        self.assertTrue(restarted.can_edit(restarted.sync.tree.get(copy_id)))
+        self.assertTrue(restarted.can_edit(restarted.sync.tree.get(again)))
+        self.assertFalse(restarted.can_edit(restarted.sync.tree.get(other)))
+        # Editing turned off: no copy may be edited either.
+        off = LibrarySource(restarted.sync, editable=())
+        self.assertEqual(off.edit_refusal(restarted.sync.tree.get(copy_id)), "Editing is not turned on")
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
     def test_an_image_dropped_on_the_page_is_put_there_and_stays_on_this_computer(self):
         view = self.open_document(self.THROWAWAY, self.PAGE1)
         self.assertTrue(self.wait_for(lambda: view._image is not None))
@@ -1331,6 +1360,7 @@ class EditingTests(unittest.TestCase):
         # The calls PageActions.qml / DocumentViewport.qml make, from QML: an arrow
         # function as the callback, JS arrays of page numbers.
         from PySide6.QtCore import Q_ARG, Q_RETURN_ARG, QMetaObject
+        uploads = len(self.cloud.puts())
         from PySide6.QtQml import QQmlComponent
         self.open_document(self.THROWAWAY)
         component = QQmlComponent(self.app.engine)
@@ -1365,7 +1395,7 @@ class EditingTests(unittest.TestCase):
         self.assertEqual([type(e).__name__ for e in self.pending()],
                          ["PageAdd", "PageAdd", "PageCopy", "PageMove", "PageDelete"])
         self.assertEqual(self.notices, [])
-        self.assertEqual([w for w in self.cloud.puts()], [])                   # nothing uploaded
+        self.assertEqual(self.cloud.puts()[uploads:], [])                       # nothing uploaded
         # The page shown is still there and still loads.
         self.assertTrue(self.wait_for(lambda: any(v.property("status") == 2 for v in self.scene_views())))
         actions.deleteLater()
@@ -1418,6 +1448,136 @@ class EditingTests(unittest.TestCase):
         self.assertIn("on this computer", self.notices[1])
         self.assertEqual(self.pending(), [])
         self.assertEqual(view.property("status"), 2)
+
+
+
+class TypingTests(unittest.TestCase):
+    """Typed text through the app's own QML: the Text button turns text mode on, the
+    keys go to the page view (SceneView, as the app's keyHandler maps them) and back
+    through SceneController.keyAction, and what is typed is shown at once and kept as
+    pending edits of the notebook that may be edited, nothing uploaded."""
+
+    setUpClass = classmethod(EditingTests.setUpClass.__func__)
+    tearDownClass = classmethod(EditingTests.tearDownClass.__func__)
+    setUp, tearDown, pending = EditingTests.setUp, EditingTests.tearDown, EditingTests.pending
+    wait_for, qml, scene_views = EditingTests.wait_for, EditingTests.qml, EditingTests.scene_views
+    open_document, close_document = EditingTests.open_document, EditingTests.close_document
+
+    def document_view(self) -> QObject:
+        return self.qml("DocumentView_")
+
+    def text_mode(self, on: bool) -> None:
+        self.document_view().setProperty("textMode", on)
+
+    def keys(self, text: str = "", key=None, modifiers=Qt.KeyboardModifier.NoModifier) -> None:
+        """Key presses, as the system hands them to the window (shortcuts first)."""
+        from PySide6.QtTest import QTest
+        for c in text:
+            k = Qt.Key(ord(c.upper())) if c.isalnum() else {" ": Qt.Key.Key_Space, "!": Qt.Key.Key_Exclam}[c]
+            QTest.keyClick(self.window, k, Qt.KeyboardModifier.ShiftModifier if c.isupper() else
+                           Qt.KeyboardModifier.NoModifier)
+        if key is not None:
+            QTest.keyClick(self.window, key, modifiers)
+        wait(20)
+
+    def typing(self, view):
+        """The page view in text mode, with the keyboard."""
+        self.text_mode(True)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None), self.notices)
+        self.window.requestActivate()
+        view.forceActiveFocus()
+        self.assertTrue(self.wait_for(view.hasActiveFocus), "the page view has no keyboard")
+        return view.text_session
+
+    def paragraphs(self, session) -> list:
+        from viewer.rm_parser import text_block
+        block = text_block(session.text.root_text(), session.authors)
+        return [(p.style.name, [(s.text, s.bold, s.italic) for s in p.spans]) for p in block.paragraphs]
+
+    def test_typing_enter_backspace_styles_and_formatting(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        controller = view._controller
+        session = self.typing(view)
+        # A page with no text gets a box whose first paragraph is a title (createRootDocument).
+        self.assertTrue(controller.property("hasRootDocument"), "no text box")
+        self.assertEqual(controller.property("textDocumentId"), "0:0")
+        self.keys("meeting notex")
+        self.keys(key=Qt.Key.Key_Backspace)
+        self.keys("s")
+        self.keys(key=Qt.Key.Key_Return)
+        self.keys("first point")
+        self.assertEqual(session.text.text, "meeting notes\nfirst point")
+        self.assertEqual(controller.property("textCursorIndex"), 25)
+        # Ctrl+5 bullet, Ctrl+7 checkbox, Ctrl+3 subheading 2, Ctrl+2 subheading, Ctrl+4 body.
+        for key, style in ((Qt.Key.Key_5, "BULLETPOINT"), (Qt.Key.Key_7, "CHECKBOX_UNCHECKED"),
+                           (Qt.Key.Key_3, "SUBHEADING_2"), (Qt.Key.Key_2, "SUBHEADING"), (Qt.Key.Key_4, "PARAGRAPH"),
+                           (Qt.Key.Key_5, "BULLETPOINT")):
+            self.keys(key=key, modifiers=Qt.KeyboardModifier.ControlModifier)
+            self.assertEqual(self.paragraphs(session)[1][0], style)
+        self.assertTrue(controller.property("textParagraphStyle").matchesButtonStyle(3))       # Bulletpoint
+        self.assertFalse(controller.property("textParagraphStyle").matchesButtonStyle(0))
+        # Enter in a list item continues the list; Enter on the empty item ends it.
+        self.keys(key=Qt.Key.Key_Return)
+        self.assertEqual(self.paragraphs(session)[2][0], "BULLETPOINT")
+        self.keys(key=Qt.Key.Key_Return)
+        self.assertEqual([p[0] for p in self.paragraphs(session)], ["TITLE", "BULLETPOINT", "PARAGRAPH"])
+        # Shift+Home selects back to the line start; Ctrl+B makes it bold, Ctrl+I italic.
+        self.keys("plain bold")
+        for _ in range(4):
+            self.keys(key=Qt.Key.Key_Left, modifiers=Qt.KeyboardModifier.ShiftModifier)
+        self.assertTrue(controller.property("hasTextSelection"))
+        self.keys(key=Qt.Key.Key_B, modifiers=Qt.KeyboardModifier.ControlModifier)
+        self.assertEqual(controller.property("textSelectionStyles"), 1)
+        self.keys(key=Qt.Key.Key_End)
+        self.keys(key=Qt.Key.Key_I, modifiers=Qt.KeyboardModifier.ControlModifier)     # for what is typed next
+        self.keys("!")
+        self.assertEqual(self.paragraphs(session)[2][1],
+                         [("plain ", False, False), ("bold", True, False), ("!", False, True)])
+        # Shown at once: the cursor is drawn where the text ends.
+        self.assertGreater(controller.property("textCursorPosition").y(), 234)
+        # Kept as pending edits after a pause, nothing uploaded.
+        files = dict(self.cloud.item(self.THROWAWAY))
+        self.assertTrue(self.wait_for(lambda: self.pending() and not session.edits), self.notices)
+        self.assertEqual({type(e).__name__ for e in self.pending()}, {"TextEdit"})
+        self.assertEqual(dict(self.cloud.item(self.THROWAWAY)), files)
+        self.text_mode(False)
+        self.assertTrue(self.wait_for(lambda: view.text_session is None))
+        doc = self.source.sync.tree.get(self.THROWAWAY)
+        from ui.library import document_pages
+        scene_ = self.source.page_scene(doc, document_pages(doc)[0])
+        self.assertEqual(scene_.text.text, "meeting notes\nfirst point\nplain bold!")
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_undo_and_redo_of_typing(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        controller = view._controller
+        self.typing(view)
+        self.keys("one")
+        self.keys(key=Qt.Key.Key_Left)                  # the cursor moved: "one" is an action of its own
+        self.keys(key=Qt.Key.Key_End)
+        self.keys(" two")
+        self.assertTrue(controller.property("undoAvailable"))
+        self.keys(key=Qt.Key.Key_Z, modifiers=Qt.KeyboardModifier.ControlModifier)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None and view.text_session.text.text == "one"),
+                        self.notices)
+        self.keys(key=Qt.Key.Key_Z, modifiers=Qt.KeyboardModifier.ControlModifier)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None and view.text_session.text.text == ""))
+        self.keys(key=Qt.Key.Key_Y, modifiers=Qt.KeyboardModifier.ControlModifier)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None and view.text_session.text.text == "one"))
+        self.assertTrue(controller.property("redoAvailable"))
+        self.keys("!")                                  # typing after a redo: on the text as it is
+        self.assertEqual(view.text_session.text.text, "one!")
+        self.text_mode(False)
+        self.assertTrue(self.wait_for(lambda: view.text_session is None and not self.notices))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_no_typing_where_editing_is_not_turned_on(self):
+        view = self.open_document(self.OTHER)
+        self.text_mode(True)
+        self.assertTrue(self.wait_for(lambda: self.notices))
+        self.assertIsNone(view.text_session)
+        self.assertEqual(self.pending(), [])
+        self.text_mode(False)
 
 
 class FakeNetwork(QObject):

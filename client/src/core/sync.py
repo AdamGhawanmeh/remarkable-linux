@@ -390,8 +390,17 @@ def describe_text_edit(e) -> str:
     if e.op == "style":
         from viewer.rm_parser import ParagraphStyle
         where = "the first paragraph" if e.first is None else f"the paragraph after {_char(e.first)}"
+        if e.stored is not None:
+            return f"style {where} as stored {tuple(e.stored)}"
         return f"make {where} {ParagraphStyle(e.paragraph).name.lower()}"
-    what = {"delete": "delete", "format": f"make {e.style}", "unformat": f"make not {e.style}"}[e.op]
+    if e.op == "create":
+        from viewer.rm_parser import ParagraphStyle
+        return f"make a text box (first paragraph {ParagraphStyle(e.paragraph).name.lower()})"
+    if e.op == "reinsert":
+        what = f"put back {len(e.text)} characters" if e.text else f"put back a format marker ({e.code})"
+        return f"{what} after {_char(e.first)} (undo/redo)"
+    what = {"delete": "delete", "format": f"make {e.style}", "unformat": f"make not {e.style}",
+            "remove": "take away (undo/redo)"}[e.op]
     return f"{what} {_char(e.first)} .. {_char(e.last)}"
 
 

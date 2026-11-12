@@ -10,6 +10,14 @@ editing, handwriting conversion. Here:
     SceneController    the page's paper and content geometry, and its layers
     PagePickerModel    the pages for the page overview grid
     SceneLayersModel   the page's layers for the layers foldout
+Typed text: in text mode (SceneView.textModeEnabled) the page's text is a
+ui.textedit.TextSession held by the view: keys become the app's actions (SceneView's
+keyHandler; QML hands each back through SceneController.keyAction), the page is drawn
+again with the text as it is now, and the view draws the cursor and the selection, as
+the app's view does. What is typed is kept as pending edits of the library in batches
+(LibrarySource.add_text_edits): after a pause, before an undo or redo, and when text
+mode ends or the page changes.
+
 Editing so far is images on notebook pages, where the library allows editing
 (LibrarySource.editable): an image file dropped on a page
 (SceneController.insertImageFileAsSceneItem), and an image selected
@@ -35,14 +43,18 @@ import shiboken6
 
 from PySide6.QtCore import (QAbstractListModel, QCoreApplication, QModelIndex, QObject, QPointF, QRect, QRectF, QSize, QSizeF, Qt,
                             QThreadPool, QTimer, QUrl, Signal, Slot)
-from PySide6.QtGui import QImage, QPainter, QTransform
+from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
 from core.edits import EditError
 from core.models import FileType
 from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH
+from viewer.rm_parser import ParagraphStyle as StyleType
+from viewer import rm_text
+from viewer.renderer import qt_measure
 
 from ... import editing
+from ... import textedit
 from ...editing import prepare_image
 from ...library import pdf_name
 from ...pages import DocumentPages, PageContent, render_content
@@ -52,6 +64,26 @@ from .generated import qml_class
 log = logging.getLogger("rm.ui.quick.scene")
 
 HALF_WIDTH = PAGE_WIDTH / 2
+TEXT_KEEP_MS = 1000         # what was typed is kept as pending edits after this long a pause
+CARET_WIDTH = 3.0           # scene pixels
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _changed_end(before: str, after: str, cursor: int) -> int:
+    """Where the cursor goes after an undo or redo: after what it put back, or where
+    what it took away was (the cursor where it was when the text is the same)."""
+    if before == after:
+        return min(cursor, rm_text.units(after))
+    start = 0
+    while start < min(len(before), len(after)) and before[start] == after[start]:
+        start += 1
+    end = 0
+    while end < min(len(before), len(after)) - start and before[-1 - end] == after[-1 - end]:
+        end += 1
+    return rm_text.units(after[:len(after) - end])
 PORTRAIT = QRectF(-HALF_WIDTH, 0, PAGE_WIDTH, PAGE_HEIGHT)
 # Largest page image kept per zoom (pixels); deeper zooms upscale it.
 MAX_PIXELS = 32_000_000
@@ -155,7 +187,65 @@ def no_pages_reason(node) -> str:
 # -- enums and helpers the QML only names -------------------------------------------
 
 Page = qml_class("Page")
-ParagraphStyle = qml_class("scene::ParagraphStyle", name="ParagraphStyle")
+class _ParagraphStyle:
+    """A paragraph's style as QML gets it (SceneController.textParagraphStyle): the
+    app's scene::ParagraphStyle, here over the style as stored."""
+
+    stored: tuple | None = None
+
+    @classmethod
+    def of(cls_, stored: tuple | None, parent: QObject) -> QObject:
+        value = ParagraphStyle(parent)
+        value.stored = stored
+        return value
+
+    def _held(self) -> tuple[int, int]:
+        return textedit.held(self.stored)
+
+    @Slot(int, result=bool)
+    def matchesButtonStyle(self, button: int) -> bool:
+        """TextFormattingUtils: a list button matches its list kind at any indent; a
+        text style button, only that style."""
+        mine = textedit.held(self.stored)
+        theirs = textedit.held(rm_text.stored_style(StyleType(int(button))))
+        if textedit.is_list(*theirs):
+            return textedit.is_list(*mine) and mine[1] >> 4 & 0xF == theirs[1] >> 4 & 0xF
+        return textedit.type_of(self.stored) == StyleType(int(button))
+
+    @Slot(result=bool)
+    def isListItem(self) -> bool:
+        return textedit.is_list(*self._held())
+
+    @Slot(result=bool)
+    def isCheckbox(self) -> bool:
+        base, properties = self._held()
+        return textedit.is_list(base, properties) and properties >> 4 & 0xF == 1
+
+    @Slot(result=bool)
+    def isBulletpoint(self) -> bool:
+        base, properties = self._held()
+        return textedit.is_list(base, properties) and properties >> 4 & 0xF == 0
+
+    @Slot(result=bool)
+    def isNumberedList(self) -> bool:
+        base, properties = self._held()
+        return textedit.is_list(base, properties) and properties >> 4 & 0xF == 2
+
+    @Slot(result=bool)
+    def isText(self) -> bool:
+        return self._held()[0] == 2
+
+    @Slot(result=int)
+    def indentLevel(self) -> int:
+        base, properties = self._held()
+        return properties & 0xF if textedit.is_list(base, properties) else 0
+
+    @Slot(result=bool)
+    def isChecked(self) -> bool:
+        return self.isCheckbox() and self._held()[1] >> 8 & 7 == 1
+
+
+ParagraphStyle = qml_class("scene::ParagraphStyle", name="ParagraphStyle", behaviour=_ParagraphStyle)
 SceneKeyHandlerAction = qml_class("SceneKeyHandlerAction")
 SceneParticipant = qml_class("SceneParticipant")
 SceneRenderContext = qml_class("SceneRenderContext")
@@ -506,7 +596,13 @@ class _Controller:
     @Slot("QVariant", int)
     @Slot("QVariant", int, int)
     def pasteClipboardContent(self, content, mode: int = 0, merge: int = 0) -> None:
-        _notify("Pasting text is not available on Linux yet")
+        """Text pasted in text mode, typed at the cursor (as plain text)."""
+        content = _js(content) or {}
+        text = content.get("text") if hasattr(content, "get") else None
+        if not text or self.view is None or self.view.text_session is None:
+            _notify("Only plain text can be pasted into typed text on Linux yet")
+            return
+        self.view.text_do(lambda t: t.paste(str(text)))
 
     @Slot(result="QVariantList")
     @Slot(QRect, result="QVariantList")
@@ -514,6 +610,119 @@ class _Controller:
         """The outlines DocumentViewport draws around each selected stroke: none, as
         strokes cannot be selected yet (an image's outline is the selection box)."""
         return []
+
+    # -- typed text (DocumentViewport in text mode) --
+    @Slot()
+    @Slot("QVariant")
+    @Slot("QVariant", float)
+    def createRootDocument(self, style=None, width: float | None = None) -> None:
+        """Text mode starts on a page: its text box is made when it has none (its first
+        paragraph `style`, ParagraphStyle.Type), and the view starts typing on it."""
+        if self.view is not None:
+            style = _js(style)
+            self.view.start_text(StyleType(int(style)) if isinstance(style, (int, float)) else StyleType.TITLE)
+
+    @Slot()
+    @Slot(QPointF)
+    def focusRootDocument(self, pos: QPointF | None = None) -> None:
+        if self.view is not None:
+            self.view.start_text(StyleType.TITLE, None if pos is None else QPointF(pos))
+
+    @Slot("QVariant")
+    @Slot("QVariant", int)
+    def keyAction(self, action, flags: int = 0) -> None:
+        if self.view is not None:
+            self.view.text_key(_js(action) or {})
+
+    @Slot(bool, bool)
+    def setCursorVisible(self, visible: bool, update: bool) -> None:
+        if self._set("isTextCursorVisible", bool(visible)) and self.view is not None:
+            self.view.update()
+
+    @Slot(QPointF)
+    @Slot(QPointF, int)
+    @Slot(QPointF, int, int)
+    def setCursorPosition(self, pos: QPointF, mode: int = 0, overscroll: int = 0) -> None:
+        if self.view is not None:
+            self.view.text_place(QPointF(pos), int(mode))
+
+    @Slot(int)
+    @Slot(int, int)
+    def setCursorIndex(self, index: int, mode: int = 0) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.place(int(index), int(mode) == textedit.KEEP_ANCHOR), edits=False)
+
+    @Slot(int, int)
+    def moveCursor(self, operation: int, mode: int) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.move(int(operation), int(mode)), edits=False)
+
+    @Slot("QVariant")
+    def cycleParagraphStyle(self, style) -> None:
+        style = _js(style)
+        stored = getattr(style, "stored", None)
+        kind = textedit.type_of(stored) if hasattr(style, "stored") else StyleType(int(style))
+        if self.view is not None:
+            self.view.text_do(lambda t: t.cycle_style(kind))
+
+    @Slot("QVariant")
+    @Slot("QVariant", int)
+    def setParagraphStyle(self, style, indent: int = 0) -> None:
+        style = _js(style)
+        kind = textedit.type_of(style.stored) if hasattr(style, "stored") else StyleType(int(style))
+        if self.view is not None:
+            self.view.text_do(lambda t: t.set_style(kind))
+
+    @Slot(int)
+    def setTextStyle(self, style: int) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.toggle_style(int(style)))
+
+    @Slot()
+    def indentParagraph(self) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.indent(1))
+
+    @Slot()
+    def unindentParagraph(self) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.indent(-1))
+
+    @Slot(int)
+    def selectText(self, mode: int) -> None:
+        """SceneParticipant::SelectionMode: 1 word, 2 token, 3 line, 4 block, 5 all."""
+        actions = {1: "select_word", 2: "select_word", 3: "select_paragraph", 4: "select_paragraph", 5: "select_all"}
+        if self.view is not None and int(mode) in actions:
+            self.view.text_do(lambda t: getattr(t, actions[int(mode)])(), edits=False)
+
+    @Slot(int, int)
+    def selectTextRange(self, start: int, end: int) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.select_range(int(start), int(end)), edits=False)
+
+    @Slot()
+    def clearSelectedText(self) -> None:
+        if self.view is not None:
+            self.view.text_do(lambda t: t.place(t.cursor), edits=False)
+
+    @Slot()
+    def copySelectedText(self) -> None:
+        text = self.view.text_session.selected_text() if self.view is not None and self.view.text_session else ""
+        if text:
+            self.textCopied.emit(text)
+
+    @Slot()
+    def cutSelectedText(self) -> None:
+        if self.view is None or self.view.text_session is None:
+            return
+        cut = []
+        self.view.text_do(lambda t: cut.append(t.cut_selection()))
+        if cut and cut[0]:
+            self.textCopied.emit(cut[0])
+
+    @Slot()
+    def markKeyboardUsedDuringSession(self) -> None:
+        pass
 
     # -- undo and redo (DocumentViewport's undo and redo actions) --
     @Slot()
@@ -556,6 +765,8 @@ class _SceneView:
     _loaded = Signal(object)
     _rendered = Signal(object)
     _edited = Signal(object)
+    _text_opened = Signal(object)
+    _text_kept = Signal(object)
 
     def __init__(self, parent: QQuickItem | None = None) -> None:
         QQuickPaintedItem.__init__(self, parent)
@@ -590,6 +801,16 @@ class _SceneView:
         self._tiles.transformChanged.connect(self._transform_changed)
         self._device_ratio = 1.0
         self.windowChanged.connect(self._window_changed)
+        # Typing (textModeEnabled): the page's text while it is typed on, what to do
+        # once it is open, and the timer that keeps what was typed after a pause.
+        self.text_session: textedit.TextSession | None = None
+        self._text_opening = False
+        self._text_then: list = []
+        self._text_keep = QTimer(self, singleShot=True, interval=TEXT_KEEP_MS)
+        self._text_keep.timeout.connect(self._keep_text)
+        self._text_opened.connect(self._on_text_opened)
+        self._text_kept.connect(self._on_text_kept)
+        self.setFlag(QQuickItem.ItemAcceptsInputMethod, False)
 
     # -- loading --
     def componentComplete(self) -> None:
@@ -602,7 +823,10 @@ class _SceneView:
     def _property_changed(self, name: str) -> None:
         if name in ("pageId", "document") and self.isComponentComplete():
             self._set_selected(None)
+            self.stop_text()
             self._load()
+        elif name == "textModeEnabled" and not self._get("textModeEnabled"):
+            self.stop_text()
 
     def _load(self, quiet: bool = False) -> None:
         """Load the page `pageId` (the first page if the id is empty or unknown: the
@@ -920,6 +1144,9 @@ class _SceneView:
         source, node = _source(), getattr(self._get("document"), "node", None)
         if source is None or node is None or not self._page_id or not hasattr(source, "undo"):
             return
+        if self.text_session is not None:
+            self._keep_text(then=lambda: self._text_history(redo))
+            return
         (self._controller.aboutToRedo if redo else self._controller.aboutToUndo).emit()
         if self._selected is not None:
             self._set_selected(None)
@@ -944,8 +1171,224 @@ class _SceneView:
         state = (False, False)
         if source is not None and node is not None and self._page_id and hasattr(source, "history_state"):
             state = source.history_state(node, self._page_id)
+        if self.text_session is not None and self.text_session.steps:
+            state = (True, False)
         self._controller._set("undoAvailable", state[0])
         self._controller._set("redoAvailable", state[1])
+
+    # -- typed text --
+    def _text_target(self):
+        """(source, document node, page id) when text may be typed on the page shown;
+        else None, after telling the user why not."""
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        if source is None or node is None or self._content is None or not self._page_id:
+            return None
+        refusal = source.edit_refusal(node)
+        if not refusal and self._content.has_pdf_page:
+            refusal = "Text can only be typed on notebook pages"
+        if refusal:
+            _notify(refusal)
+            return None
+        return source, node, self._page_id
+
+    def start_text(self, style: StyleType, pos: QPointF | None = None) -> None:
+        """Text mode on the page shown (createRootDocument, focusRootDocument): its text
+        is read with the pending edits, on the view's worker, then typed on here."""
+        if pos is not None:
+            self._text_then.append(lambda t: t.place(t.index_at(pos.x(), pos.y())))
+        if self.text_session is not None or self._text_opening:
+            return
+        target = self._text_target()
+        if target is None:
+            return
+        source, node, page_id = target
+        scene, now = self._content.scene if self._content is not None else None, _now_ms
+        self._text_opening = True
+        self._controller._set("keyActionRunning", True)
+
+        def job():
+            try:
+                done = source.text_page(node, page_id)
+                session = textedit.TextSession.open(node.id, page_id, done.page, done, source.sync.author(), scene,
+                                                    qt_measure, now, style)
+                result = (session, None)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                result = (None, str(err))
+            except Exception as err:      # typing never takes the page view down with it
+                log.exception("opening the text of page %s", page_id)
+                result = (None, f"The text cannot be typed on: {type(err).__name__}")
+            emit_from_worker(self, lambda: self._text_opened.emit(result))
+        self._pool.start(_Job(job))
+
+    def _on_text_opened(self, result) -> None:
+        session, error = result
+        self._text_opening = False
+        self._controller._set("keyActionRunning", False)
+        if error is not None:
+            _notify(error)
+            return
+        if not self._get("textModeEnabled") and not self._text_then:
+            # Text mode ended while the page's text was read: still keep the box made.
+            self.text_session = session
+            self.stop_text()
+            return
+        self.text_session = session
+        then, self._text_then = self._text_then, []
+        for step in then:
+            step(session)
+        if session.edits:
+            self._text_keep.start()
+        self._text_changed()
+
+    def text_do(self, change, edits: bool = True) -> None:
+        """Do `change(session)` on the text being typed, then show it."""
+        session = self.text_session
+        if session is None:
+            if self._text_opening:
+                self._text_then.append(change)
+            return
+        try:
+            change(session)
+        except rm_text.TextError as err:
+            log.warning("text change not made: %s", err)
+        if edits and session.edits:
+            self._text_keep.start()
+        self._text_changed()
+
+    def text_key(self, action: dict) -> None:
+        """A key action QML hands back (SceneController::keyAction)."""
+        kind = int(action.get("type", 0))
+        if kind == textedit.UNDO:
+            self.history_step(redo=False)
+        elif kind == textedit.REDO:
+            self.history_step(redo=True)
+        elif kind == textedit.COPY:
+            self._controller.copySelectedText()
+        elif kind == textedit.CUT:
+            self._controller.cutSelectedText()
+        elif kind in (textedit.PASTE, textedit.PASTE_AND_MATCH_STYLE):
+            if _clipboard is not None:
+                self._controller.pasteClipboardContent({"text": _clipboard.textString()})
+        elif kind != textedit.NONE:
+            self.text_do(lambda t: t.key(action))
+
+    def text_place(self, pos: QPointF, mode: int) -> None:
+        self.text_do(lambda t: t.place(t.index_at(pos.x(), pos.y()), mode == textedit.KEEP_ANCHOR), edits=False)
+
+    def _text_changed(self) -> None:
+        """The controller's text properties from the session, and the page drawn again."""
+        c, session = self._controller, self.text_session
+        if session is None:
+            for name, value in (("textDocumentId", None), ("hasTextSelection", False), ("textCursorIndex", 0),
+                                ("textCursorAnchorIndex", 0), ("isTextCursorVisible", False)):
+                c._set(name, value)
+            self.update()
+            return
+        caret, anchor = session.caret(), session.caret(session.anchor)
+        c._set("hasRootDocument", True)
+        c._set("textDocumentId", "0:0")
+        c._set("textCursorIndex", session.cursor)
+        c._set("textCursorAnchorIndex", session.anchor)
+        c._set("textCursorPosition", QPointF(caret.x, caret.top))
+        c._set("textCursorAnchorPosition", QPointF(anchor.x, anchor.top))
+        c._set("textLineHeight", round(caret.height))
+        c._set("textAnchorLineHeight", round(anchor.height))
+        c._set("isTextCursorNewline", caret.empty_line)
+        c._set("hasTextSelection", session.has_selection())
+        c._set("textStyles", session.char_styles())
+        c._set("textSelectionStyles", session.selection_styles())
+        c._set("rootDocumentLength", session.text.length)
+        stored = session.stored_style()
+        old = c._get("textParagraphStyle")
+        if getattr(old, "stored", object()) != stored:
+            c._set("textParagraphStyle", ParagraphStyle.of(stored, c))
+        c._set("textParagraphBounds", QRectF(*session.paragraph_bounds()))
+        rects = session.selection_rects()
+        if rects:
+            xs, ys = [r[0] for r in rects] + [r[0] + r[2] for r in rects], [r[1] for r in rects] + [r[1] + r[3] for r in rects]
+            c._set("textSelectionBounds", QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)))
+        self._update_history()
+        self.update()
+        self._render()
+
+    def _keep_text(self, then=None) -> None:
+        """Hand what was typed to the library (LibrarySource.add_text_edits) on the
+        view's worker, then `then()`."""
+        self._text_keep.stop()
+        session = self.text_session
+        edits, steps = session.take() if session is not None else ([], [])
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        if not edits or source is None or node is None:
+            if then is not None:
+                then()
+            return
+        page_id = session.page_id
+
+        def job():
+            error = None
+            try:
+                source.add_text_edits(node, page_id, edits, steps)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("keeping the text typed on page %s", page_id)
+                error = f"The text could not be kept: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._text_kept.emit((error, then)))
+        self._pool.start(_Job(job))
+
+    def _on_text_kept(self, result) -> None:
+        error, then = result
+        if error is not None:
+            # What was typed is not kept: show the page as the library has it.
+            _notify(error)
+            if self.text_session is not None:
+                self._reopen_text()
+            return
+        self._update_history()
+        if then is not None:
+            then()
+
+    def _text_history(self, redo: bool) -> None:
+        """Undo or redo with the text kept, then type on the page as it is after it."""
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        if source is None or node is None or self.text_session is None:
+            return
+        (self._controller.aboutToRedo if redo else self._controller.aboutToUndo).emit()
+        page_id, now_ms = self.text_session.page_id, _now_ms()
+        self._controller._set("keyActionRunning", True)
+
+        def job():
+            error = None
+            try:
+                (source.redo if redo else source.undo)(node, page_id, now_ms)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("%s on page %s", "redo" if redo else "undo", page_id)
+                error = f"Could not {'redo' if redo else 'undo'}: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._text_kept.emit((error, self._reopen_text)))
+        self._pool.start(_Job(job))
+
+    def _reopen_text(self) -> None:
+        """Read the page's text again (after an undo, or an edit not kept), the cursor
+        where it was."""
+        old = self.text_session
+        self.text_session = None
+        self._controller._set("keyActionRunning", False)
+        if old is not None:
+            at, before = old.cursor, old.plain()
+            self._text_then.append(lambda t: t.place(_changed_end(before, t.plain(), at)))
+        self.start_text(StyleType.TITLE)
+
+    def stop_text(self) -> None:
+        """Text mode ends (or the page changes): what was typed is kept, and the page
+        is shown as the library has it."""
+        if self.text_session is None:
+            return
+        self._keep_text(then=lambda: self._load(quiet=True))
+        self.text_session = None
+        self._text_then = []
+        self._text_changed()
 
     # -- geometry --
     def geometryChange(self, new: QRectF, old: QRectF) -> None:
@@ -989,6 +1432,9 @@ class _SceneView:
         if area > MAX_PIXELS:
             scale *= (MAX_PIXELS / area) ** 0.5
         content = self._content
+        if self.text_session is not None:
+            from dataclasses import replace
+            content = replace(content, scene=self.text_session.shown_scene())
         if self._selected is not None and content.scene is not None:
             content = _without_image(content, self._selected)    # SelectionImage shows it
         self._rendering = True
@@ -1022,6 +1468,16 @@ class _SceneView:
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawImage(self._tiles.sceneToView(self._bounds), self._image)
+        session = self.text_session
+        if session is None or not self._get("textModeEnabled"):
+            return
+        for x, y, w, h in session.selection_rects():            # the selection, as the app's view shades it
+            painter.fillRect(self._tiles.sceneToView(QRectF(x, y, w, h)), QColor(0, 0, 0, 56))
+        if self._controller._get("isTextCursorVisible") and not session.has_selection():
+            caret = session.caret()
+            rect = self._tiles.sceneToView(QRectF(caret.x - CARET_WIDTH / 2, caret.top + caret.height * 0.12,
+                                                  CARET_WIDTH, caret.height * 0.76))
+            painter.fillRect(rect, QColor(0, 0, 0))
 
     def releaseResources(self) -> None:
         self._pool.waitForDone(5000)
@@ -1043,14 +1499,30 @@ class _SceneView:
 
     @Slot(int, int, bool, str, result="QVariantMap")
     def processKey(self, key: int, modifiers: int, auto_repeat: bool, text: str) -> dict:
-        """The SceneKeyHandlerAction for a key: page up/down scroll (the viewport does
-        that); without text editing, other keys do nothing."""
+        """The SceneKeyHandlerAction for a key (SceneKeyHandler::process). Out of text
+        mode only page up/down do something (the viewport scrolls), and Backspace
+        deletes a selected image."""
+        if self._get("textModeEnabled"):
+            return textedit.key_action(int(key), int(modifiers), bool(auto_repeat), str(text or ""))
         actions = SceneKeyHandlerAction.Type
         kind = {int(Qt.Key.Key_PageUp.value): actions["PageUp"], int(Qt.Key.Key_PageDown.value): actions["PageDown"]}
         if int(key) in (int(Qt.Key.Key_Backspace.value), int(Qt.Key.Key_Delete.value)) and self._selected is not None:
             # Delete comes as the selection handler's shortcut; Backspace reaches here.
             self.delete_selection(self._controller._get("currentLayer"))
         return {"type": int(kind.get(int(key), actions["None"]))}
+
+    def keyPressEvent(self, event) -> None:
+        """In text mode the view has the keyboard, as the app's does: each key becomes
+        an action (sceneKeyActionReceived), which QML hands back to keyAction."""
+        if not self._get("textModeEnabled"):
+            event.ignore()
+            return
+        action = textedit.key_action(int(event.key()), int(event.modifiers().value), event.isAutoRepeat(), event.text())
+        if action["type"] == textedit.NONE:
+            event.ignore()
+            return
+        event.accept()
+        self.sceneKeyActionReceived.emit(action)
 
     @Slot(result=bool)
     def isNotePage(self) -> bool:

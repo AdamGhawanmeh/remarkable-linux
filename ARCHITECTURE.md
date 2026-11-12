@@ -545,6 +545,21 @@ style off (0x140ab4710) deletes the markers it reaches and re-marks what lies ou
 (0x0A) fields are `loads, merges, textChars, textLines, keyboardCount`: textChars = UTF-16 length
 + 1, textLines = paragraphs (all 34 real blocks); a text edit updates both.
 
+**Text mode** [O] (`ui.textedit`, `SceneView`/`SceneController` in `bridge/scene.py`): the view
+has the keyboard; `SceneKeyHandler::process` (0x140408d10; Windows helpers 0x140408af0,
+0x140408c40) maps keys to `SceneKeyHandlerAction {type, MoveOperation, MoveMode, text}`, emitted
+as `sceneKeyActionReceived` and handed back to `SceneController::keyAction`. Ctrl+1..7 = Title,
+Subheading, Subheading2, Paragraph, Bullet, Numbered, Checkbox. Enter (`handleKeyEnter`
+0x14094f2d0): empty list item → un-indent (0x1408b5aa0), else new paragraph that copies the style
+when the old one is a list item (checkbox unchecked) or was split mid-way. Backspace
+(0x14094ea70) at a list item's start → body text. `* `/`+ `/`- ` at a paragraph start → bullet
+(0x14094d080). `cycleParagraphStyle` (0x14043ca20): a list button on the same list kind cycles
+indent 0..2 (0x1408b5870), anything else sets. Indented lists are written with
+base_style/style_properties (0x140a92b30). The cursor is drawn by the view, not QML
+(`CursorBlinkManager` only toggles `setCursorVisible`). Undo of text: remove by id, put back with
+new ids after the original neighbour, ids translated across the stack (as the app's undo
+"translated" log).
+
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in
 the corpus is interpreted or understood (no unaccounted blocks). Full-library run: every

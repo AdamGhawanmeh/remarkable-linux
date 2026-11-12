@@ -600,8 +600,8 @@ class TextDocument:
         return self._put(Run(clock.take(), format=code), n, offset)
 
     def format(self, index: int, length: int, style: str, clock: Clock) -> list[tuple[int, int]]:
-        """Give a range of the text a style; the ids of the start markers put in
-        (0x140aaee30)."""
+        """Give a range of the text a style; the ids of the markers put in, in the
+        order they were made (0x140aaee30)."""
         self._check(index, length)
         start, end = MARKERS[style]
         n, offset, depth = self.locate(index)
@@ -616,7 +616,9 @@ class TextDocument:
                         at, offset = at + run.length - offset, 0
                     elif run.format == start:
                         if not nested and opened:
-                            n = self._marker(end, clock, n, 0) + 1
+                            n = self._marker(end, clock, n, 0)
+                            made.append(self.runs[n].id)
+                            n += 1
                             opened = False
                         nested += 1
                     elif run.format == end:
@@ -628,9 +630,10 @@ class TextDocument:
             n += 1
         if opened:
             if at > stop:
-                self._marker(end, clock, n - 1, self.runs[n - 1].length - (at - stop))
+                n = self._marker(end, clock, n - 1, self.runs[n - 1].length - (at - stop))
             else:
-                self._marker(end, clock, n, 0)
+                n = self._marker(end, clock, n, 0)
+            made.append(self.runs[n].id)
         return made
 
     def _spans(self, style: str) -> list[tuple[int, int, int, int]]:
@@ -651,26 +654,29 @@ class TextDocument:
             at += run.length
         return spans
 
-    def unformat(self, index: int, length: int, style: str, clock: Clock) -> bool:
+    def unformat(self, index: int, length: int, style: str, clock: Clock
+                 ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]] | None:
         """Take a style off a range of the text (0x140ab4710): the markers of every
         stretch reaching into it are deleted, and what those stretches had outside
-        the range is styled anew. Whether anything changed."""
+        the range is styled anew. (markers deleted, markers made), None when nothing
+        changed."""
         self._check(index, length)
         stop = index + length
         hit = [span for span in self._spans(style) if span[2] < stop and span[3] > index and span[2] < span[3]]
         if not hit or length <= 0:
-            return False
-        again = []
+            return None
+        again, gone, made = [], [], []
         for first, last, begun, ended in hit:
             for n in (first, last):
+                gone.append(self.runs[n].id)
                 self.runs[n].deleted, self.runs[n].source = 1, None
             if begun < index:
                 again.append((begun, index))
             if ended > stop:
                 again.append((stop, ended))
         for begun, ended in sorted(set(again)):
-            self.format(begun, ended - begun, style, clock)
-        return True
+            made += self.format(begun, ended - begun, style, clock)
+        return gone, made
 
     def toggle(self, index: int, length: int, style: str, clock: Clock) -> bool:
         """Style a range, or take the style off when all of it has it; whether it is
@@ -681,13 +687,23 @@ class TextDocument:
         self.format(index, length, style, clock)
         return True
 
-    def set_style(self, paragraph: int | tuple[int, int], style: ParagraphStyle, clock: Clock) -> None:
-        """Give a paragraph (its number, or the id its style is kept under) a style."""
+    def style_entry(self, key: tuple[int, int]) -> StyleEntry | None:
+        """The style entry in force for a paragraph (None: it has none, body text)."""
+        best = None
+        for entry in self.styles:
+            if entry.char_id == key and (best is None or w.id_key(entry.timestamp) >= w.id_key(best.timestamp)):
+                best = entry
+        return best
+
+    def set_style(self, paragraph: int | tuple[int, int], style, clock: Clock) -> None:
+        """Give a paragraph (its number, or the id its style is kept under) a style: a
+        ParagraphStyle, or as stored, (style_legacy, base_style, style_properties)."""
         keys = self.paragraph_keys()
         key = keys[paragraph] if isinstance(paragraph, int) else tuple(paragraph)
         if key not in keys:
             raise TextError(f"{key} does not start a paragraph")
-        entry = StyleEntry(key, clock.take(), *stored_style(style))
+        stored = tuple(style) if isinstance(style, tuple) else stored_style(style)
+        entry = StyleEntry(key, clock.take(), *stored)
         places = [n for n, old in enumerate(self.styles) if old.char_id == key]
         if places:
             self.styles[places[0]] = entry
@@ -695,6 +711,56 @@ class TextDocument:
                 del self.styles[n]
         else:
             self.styles.append(entry)
+
+    def _after(self, item: tuple[int, int] | None) -> tuple[int, int] | None:
+        """(run, offset) where something put right after the item `item` goes (None:
+        at the start); None when the text has no such item."""
+        if item is None or item == ZERO:
+            return 0, 0
+        n = self.sequence.find(item)
+        if n is None:
+            return None
+        run = self.runs[n]
+        offset = item[1] - run.id[1] + 1
+        return (n + 1, 0) if offset >= run.length else (n, offset)
+
+    def reinsert(self, after: tuple[int, int] | None, clock: Clock, text: str = "", code: int = 0
+                 ) -> list[tuple[int, int]] | None:
+        """Put text (or a marker, `code`) back right after the item `after`, whatever
+        it is now (deleted, a marker), as the app's undo and redo put back what they
+        took away (0x140ab3620, 0x140ab2160); the ids it takes, None when the text has
+        no such item."""
+        place = self._after(after)
+        if place is None:
+            return None
+        if code:
+            first = clock.take()
+            self._put(Run(first, format=code), *place)
+            return [first]
+        if not text:
+            return []
+        first = clock.take(units(text))
+        self._put(Run(first, text=text), *place)
+        return [(first[0], first[1] + k) for k in range(units(text))]
+
+    def remove(self, first: tuple[int, int], last: tuple[int, int]) -> int:
+        """Delete the items from `first` to `last`, in the order of the sequence, text
+        and markers alike, as the app's undo deletes what an action added by id
+        (0x140ab7d10, 0x140ab92c0); how many ids went."""
+        start, end = self.sequence.find(first), self.sequence.find(last)
+        if start is None or end is None or end < start:
+            return 0
+        seq = self.sequence
+        start = seq.split(start, first)
+        end = self.sequence.find(last, start)
+        seq.split(end, (last[0], last[1] + 1))           # nothing to cut when `last` ends its run
+        done = 0
+        for n in range(start, end + 1):
+            run = self.runs[n]
+            if not run.deleted:
+                done += run.length
+                run.deleted, run.source = run.length, None
+        return done
 
     # writing -------------------------------------------------------------------
     def root_text(self) -> RootText:
@@ -739,8 +805,8 @@ def _stats(payload: bytes, chars: int, lines: int) -> bytes:
     return w.write_values([(i, k, struct.pack("<I", new[i]) if i in new else v) for i, k, v in values])
 
 
-def edit_text(page: bytes | None, *, author: bytes,
-              change: Callable[[TextDocument, Clock], object]) -> bytes:
+def edit_text(page: bytes | None, *, author: bytes, change: Callable[[TextDocument, Clock], object],
+              style: ParagraphStyle = ParagraphStyle.TITLE) -> bytes:
     """`page` (None: a page with no .rm yet) after `change(text, clock)` has changed its
     text; a page without a text box gets one first. Every other block is kept byte for
     byte; replaced are the RootText block and the text counts of PageStats, and
@@ -757,7 +823,7 @@ def edit_text(page: bytes | None, *, author: bytes,
     at = _text_block(blocks)
     authors = page_authors(blocks)
     if at is None:
-        text = TextDocument.new(clock, authors=authors)
+        text = TextDocument.new(clock, style=style, authors=authors)
         was = None
     else:
         was = blocks[at].payload

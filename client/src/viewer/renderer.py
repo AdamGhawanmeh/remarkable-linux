@@ -206,6 +206,18 @@ class TextLine:
     marker: str = ""                          # list marker drawn left of x
     marker_font: TextFont | None = None
     paragraph: int = 0
+    # Where the line is in the text (TextBlock.text, counted in UTF-16 units): its first
+    # character, and where the next line starts (the paragraph's newline for its last
+    # line), so that a caret can be put on it; its height; and its words as laid out
+    # (spaces included), each with its index.
+    start: int = 0
+    end: int = 0
+    height: float = 0.0
+    segments: tuple[tuple[int, str, TextFont], ...] = ()
+
+
+def _units(text: str) -> int:
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
 # measure(text, font) -> advance width in page pixels
@@ -226,6 +238,7 @@ def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[Tex
     y = block.y
     lines: list[TextLine] = []
     number = 0
+    base = 0                                    # text index of the paragraph's first character
     for index, para in enumerate(block.paragraphs):
         scale, heading_bold = STYLE_FONTS.get(para.style, (1.0, False))
         size = _BODY * scale
@@ -234,22 +247,27 @@ def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[Tex
                                               ParagraphStyle.NUMBERED_LIST_INDENTED) else 0
         marker, indent = _prefix(para.style, number)
         x0, max_w = left + indent, max(block.width - indent, size)
-        words: list[tuple[str, TextFont]] = []
+        words: list[tuple[str, TextFont, int]] = []
+        at = base
         for span in para.spans:
             font = TextFont(size, span.bold or heading_bold, span.italic)
             for i, part in enumerate(span.text.split(" ")):
                 if i:
-                    words.append((" ", font))
+                    words.append((" ", font, at))
+                    at += 1
                 if part:
-                    words.append((part, font))
-        current: list[tuple[str, TextFont]] = []
+                    words.append((part, font, at))
+                    at += _units(part)
+        end = base + _units(para.text)
+        current: list[tuple[str, TextFont, int]] = []
         width = 0.0
         first = True
+        start = base
 
-        def flush():
-            nonlocal current, width, first, y
+        def flush(next_start: int):
+            nonlocal current, width, first, y, start
             y += line_h
-            pieces = _merge(current)
+            pieces = _merge([(t, f) for t, f, _ in current])
             while pieces and not pieces[-1][0].strip():
                 pieces.pop()
             if pieces:
@@ -257,19 +275,67 @@ def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[Tex
             lines.append(TextLine(x0, y - line_h * (1 - BASELINE_AT), tuple(pieces),
                                   marker if first else "",
                                   TextFont(size, heading_bold) if first and marker else None,
-                                  index))
-            current, width, first = [], 0.0, False
+                                  index, start, next_start, line_h,
+                                  tuple((i, t, f) for t, f, i in current)))
+            current, width, first, start = [], 0.0, False, next_start
 
-        for text, font in words:
+        for text, font, i in words:
             w = measure(text, font)
             if text != " " and current and width + w > max_w:
-                flush()
+                flush(i)
             if text == " " and not current:
+                if start == i:
+                    start = i + 1                   # a space a line does not start with
                 continue
-            current.append((text, font))
+            current.append((text, font, i))
             width += w
-        flush()
+        flush(end)
+        base = end + 1
     return lines
+
+
+def caret_x(line: TextLine, index: int, measure: Measure = estimate_width) -> float:
+    """Page x of a caret before the character at text index `index` on `line`."""
+    x = line.x
+    for at, text, font in line.segments:
+        if index <= at:
+            break
+        if index < at + _units(text):
+            raw = text.encode("utf-16-le", "surrogatepass")[:2 * (index - at)]
+            return x + measure(raw.decode("utf-16-le", "surrogatepass"), font)
+        x += measure(text, font)
+    return x
+
+
+def line_of(lines: list[TextLine], index: int) -> int:
+    """The line a caret at text index `index` is on: the one holding the character
+    there, or the one it ends (the end of a paragraph)."""
+    for n, line in enumerate(lines):
+        if line.start <= index < line.end:
+            return n
+        if index == line.end and (n + 1 == len(lines) or lines[n + 1].paragraph != line.paragraph
+                                  or lines[n + 1].start > index):
+            return n
+    return max(len(lines) - 1, 0)
+
+
+def index_at(lines: list[TextLine], x: float, y: float, measure: Measure = estimate_width) -> int:
+    """The text index nearest a point (page coordinates): the line under it (or the
+    nearest), then the caret place nearest x on it."""
+    if not lines:
+        return 0
+    def top(line):
+        return line.baseline - line.height * BASELINE_AT
+    n = min(range(len(lines)), key=lambda k: 0 if top(lines[k]) <= y < top(lines[k]) + lines[k].height
+            else min(abs(y - top(lines[k])), abs(y - top(lines[k]) - lines[k].height)))
+    line = lines[n]
+    last = line.end if line_of(lines, line.end) == n else max(line.start, line.end - 1)
+    best, best_d = line.start, abs(caret_x(line, line.start, measure) - x)
+    for i in range(line.start + 1, last + 1):
+        d = abs(caret_x(line, i, measure) - x)
+        if d < best_d:
+            best, best_d = i, d
+    return best
 
 
 def _merge(pieces: list[tuple[str, TextFont]]) -> list[tuple[str, TextFont]]:
@@ -628,5 +694,5 @@ def render_image(scene: PageScene, *, scale: float = 1.0, background: str = "#ff
 
 
 __all__ = ["PALETTE_ARGB", "Run", "StrokeStyle", "TextFont", "TextLine", "image_matrix", "image_size",
-           "layout_text", "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
+           "layout_text", "caret_x", "line_of", "index_at", "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
            "stroke_style", "PAGE_WIDTH", "PAGE_HEIGHT"]

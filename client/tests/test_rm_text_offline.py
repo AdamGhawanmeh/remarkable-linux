@@ -218,7 +218,7 @@ class FormatTests(unittest.TestCase):
 
     def test_a_range_gets_a_pair_of_markers(self):
         made = self.doc.format(4, 3, BOLD, self.clock)
-        self.assertEqual(made, [(1, 21)])
+        self.assertEqual(made, [(1, 21), (1, 22)])
         self.assertEqual([(i, what) for i, _, _, what in shape(self.doc)],
                          [((1, 1), "one "), ((1, 21), "fmt1"), ((1, 5), "two"), ((1, 22), "fmt2"), ((1, 8), " three")])
         self.assertEqual(spans(self.doc), [[("one ", False, False), ("two", True, False), (" three", False, False)]])

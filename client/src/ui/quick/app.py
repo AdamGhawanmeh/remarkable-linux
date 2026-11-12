@@ -113,7 +113,8 @@ class QuickApp:
         self.library.save_reading_position = self._save_reading_position
         self.singletons = Singletons(
             library=self.library,
-            controller=LibraryController(self.library, self.mutator.run),
+            controller=LibraryController(self.library, self.mutator.run,
+                                         inherit_editing=getattr(source, "inherit_editing", None)),
             importer=DocumentImporter(self.mutator.run), selection=DocumentSelection(),
             document_sync=DocumentSync(),
             screen_share=ScreenShareClient(liveview_factory),
