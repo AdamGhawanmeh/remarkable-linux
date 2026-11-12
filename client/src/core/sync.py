@@ -62,7 +62,7 @@ from typing import Any, Callable, Iterable
 from .auth import AuthClient, HttpResponse
 from .config import atomic_write_json, cache_dir, ensure_private_dir, read_json
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd, PageCopy, PageDelete,
-                    PageMove, PendingEdits, document_files)
+                    PageMove, PendingEdits, TextEdit, document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
                      new_document_content, new_folder_content, new_metadata)
@@ -375,8 +375,30 @@ def _by_id(entries: list) -> dict | None:
     return out if len(out) == len(entries) else None
 
 
+def _char(ref) -> str:
+    if ref is None:
+        return "the start"
+    return f"char {ref[1]}:{ref[2]}" if ref[0] == "page" else f"char {ref[2]} of edit {ref[1][:8]}"
+
+
+def describe_text_edit(e) -> str:
+    """A text edit in a few words (only its length is shown of what it types)."""
+    if e.op == "insert":
+        side = "".join(f", {n} {'inside' if v else 'outside'}" for n, v in (("bold", e.bold), ("italic", e.italic))
+                       if v is not None)
+        return f"type {len(e.text)} characters after {_char(e.first)}{side}"
+    if e.op == "style":
+        from viewer.rm_parser import ParagraphStyle
+        where = "the first paragraph" if e.first is None else f"the paragraph after {_char(e.first)}"
+        return f"make {where} {ParagraphStyle(e.paragraph).name.lower()}"
+    what = {"delete": "delete", "format": f"make {e.style}", "unformat": f"make not {e.style}"}[e.op]
+    return f"{what} {_char(e.first)} .. {_char(e.last)}"
+
+
 def describe_edit(e) -> str:
     """One pending edit, as push plans list them."""
+    if isinstance(e, TextEdit):
+        return f"  text on page {e.page_id}: {describe_text_edit(e)}"
     if isinstance(e, PageAdd):
         return f"  add page {e.new_id} (template {e.template!r}) at {e.index}, after page {e.after or '(front)'}"
     if isinstance(e, PageCopy):

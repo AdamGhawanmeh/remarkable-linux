@@ -531,6 +531,20 @@ the character sequence: 1/2 bold start/end, 3/4 italic, 5/6 link (`scene::Charac
 { None, Bold, Italic, Link }`; 0x140aab3c0 pairs an end with the start whose id is one less).
 See `viewer.rm_parser.decode_root_text` for the whole block.
 
+**Changing typed text** [O] (`viewer.rm_text`): the app holds the sequence as runs in reading
+order. Loading (0x1409164b0): entries not listed by rising id are taken in file order (how it
+writes them); otherwise each is integrated (0x1409350a0): dropped if its neighbours are not older
+than it (0x140943f30); appended to the run holding `left` when it just continues it (0x14092e6d0);
+else placed by scanning from `left` to `right`, two runs between the same neighbours ordered by
+author UUID (0x140a984f0). Typing (0x140aae810 → 0x140aae250) makes one run with fresh ids from
+the page clock, cutting the run it lands in (0x14093fd50, 0x140940520: the second half keeps its
+own ids, left = the id before, right = the run's right). Deleting (0x140ab8970 → 0x14093d670)
+turns stretches into tombstones (no value on disk) and leaves markers. Bold/italic (0x140aaee30)
+put a start marker and an end marker with the next id around each unstyled stretch; taking a
+style off (0x140ab4710) deletes the markers it reaches and re-marks what lies outside. PageStats
+(0x0A) fields are `loads, merges, textChars, textLines, keyboardCount`: textChars = UTF-16 length
++ 1, textLines = paragraphs (all 34 real blocks); a text edit updates both.
+
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in
 the corpus is interpreted or understood (no unaccounted blocks). Full-library run: every

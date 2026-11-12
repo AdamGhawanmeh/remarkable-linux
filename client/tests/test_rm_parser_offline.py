@@ -247,10 +247,13 @@ class TextAndImageTests(unittest.TestCase):
     def test_text_errors(self):
         good_item = text_item((1, 1), ZERO, text="a")
         for payload, message in (
-                ([b"\x1c" + good_item[1:]], "not a sub-block"),
-                ([text_item((1, 1), (1, 2), text="a"), text_item((1, 2), (1, 1), text="b")], "cycle")):
+                ([b"\x1c" + good_item[1:]], "not a sub-block"),):
             with self.assertRaisesRegex(RmParseError, message):
                 parse(v6_file(root_text(payload, [])))
+        # An entry whose neighbour is not older than it is dropped, as the app drops it
+        # (0x140943f30), so no loop can form.
+        looped = [text_item((1, 1), (1, 2), text="a"), text_item((1, 2), (1, 1), text="b")]
+        self.assertEqual(parse(v6_file(root_text(looped, []))).text.text, "b")
         bad_formats = (
             (bytes([0, 0]) + f_sub(2, bytes([17, 2])), "missing its timestamp"),
             (bytes([0, 0]) + f_id(1, (1, 1)), "missing its value"),

@@ -19,6 +19,11 @@ For every v6 page under the directory (default: the library cache) it checks tha
   - undoing the move (the moved item deleted, the old one put back under a new id right
     after itself) gives the old corners at the old place among the layer's items, the
     moveId naming the first item, and changes nothing else.
+  - the typed text (RootText) re-encodes to its bytes (viewer.rm_text), its stats match
+    PageStats (textChars = UTF-16 length + 1, textLines = paragraphs), and typing,
+    deleting, styling a paragraph and making a word bold through rm_text.edit_text
+    gives the text asked for, changes only the text and stats blocks (and authors),
+    and reads back the same; a page with no text gets a box where the app puts one.
 It prints counts only, nothing of the pages' content. Exit status 1 if anything failed.
 """
 
@@ -31,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from viewer import rm_parser, rm_writer as w  # noqa: E402
+from viewer import rm_parser, rm_text, rm_writer as w  # noqa: E402
 
 ORDER = re.compile(r"^UCPSI?M+T?N+[GLXJ]*$")
 LETTER = {0x09: "U", 0x00: "C", 0x0A: "P", 0x0D: "S", 0x0E: "I", 0x01: "M", 0x07: "T", 0x02: "N",
@@ -60,6 +65,58 @@ def rights_hold(blocks: list[w.Block], stats: Counter) -> None:
                 this = (item.item[0], item.item[1] + n)
                 after[this], after[left] = after.get(left, w.ZERO_ID), this
                 left = this
+
+
+def check_text(data: bytes, blocks: list[w.Block], stats: Counter) -> None:
+    texts = [b for b in blocks if b.type == w.BLOCK_ROOT_TEXT]
+    page_stats = [b for b in blocks if b.type == w.BLOCK_PAGE_STATS]
+    if texts:
+        stats["text blocks"] += 1
+        root = rm_parser.decode_root_text(texts[0].payload)
+        if rm_text.encode_root_text(root) != texts[0].payload:
+            stats["text re-encoding: WRONG"] += 1
+        doc = rm_text.page_text(data)
+        if doc.encode() != texts[0].payload:
+            stats["text through the document: WRONG"] += 1
+        counted = [v for _, _, v in w.read_values(page_stats[0].payload)][2:4] if page_stats else []
+        if [int.from_bytes(v, "little") for v in counted] != list(doc.stats()):
+            stats["text stats: WRONG"] += 1
+    original = rm_parser.parse(data)
+    old_text = original.text.text if original.text else None
+
+    def change(doc, clock):
+        at = doc.length
+        doc.insert(at, "\nA bold word", clock)
+        doc.format(at + 3, 4, rm_text.BOLD, clock)
+        doc.set_style(len(doc.paragraph_keys()) - 1, rm_parser.ParagraphStyle.BULLETPOINT, clock)
+        doc.delete(at + 7, 1)
+
+    try:
+        edited = rm_text.edit_text(data, author=AUTHOR, change=change)
+    except rm_parser.RmParseError as e:
+        stats[f"text edit refused: {re.sub(r'[0-9]+', 'N', str(e))}"] += 1
+        return
+    stats["text edits"] += 1
+    after = rm_parser.parse(edited)
+    _, new_blocks = w.split(edited)
+    kept = (w.BLOCK_AUTHORS, w.BLOCK_ROOT_TEXT, w.BLOCK_PAGE_STATS)
+    same = [b.encode() for b in blocks if b.type not in kept] == [b.encode() for b in new_blocks if b.type not in kept]
+    last = after.text.paragraphs[-1] if after.text else None
+    want = ("" if old_text is None else old_text) + "\nA boldword" if old_text is not None else "\nA boldword"
+    ok = (same and after.text is not None and after.text.text == want
+          and last.style == rm_parser.ParagraphStyle.BULLETPOINT
+          and [(s.text, s.bold) for s in last.spans] == [("A ", False), ("bold", True), ("word", False)]
+          and len(after.strokes) == len(original.strokes)
+          and ORDER.match("".join(LETTER.get(b.type, "?") for b in new_blocks))
+          and rm_text.page_text(edited).encode() == [b for b in new_blocks if b.type == w.BLOCK_ROOT_TEXT][0].payload)
+    if ok:
+        counted = [int.from_bytes(v, "little") for _, _, v in
+                   w.read_values([b for b in new_blocks if b.type == w.BLOCK_PAGE_STATS][0].payload)]
+        ok = counted[2:4] == list(rm_text.page_text(edited).stats()) and counted[:2] + counted[4:] == \
+            [int.from_bytes(v, "little") for _, _, v in w.read_values(page_stats[0].payload)][:2] + \
+            [int.from_bytes(v, "little") for _, _, v in w.read_values(page_stats[0].payload)][4:]
+    if not ok:
+        stats["text edit: WRONG"] += 1
 
 
 def check(data: bytes, stats: Counter, skeleton: dict[bytes, str]) -> None:
@@ -107,6 +164,8 @@ def check(data: bytes, stats: Counter, skeleton: dict[bytes, str]) -> None:
     single = len(w.decode_authors(blocks[0].payload)) == 1
     if single:
         rights_hold(blocks, stats)
+
+    check_text(data, blocks, stats)
 
     try:
         before = rm_parser.parse(data)

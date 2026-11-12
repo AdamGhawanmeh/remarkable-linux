@@ -14,6 +14,15 @@ Four kinds: an image put on a page (ImageInsert), an image moved, scaled or turn
 images table, which stays the same however often it is moved, so they apply as well to
 an image of the tablet's as to one put on the page here.
 
+Typed text (TextEdit): text typed or deleted, a stretch made bold or italic or not,
+a paragraph given a style (viewer.rm_text, as the app's text document does each). An
+edit names characters by id, not by position, so that it lands on the same text when
+it is made again on a newer version of the page: ("page", author, counter), a
+character the page had, or ("edit", uid, offset), one typed by an earlier edit. Text
+goes after the character named (none: at the start); a range runs from its first
+character to its last. A page with no text box gets one (its first paragraph a title,
+as the app makes one), and changes its .rm, .content and .metadata like an image does.
+
 Undo and redo (PageHistory) work as in reMarkable.exe (SceneActionStack): they do not
 take edits back but make new ones, so they upload like any other edit.
 
@@ -54,12 +63,13 @@ import logging
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from viewer import rm_writer
-from viewer.rm_parser import RmParseError
+from viewer import rm_text
+from viewer.rm_parser import ParagraphStyle, RmParseError
 
 from .config import atomic_write_json, ensure_private_dir, read_json
 from .models import Document, json_bytes
@@ -333,13 +343,88 @@ class PageDelete(_PageEdit):
         return cls.new(raw["doc_id"], raw["pages"], raw["created_ms"], raw["blank_id"])
 
 
+# A character of a page's text, named so that it can be found again whatever ids the
+# page gives the edits when they are made again: ("page", author, counter), one the page
+# had, or ("edit", uid, offset), the offset-th UTF-16 unit typed by the TextEdit `uid`.
+CharRef = tuple
+
+TEXT_OPS = ("insert", "delete", "format", "unformat", "style")
+TEXT_STYLES = ("bold", "italic")
+
+
+def _char_ref(value) -> CharRef | None:
+    if value is None:
+        return None
+    ref = tuple(value)
+    if (len(ref) == 3 and ref[0] == "edit" and isinstance(ref[1], str) and ref[1]
+            and isinstance(ref[2], int) and not isinstance(ref[2], bool) and ref[2] >= 0):
+        return ref
+    if (len(ref) == 3 and ref[0] == "page" and all(isinstance(n, int) and not isinstance(n, bool) for n in ref[1:])
+            and 0 <= ref[1] <= 0xFF and ref[2] > 0):
+        return ref
+    raise EditError(f"not a character reference: {value!r}")
+
+
+@dataclass(frozen=True)
+class TextEdit:
+    """A change of a page's typed text (viewer.rm_text):
+
+        insert    `text` after the character `first` (None: at the start); `bold` and
+                  `italic` (None: as it falls) say on which side of a styled stretch's
+                  markers it goes when it is typed right at one's end
+        delete    the characters `first` to `last`
+        format    `style` ("bold"/"italic") given to the characters `first` to `last`
+        unformat  `style` taken off them
+        style     the paragraph after the newline `first` (None: the first paragraph)
+                  given `paragraph` (a viewer.rm_parser.ParagraphStyle value)
+    """
+
+    doc_id: str
+    page_id: str
+    op: str
+    created_ms: int
+    first: CharRef | None = None
+    last: CharRef | None = None
+    text: str = ""
+    style: str = ""
+    paragraph: int = 0
+    bold: bool | None = None
+    italic: bool | None = None
+    uid: str = ""
+
+    def __post_init__(self) -> None:
+        if self.op not in TEXT_OPS:
+            raise EditError(f"not a text edit: {self.op!r}")
+        if self.op == "insert" and not self.text:
+            raise EditError("an insert without text")
+        if self.op in ("delete", "format", "unformat") and (self.first is None or self.last is None):
+            raise EditError(f"a {self.op} without its range")
+        if self.op in ("format", "unformat") and self.style not in TEXT_STYLES:
+            raise EditError(f"not a text style: {self.style!r}")
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, op: str, created_ms: int, *, first=None, last=None, text: str = "",
+            style: str = "", paragraph: int = 0, bold: bool | None = None, italic: bool | None = None) -> "TextEdit":
+        return cls(str(doc_id), str(page_id), op, int(created_ms), _char_ref(first), _char_ref(last), str(text),
+                   str(style), int(paragraph), bold, italic, uuid.uuid4().hex)
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "TextEdit":
+        flag = lambda v: None if v is None else bool(v)       # noqa: E731
+        return cls(str(raw["doc_id"]), str(raw["page_id"]), str(raw["op"]), int(raw["created_ms"]),
+                   _char_ref(raw.get("first")), _char_ref(raw.get("last")), str(raw.get("text") or ""),
+                   str(raw.get("style") or ""), int(raw.get("paragraph") or 0), flag(raw.get("bold")),
+                   flag(raw.get("italic")), str(raw.get("uid") or ""))
+
+
 PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete)
 DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
 
-Edit = ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
+Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
+        | TextEdit)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
-                          "page-move": PageMove, "page-delete": PageDelete}
+                          "page-move": PageMove, "page-delete": PageDelete, "text": TextEdit}
 
 
 class PendingEdits:
@@ -476,6 +561,25 @@ class Replay:
     page: bytes | None
     made: dict[str, tuple[int, int]]
     removed: dict[tuple[int, int], rm_writer.ImageValue]
+    typed: dict[str, tuple[tuple[int, int], int]] = field(default_factory=dict)   # uid -> (first id, units)
+
+    def char(self, ref: CharRef | None) -> tuple[int, int] | None:
+        """The id a character reference names now (None: none, or not known)."""
+        if ref is None:
+            return None
+        if ref[0] == "page":
+            return ref[1], ref[2]
+        made = self.typed.get(ref[1])
+        if made is None or ref[2] >= made[1]:
+            return None
+        return made[0][0], made[0][1] + ref[2]
+
+    def char_ref(self, char_id: tuple[int, int]) -> CharRef:
+        """How an edit names the character `char_id` of the page."""
+        for uid, (first, count) in reversed(list(self.typed.items())):
+            if first[0] == char_id[0] and first[1] <= char_id[1] < first[1] + count:
+                return ("edit", uid, char_id[1] - first[1])
+        return ("page", *char_id)
 
     def resolve(self, ref: ItemRef) -> tuple[int, int] | None:
         return self.made.get(ref[1]) if ref[0] == "edit" else (ref[1], ref[2])
@@ -496,6 +600,7 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
     made: dict[str, tuple[int, int]] = {}
     removed: dict[tuple[int, int], rm_writer.ImageValue] = {}
     deleted: set[bytes] = set()
+    typed: dict[str, tuple[tuple[int, int], int]] = {}
 
     def note(uid: str, key: bytes) -> None:
         live = rm_writer.image_item(page, key)
@@ -503,6 +608,9 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
             made[uid] = live[0]
 
     for edit in edits:
+        if isinstance(edit, TextEdit):
+            page = _text_edit(page, edit, author, Replay(page, made, removed, typed))
+            continue
         key = bytes.fromhex(edit.key)
         if isinstance(edit, ImageInsert):
             if key not in page_images(page):
@@ -538,7 +646,69 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
             note(edit.uid, key)
     if deleted and page is not None:
         page, _ = rm_writer.prune_images(page, deleted)
-    return Replay(page, made, removed)
+    return Replay(page, made, removed, typed)
+
+
+def _text_edit(page: bytes | None, edit: TextEdit, author: bytes, done: Replay) -> bytes | None:
+    """`page` with a text edit made to it. A character it names that the text no longer
+    has (another device took it out of a newer version) leaves it with nothing to do,
+    as a move of an image deleted meanwhile does."""
+
+    def where(ref: CharRef | None, after: bool) -> int | None:
+        """The text position of a character: before it, or after it (a deleted one:
+        where it was)."""
+        if ref is None:
+            return 0
+        char = done.char(ref)
+        found = text.position_of(char) if char is not None else None
+        if found is None:
+            return None
+        return found[0] + (1 if after and found[1] else 0)
+
+    def change(doc: rm_text.TextDocument, clock: rm_text.Clock) -> None:
+        nonlocal text
+        text = doc
+        if edit.op == "insert":
+            at = where(edit.first, True)
+            if at is None:
+                return skip()
+            first = doc.insert(at, edit.text, clock, bold=edit.bold, italic=edit.italic)
+            if edit.uid and first is not None:
+                done.typed[edit.uid] = (first, rm_text.units(edit.text))
+            return
+        if edit.op == "style":
+            key = rm_text.ZERO if edit.first is None else done.char(edit.first)
+            if key is None or key not in doc.paragraph_keys():
+                return skip()
+            doc.set_style(key, ParagraphStyle(edit.paragraph), clock)
+            return
+        start, end = where(edit.first, False), where(edit.last, True)
+        if start is None or end is None:
+            return skip()
+        if end <= start:
+            return
+        if edit.op == "delete":
+            doc.delete(start, end - start)
+        elif edit.op == "format":
+            doc.format(start, end - start, edit.style, clock)
+        else:
+            doc.unformat(start, end - start, edit.style, clock)
+
+    def skip() -> None:
+        log.warning("not making text edit %s on page %s: its text is gone", edit.op, edit.page_id)
+
+    text: rm_text.TextDocument | None = None
+    try:
+        return rm_text.edit_text(page, author=author, change=change)
+    except ValueError as err:
+        raise EditError(f"the text edit does not fit the page: {err}") from err
+
+
+def text_of(page: bytes | None, edits: list[Edit], author: bytes) -> tuple[rm_text.TextDocument | None, Replay]:
+    """The text of `page` with `edits` made to it, and what they made: to name a
+    position of it in a new TextEdit (Replay.char_ref of TextDocument.id_at)."""
+    done = replay(page, edits, author)
+    return rm_text.page_text(done.page), done
 
 
 def page_with_edits(page: bytes | None, edits: list[Edit], author: bytes) -> bytes | None:

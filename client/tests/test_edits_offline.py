@@ -30,8 +30,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import push_edits  # noqa: E402
 from core.edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd,  # noqa: E402
-                        PageCopy, PageDelete, PageMove, PendingEdits, Staged, document_files, page_images,
-                        page_with_edits)
+                        PageCopy, PageDelete, PageMove, PendingEdits, Staged, TextEdit, document_files, page_images,
+                        page_with_edits, text_of)
 from core import pagemap  # noqa: E402
 from core.tags import set_entry_tags, set_page_tags  # noqa: E402
 from core.pagemap import PageMap, PageMapError, jump, key_after, keys_after, keys_between, not_before  # noqa: E402
@@ -39,8 +39,8 @@ from core.models import Content, json_bytes  # noqa: E402
 from core.sync import SyncClient, SyncError, json_changes, parse_index  # noqa: E402
 from ui import editing  # noqa: E402
 from ui.library import LibrarySource, document_pages  # noqa: E402
-from viewer import rm_writer  # noqa: E402
-from viewer.rm_parser import RmParseError, parse  # noqa: E402
+from viewer import rm_text, rm_writer  # noqa: E402
+from viewer.rm_parser import ParagraphStyle, RmParseError, parse  # noqa: E402
 
 THROWAWAY = "11111111-aaaa-4aaa-8aaa-111111111111"
 OTHER = "22222222-bbbb-4bbb-8bbb-222222222222"
@@ -1913,6 +1913,106 @@ class CopyChainTests(ImagePageBase):
         # The copy of the copy is a document like any other: its metadata has the same fields.
         self.assertEqual(sorted(self.cloud.metadata(c)), sorted(self.cloud.metadata(b)))
         self.assertEqual(self.cloud.metadata(c)["visibleName"], "throwaway copy copy")
+
+
+class TextEditTests(Base):
+    """Typed text staged as edits (TextEdit), made on the page when it is worked out,
+    and uploaded like any other edit."""
+
+    def files(self, edits):
+        return document_files(self.doc, edits, lambda name: self.source.blob(self.doc, name), lambda e: b"",
+                              self.sync.author())
+
+    def text(self, op, when=NOW, page=PAGE1, **kw) -> TextEdit:
+        return TextEdit.new(THROWAWAY, page, op, when, **kw)
+
+    def test_typing_on_a_page_changes_three_files(self):
+        edit = self.text("insert", text="Hello")
+        files = self.files([edit])
+        rm, content, metadata = f"{THROWAWAY}/{PAGE1}.rm", f"{THROWAWAY}.content", f"{THROWAWAY}.metadata"
+        self.assertEqual(sorted(files), sorted([rm, content, metadata]))
+        scene = parse(files[rm])
+        self.assertEqual([(p.style, p.text) for p in scene.text.paragraphs], [(ParagraphStyle.TITLE, "Hello")])
+        self.assertEqual(len(scene.strokes), 1)
+        self.assertEqual(json.loads(files[metadata])["lastModified"], str(NOW))
+        # A page with no .rm yet gets one, with the text.
+        files = self.files([self.text("insert", page=PAGE2, text="Two")])
+        self.assertEqual(parse(files[f"{THROWAWAY}/{PAGE2}.rm"]).text.text, "Two")
+
+    def test_edits_name_the_text_they_typed(self):
+        typed = self.text("insert", text="Hello world")
+        edits = [typed,
+                 self.text("format", first=("edit", typed.uid, 6), last=("edit", typed.uid, 10), style="bold"),
+                 self.text("insert", first=("edit", typed.uid, 4), text="\nnext"),
+                 self.text("delete", first=("edit", typed.uid, 0), last=("edit", typed.uid, 0)),
+                 self.text("style", paragraph=int(ParagraphStyle.PARAGRAPH))]
+        page = page_with_edits(drawn_page(), edits, TABLET)
+        text = parse(page).text
+        self.assertEqual(text.text, "ello\nnext world")
+        self.assertEqual([(p.style, [(s.text, s.bold) for s in p.spans]) for p in text.paragraphs],
+                         [(ParagraphStyle.PARAGRAPH, [("ello", False)]),
+                          (ParagraphStyle.PARAGRAPH, [("next ", False), ("world", True)])])
+        # The second paragraph is named by its newline, typed by the third edit.
+        doc, done = text_of(drawn_page(), edits, TABLET)
+        newline = done.char_ref(doc.paragraph_keys()[1])
+        self.assertEqual(newline, ("edit", edits[2].uid, 0))
+        styled = page_with_edits(drawn_page(), edits + [self.text("style", first=newline,
+                                                                    paragraph=int(ParagraphStyle.BULLETPOINT))], TABLET)
+        self.assertEqual(parse(styled).text.paragraphs[1].style, ParagraphStyle.BULLETPOINT)
+
+    def test_kept_on_disk_and_read_back(self):
+        typed = self.text("insert", text="x\U0001F600", bold=True)
+        edits = [typed, self.text("unformat", first=("page", 1, 5), last=("edit", typed.uid, 2), style="italic"),
+                 self.text("style", first=("edit", typed.uid, 0), paragraph=3)]
+        for edit in edits:
+            self.sync.edits.add(edit)
+        self.assertEqual(PendingEdits(self.dir / "cache" / "pending").all(), edits)
+        for bad in ({"op": "insert"}, {"op": "move"}, {"op": "format", "style": "bold"},
+                    {"op": "format", "first": ["page", 1, 2], "last": ["page", 1, 3], "style": "under"},
+                    {"op": "delete", "first": ["page", 1, 0], "last": ["page", 1, 3]}):
+            with self.assertRaises(EditError):
+                TextEdit.load({"doc_id": THROWAWAY, "page_id": PAGE1, "created_ms": NOW, **bad})
+
+    def test_made_again_on_a_newer_version_of_the_page(self):
+        # Staged on the page as it was; meanwhile the tablet typed "Hi " in front.
+        typed = self.text("insert", text="there")
+        edits = [typed, self.text("insert", first=("edit", typed.uid, 4), text="!")]
+        newer = rm_text.edit_text(drawn_page(), author=TABLET, change=lambda d, c: d.insert(0, "Hi ", c))
+        first = rm_text.page_text(newer).id_at(2)
+        on_newer = page_with_edits(newer, [self.text("insert", first=("page", *first), text="you "), *edits],
+                                   self.sync.author())
+        self.assertEqual(parse(on_newer).text.text, "there!Hi you ")
+        # Text it names that was deleted there is still known (a tombstone): typing
+        # after it goes where it was, deleting it again does nothing.
+        gone = rm_text.edit_text(newer, author=TABLET, change=lambda d, c: d.delete(0, 3))
+        page = page_with_edits(gone, [self.text("delete", first=("page", *first), last=("page", *first)),
+                                      self.text("insert", first=("page", *first), text="ok")], self.sync.author())
+        self.assertEqual(parse(page).text.text, "ok")
+        # Text the page never had (another version of it): that edit does nothing.
+        with self.assertLogs("rm.edits", "WARNING"):
+            page = page_with_edits(gone, [self.text("insert", first=("page", 1, 999), text="lost"),
+                                          self.text("insert", text="kept")], self.sync.author())
+        self.assertEqual(parse(page).text.text, "kept")
+
+    def test_the_push_plan_lists_text_edits_without_the_text(self):
+        typed = self.text("insert", text="private words")
+        self.source.blob(self.doc, f"{THROWAWAY}/{PAGE1}.rm")          # the page, cached as opening it does
+        self.sync.edits.add(typed)
+        self.sync.edits.add(self.text("format", first=("edit", typed.uid, 0), last=("edit", typed.uid, 6),
+                                      style="bold", when=NOW + 1))
+        plan = self.sync.push_plan(THROWAWAY)
+        self.assertEqual([f.name for f in plan.files],
+                         [f"{THROWAWAY}.content", f"{THROWAWAY}.metadata", f"{THROWAWAY}/{PAGE1}.rm"])
+        described = plan.describe()
+        self.assertIn(f"text on page {PAGE1}: type 13 characters after the start", described)
+        self.assertIn(f"make bold char 0 of edit {typed.uid[:8]} .. char 6 of edit {typed.uid[:8]}", described)
+        self.assertNotIn("private", described)
+        tree = self.sync.push_edits(THROWAWAY)
+        self.assertEqual(self.sync.edits.all(), [])
+        page = self.cloud.item(THROWAWAY)[f"{THROWAWAY}/{PAGE1}.rm"]
+        self.assertEqual([[(s.text, s.bold) for s in p.spans] for p in parse(page).text.paragraphs],
+                         [[("private", True), (" words", False)]])
+        self.assertEqual(tree.get(THROWAWAY).files[f"{THROWAWAY}/{PAGE1}.rm"], sha(page))
 
 
 class PendingEditsAcrossProcessesTests(unittest.TestCase):
