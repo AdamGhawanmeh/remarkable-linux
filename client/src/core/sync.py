@@ -61,8 +61,12 @@ from typing import Any, Callable, Iterable
 
 from .auth import AuthClient, HttpResponse
 from .config import atomic_write_json, cache_dir, ensure_private_dir, read_json
+from viewer import rm_stroke
+from viewer.rm_parser import Color, Tool
+
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd, PageCopy, PageDelete,
-                    PageMove, PendingEdits, TextEdit, document_files)
+                    PageMove, PendingEdits, STROKE_EDITS, StrokeAdd, StrokeDelete, StrokeErase, TextEdit,
+                    document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
                      new_document_content, new_folder_content, new_metadata)
@@ -404,6 +408,14 @@ def describe_text_edit(e) -> str:
     return f"{what} {_char(e.first)} .. {_char(e.last)}"
 
 
+def _name(enum, value: int) -> str:
+    """A Line::Tool or Line::Color by its name in the app, e.g. Finelinerv2."""
+    member = enum.parse(value)
+    if member.value < 0:
+        return f"{enum.__name__.lower()} {value}"
+    return member.name.title().replace("_V2", "v2").replace("_", "")
+
+
 def describe_edit(e) -> str:
     """One pending edit, as push plans list them."""
     if isinstance(e, TextEdit):
@@ -417,6 +429,19 @@ def describe_edit(e) -> str:
         return f"  move pages {', '.join(e.pages)}\n    to {e.index}, after page {e.after or '(front)'}"
     if isinstance(e, PageDelete):
         return (f"  delete pages {', '.join(e.pages)}\n    (if no page is left: new \"Blank\" page {e.blank_id})")
+    if isinstance(e, (StrokeAdd, StrokeErase)):
+        points = rm_stroke.unpack_points(bytes.fromhex(e.points))
+        xs, ys = [p.x for p in points], [p.y for p in points]
+        where = f"x {min(xs):.1f}..{max(xs):.1f}, y {min(ys):.1f}..{max(ys):.1f} (scene units, x 0 = page centre)"
+        if isinstance(e, StrokeErase):
+            what = "eraser" if e.tool == rm_stroke.ERASER else "erase-area outline"
+            wide = f", {points[0].width / 4:g} wide" if e.tool == rm_stroke.ERASER else ""
+            return (f"  erase on page {e.page_id}: {what} of {len(points)} points{wide}\n"
+                    f"    over {where}\n"
+                    f"    strokes it touches are deleted, what is left of them put back as new strokes")
+        return f"  stroke on page {e.page_id}: {_pen(e)}, {len(points)} points\n    drawn over {where}"
+    if isinstance(e, StrokeDelete):
+        return f"  delete {len(e.items)} stroke{'s' if len(e.items) != 1 else ''} on page {e.page_id}"
     if isinstance(e, ImageDelete):
         return f"  delete image {e.key} on page {e.page_id}"
     if isinstance(e, ImageRestore):
@@ -428,6 +453,55 @@ def describe_edit(e) -> str:
     return (f"  image on page {e.page_id}\n"
             f"    file {e.file_name}  ({e.size} bytes, sha256 {e.sha256[:12]}…), images-table key {e.key}\n"
             f"    placed {where}")
+
+
+def _pen(e: StrokeAdd) -> str:
+    colour = f"ARGB {e.argb:08x}" if e.color == rm_stroke.COLOR_ARGB else _name(Color, e.color)
+    return f"{_name(Tool, e.tool)}, {colour}, size {e.thickness:g}"
+
+
+def _extent(edits) -> str:
+    points = [p for e in edits for p in rm_stroke.unpack_points(bytes.fromhex(e.points))]
+    xs, ys = [p.x for p in points], [p.y for p in points]
+    return f"x {min(xs):.1f}..{max(xs):.1f}, y {min(ys):.1f}..{max(ys):.1f} (scene units, x 0 = page centre)"
+
+
+def describe_edits(edits) -> list[str]:
+    """The pending edits as push plans list them: one entry each, in order, but strokes
+    drawn one after the other on a page, and eraser passes likewise, summed up in one."""
+    out, at = [], 0
+    while at < len(edits):
+        e, end = edits[at], at + 1
+        if isinstance(e, (StrokeAdd, StrokeErase)):
+            while end < len(edits) and type(edits[end]) is type(e) and edits[end].page_id == e.page_id:
+                end += 1
+        run = edits[at:end]
+        at = end
+        if len(run) == 1:
+            out.append(describe_edit(e))
+        elif isinstance(e, StrokeAdd):
+            pens: dict[str, int] = {}
+            for stroke in run:
+                pens[_pen(stroke)] = pens.get(_pen(stroke), 0) + 1
+            points = sum(len(stroke.points) // (2 * rm_stroke.POINT.size) for stroke in run)
+            out.append(f"  {len(run)} strokes on page {e.page_id}, {points} points\n"
+                       + "".join(f"    {count} x {pen}\n" for pen, count in pens.items())
+                       + f"    drawn over {_extent(run)}")
+        else:
+            out.append(f"  {len(run)} eraser passes on page {e.page_id}\n    over {_extent(run)}\n"
+                       f"    strokes they touch are deleted, what is left of them put back as new strokes")
+    return out
+
+
+def stroke_changes(old: bytes | None, new: bytes | None) -> tuple[int, int, int, int] | None:
+    """What edits do to a page's strokes: (live before, live after, deleted, new); None
+    when a page cannot be read."""
+    try:
+        before = {x.item for x in rm_stroke.strokes(old)}
+        after = {x.item for x in rm_stroke.strokes(new)}
+    except (ValueError, KeyError, IndexError):
+        return None
+    return len(before), len(after), len(before - after), len(after - before)
 
 
 @dataclass
@@ -445,6 +519,8 @@ class PushPlan:
     old_index_hash: str
     trashed: bool
     removed: list[FileChange] = field(default_factory=list)     # files the document no longer has
+    # page file -> its live strokes (before, after, deleted, new), when strokes were drawn or erased
+    strokes: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
 
     def describe(self) -> str:
         lines = [f"Document  {self.doc_id}" + ("   (IN THE TRASH: the upload would be refused)" if self.trashed else ""),
@@ -453,7 +529,9 @@ class PushPlan:
         if not self.files:
             return "\n".join(lines + ["Nothing to upload: the document already has these edits."])
         lines.append(f"Edits     {len(self.edits)}, applied in this order")
-        lines += [describe_edit(e) for e in self.edits]
+        lines += describe_edits(self.edits)
+        for name, (before, after, deleted, new) in self.strokes.items():
+            lines.append(f"Strokes   {name}: {before} live before, {after} after ({deleted} deleted, {new} new)")
         for name, changes in self.fields.items():
             lines.append(f"Fields changed in {name}")
             lines += [f"  {field}: {json.dumps(old)} -> {json.dumps(new)}" for field, old, new in changes] or ["  (none)"]
@@ -1206,8 +1284,17 @@ class SyncClient:
                 before = json.loads(self.get_blob(old.hash, name, cached_only=True))
                 fields[name] = json_changes(before, json.loads(data))
         index_hash, index_data = build_index(self.root.schema_version, entries.values(), doc.id)
+        strokes = {}
+        if any(isinstance(e, STROKE_EDITS) for e in edits):
+            for change in changes:
+                if change.name.endswith(".rm"):
+                    old = (self.get_blob(change.old_sha256, change.name, cached_only=True)
+                           if change.old_sha256 is not None else None)
+                    counted = stroke_changes(old, files[change.name])
+                    if counted is not None:
+                        strokes[change.name] = counted
         return PushPlan(doc.id, edits, self.root.generation, self.root.hash, self.root.schema_version, changes,
-                        fields, index_hash, index_data, doc.hash, self.tree.is_trashed(doc_id), removed)
+                        fields, index_hash, index_data, doc.hash, self.tree.is_trashed(doc_id), removed, strokes)
 
     def push_edits(self, doc_id: str, progress: Callable[[int, int], None] | None = None) -> DocumentTree:
         """Upload the pending edits of a document: its changed files, its index, the

@@ -192,6 +192,16 @@ class Stroke:
     item_id: tuple[int, int] | None = None
     anchor: Anchor | None = None   # from the nearest anchored group, if any
     seq: int = field(default=0, compare=False)    # v6 block position: stacking with images
+    # The rest of a v6 line item, so that nothing of it is lost (viewer.rm_stroke writes
+    # one): its neighbours in the layer's sequence, the timestamp (0:1 unless it was
+    # transformed), the item it replaced when it was moved, for a shader's piece the
+    # stroke it comes from, and what follows the fields the app knows.
+    left: tuple[int, int] | None = None
+    right: tuple[int, int] | None = None
+    timestamp: tuple[int, int] | None = None
+    move_id: tuple[int, int] | None = None
+    source_id: tuple[int, int] | None = None
+    tail: bytes = b""
 
     def bounds(self) -> tuple[float, float, float, float] | None:
         if not self.points:
@@ -635,22 +645,25 @@ def _decode_anchor(f: dict[int, _Field]) -> Anchor:
                   type=kind.as_int() if kind else 0)
 
 
-def _decode_line(value: bytes, block_version: int, item_id) -> Stroke:
-    """Decode a SceneLineItem value sub-block: u8 item_type then tagged fields."""
-    r = _Reader(value)
-    item_type = r.u8()
-    if item_type != 3:
-        raise RmParseError(f"line item has unexpected item type {item_type}")
-    f = _read_fields(value[1:])
-    tool_id = _field(f, 1, TAG_BYTE4, "line").as_int()
-    color_id = _field(f, 2, TAG_BYTE4, "line").as_int()
-    thickness = _field(f, 3, TAG_BYTE8, "line").raw
-    starting = _field(f, 4, TAG_BYTE4, "line").as_float32()
-    points = _decode_points(_field(f, 5, TAG_LENGTH4, "line").raw, block_version)
-    argb = f[8].as_int() if 8 in f and f[8].type == TAG_BYTE4 else None
+def _decode_line(value: bytes, block_version: int, item_id, left=None, right=None) -> Stroke:
+    """Decode a SceneLineItem value sub-block: u8 item_type, then its fields as the app
+    reads them (0x140a20dd0): 1 tool, 2 color, 3 thicknessScale, 4 startingLength and
+    5 points, then 6 timestamp, 7 moveId, 8 ARGB colour and 9 sourceId where they are
+    there; what follows is kept (`tail`)."""
+    if not value or value[0] != 3:
+        raise RmParseError(f"line item has unexpected item type {value[0] if value else None}")
+    r = _Values(value[1:], "line")
+    tool_id = r.need(1, TAG_BYTE4)
+    color_id = r.need(2, TAG_BYTE4)
+    thickness = r.need(3, TAG_BYTE8)
+    starting = struct.unpack("<f", struct.pack("<I", r.need(4, TAG_BYTE4)))[0]
+    points = _decode_points(r.need(5, TAG_LENGTH4), block_version)
+    timestamp, move_id = r.get(6, TAG_ID), r.get(7, TAG_ID)
+    argb, source_id = r.get(8, TAG_BYTE4), r.get(9, TAG_ID)
     return Stroke(tool=Tool.parse(tool_id), color=Color.parse(color_id), points=points,
                   thickness_scale=float(thickness), starting_length=starting, argb=argb,
-                  tool_id=tool_id, color_id=color_id, item_id=item_id)
+                  tool_id=tool_id, color_id=color_id, item_id=item_id, left=left, right=right,
+                  timestamp=timestamp, move_id=move_id, source_id=source_id, tail=r.rest())
 
 
 @dataclass
@@ -1011,7 +1024,8 @@ def _parse_v6(data: bytes) -> PageScene:
                     if parent == ROOT_NODE and child not in layer_order:
                         layer_order.append(child)
                 else:
-                    stroke = _decode_line(value, version, item)
+                    stroke = _decode_line(value, version, item, _left(f),
+                                          f[4].raw if 4 in f and f[4].type == TAG_ID else None)
                     stroke.seq = counts_total(counts)
                     lines.append((parent, stroke))
             elif block_type == BLOCK_ROOT_TEXT:

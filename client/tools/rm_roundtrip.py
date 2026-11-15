@@ -24,11 +24,21 @@ For every v6 page under the directory (default: the library cache) it checks tha
     deleting, styling a paragraph and making a word bold through rm_text.edit_text
     gives the text asked for, changes only the text and stats blocks (and authors),
     and reads back the same; a page with no text gets a box where the app puts one.
+  - every stroke's value re-encodes to its bytes (viewer.rm_stroke.LineValue), and a
+    stroke drawn on the page (pages without typed text) leaves every block as it is
+    and comes back as drawn, on top of the current layer;
+  - the page's deleted runs are what deleting does: with a live stroke put back for
+    every deleted id, deleting them again in any order gives the page's own runs
+    (pages without image items);
+  - an eraser taken across the middle of the page deletes what it touches, leaves the
+    other strokes as they are, and puts pieces in place that are the strokes' own
+    points between the cuts, none of them inside the eraser.
 It prints counts only, nothing of the pages' content. Exit status 1 if anything failed.
 """
 
 from __future__ import annotations
 
+import random
 import re
 import sys
 from collections import Counter
@@ -36,7 +46,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from viewer import rm_parser, rm_text, rm_writer as w  # noqa: E402
+from viewer import rm_parser, rm_stroke, rm_text, rm_writer as w  # noqa: E402
 
 ORDER = re.compile(r"^UCPSI?M+T?N+[GLXJ]*$")
 LETTER = {0x09: "U", 0x00: "C", 0x0A: "P", 0x0D: "S", 0x0E: "I", 0x01: "M", 0x07: "T", 0x02: "N",
@@ -119,6 +129,136 @@ def check_text(data: bytes, blocks: list[w.Block], stats: Counter) -> None:
         stats["text edit: WRONG"] += 1
 
 
+def _items(blocks: list[w.Block]) -> list[tuple[w.Block, w.ItemHeader]]:
+    return [(b, w.decode_item(b.payload)) for b in blocks if b.type in w.ITEM_BLOCKS]
+
+
+def _order_ok(blocks: list[w.Block]) -> bool:
+    keys = [(w.id_key(i.parent), w.id_key(i.item)) for _, i in _items(blocks)]
+    return keys == sorted(keys) and bool(ORDER.match("".join(LETTER.get(b.type, "?") for b in blocks)))
+
+
+def check_strokes(data: bytes, blocks: list[w.Block], stats: Counter) -> None:
+    """The stroke engine (viewer.rm_stroke) on a real page."""
+    header = data[:rm_parser.HEADER_LENGTH]
+    live: dict[tuple, tuple[w.ItemHeader, rm_stroke.LineValue]] = {}
+    for block, item in _items(blocks):
+        if block.type == w.BLOCK_LINE_ITEM and item.value is not None:
+            stats["line values"] += 1
+            try:
+                line = rm_stroke.decode_line_value(item.value)
+            except rm_parser.RmParseError:
+                stats["line value: WRONG"] += 1
+                continue
+            if rm_stroke.pack_points(line.unpacked()) != line.points:
+                stats["line points: WRONG"] += 1
+            live[item.item] = (item, line)
+
+    # The deleted runs, made again by deleting.
+    gone = [(b, i) for b, i in _items(blocks) if i.value is None and i.deleted_length
+            and b.type in (w.BLOCK_LINE_ITEM, w.BLOCK_TOMBSTONE)]
+    if gone and not any(b.type == w.BLOCK_IMAGE_ITEM for b in blocks):
+        dummy = rm_stroke.new_line(rm_stroke.FINELINER_V2, 0, 2.0, [rm_stroke.Point(0.0, 0.0, 0, 16, 0, 0)] * 2).encode()
+        runs = {id(b) for b, _ in gone}
+        back, ids = [b for b in blocks if id(b) not in runs], []
+        for _, item in gone:
+            left = item.left
+            for n in range(item.deleted_length):
+                this = (item.item[0], item.item[1] + n)
+                back.append(w.new_block(w.BLOCK_LINE_ITEM, w.ItemHeader(item.parent, this, left, item.right, 0, dummy).encode()))
+                ids.append(this)
+                left = this
+        first = next(n for n, b in enumerate(back) if b.type in w.ITEM_BLOCKS)
+        back[first:] = sorted(back[first:], key=lambda b: (w.id_key(w.decode_item(b.payload).parent),
+                                                           w.id_key(w.decode_item(b.payload).item)))
+        random.Random(len(ids)).shuffle(ids)
+        try:
+            again = w.split(rm_stroke.delete_strokes(w.join(header, back), ids))[1]
+        except (rm_parser.RmParseError, ValueError) as e:
+            stats[f"deleting refused: {re.sub(r'[0-9]+', 'N', str(e))}"] += 1
+        else:
+            stats["pages whose deleted runs were made again"] += 1
+            stats["deleted ids made again"] += len(ids)
+            want = sorted((i.parent, i.item, i.left, i.right, i.deleted_length) for _, i in gone)
+            have = sorted((i.parent, i.item, i.left, i.right, i.deleted_length) for b, i in _items(again)
+                          if i.value is None and i.deleted_length and b.type == w.BLOCK_LINE_ITEM)
+            if want != have or len(again) != len(blocks):
+                stats["deleted runs made again: WRONG"] += 1
+
+    if rm_stroke.has_text(blocks):
+        stats["pages with typed text (no drawing yet)"] += 1
+        return
+    # A stroke drawn on the page.
+    drawn = rm_stroke.draw([(-200.0 + 7.3 * n, 300.0 + 40.0 * ((n * 37) % 11) / 11) for n in range(40)],
+                           rm_stroke.BALLPOINT_V2, 0, rm_stroke.MEDIUM)
+    try:
+        page = rm_stroke.append_stroke(data, author=AUTHOR, line=drawn)
+    except (rm_parser.RmParseError, ValueError) as e:
+        stats[f"drawing refused: {re.sub(r'[0-9]+', 'N', str(e))}"] += 1
+        return
+    stats["strokes drawn"] += 1
+    new_blocks = w.split(page)[1]
+    added = list((Counter(b.encode() for b in new_blocks[1:]) - Counter(b.encode() for b in blocks[1:])).elements())
+    item = w.decode_item(added[0][8:]) if len(added) == 1 else None
+    layer = w.current_layer(blocks)
+    if (item is None or len(new_blocks) != len(blocks) + 1 or item.parent != layer or item.right != w.ZERO_ID
+            or item.value != drawn.encode() or w.sequence(new_blocks, layer)[-1][0] != item.item
+            or w.highest_counter(new_blocks) != item.item[1] or not _order_ok(new_blocks)
+            or len(rm_parser.parse(page).strokes) != len(live) + 1):
+        stats["drawing: WRONG"] += 1
+
+    # An eraser across the middle of the page's ink.
+    mine = [(i, l) for i, l in live.values() if i.parent == layer]
+    if not mine:
+        return
+    middle = mine[len(mine) // 2][1].unpacked()
+    at = middle[len(middle) // 2]
+    eraser = rm_stroke.eraser_line([(at.x - 30.3, at.y - 9.7), (at.x + 0.4, at.y + 0.2), (at.x + 31.1, at.y + 8.9)])
+    try:
+        erased = rm_stroke.erase(data, author=AUTHOR, eraser=eraser)
+    except (rm_parser.RmParseError, ValueError) as e:
+        stats[f"erasing refused: {re.sub(r'[0-9]+', 'N', str(e))}"] += 1
+        return
+    stats["erasures"] += 1
+    stats["strokes an eraser deleted"] += len(erased.deleted)
+    stats["pieces an eraser left"] += len(erased.made)
+    outline = rm_stroke.eraser_outline(eraser)
+    after = w.split(erased.page)[1]
+    now = {i.item: (b, i) for b, i in _items(after)}
+    ok = _order_ok(after) and len(set(erased.made)) == len(erased.made) and w.join(header, after) == erased.page
+    old_blocks = {i.item: b for b, i in _items(blocks)}
+    for item_id, (item, line) in live.items():
+        if item_id in erased.deleted:
+            continue
+        ok = ok and item_id in now and now[item_id][0].encode() == old_blocks[item_id].encode()
+    for item_id, ids in zip(erased.deleted, erased.pieces):
+        whole = live[item_id][1]
+        points = whole.unpacked()
+        ok = ok and (item_id not in now or now[item_id][1].value is None)     # its own block, or part of a run
+        length, left = whole.starting_length, item_id
+        for piece_id in ids:
+            block, piece_item = now[piece_id]
+            piece = rm_stroke.decode_line_value(piece_item.value)
+            made = piece.unpacked()
+            inner = made[1:-1]
+            starts = [n for n in range(len(points) - len(inner) + 1) if points[n:n + len(inner)] == inner] if inner else [0]
+            ok = (ok and piece_item.left == left and (piece.tool, piece.color, piece.thickness_scale, piece.argb)
+                  == (whole.tool, whole.color, whole.thickness_scale, whole.argb) and len(made) >= 2 and bool(starts)
+                  and piece.starting_length >= length and piece.timestamp == (0, 1) and piece.move_id is None
+                  and not any(outline.contains(p.x, p.y) for p in inner))
+            length, left = piece.starting_length, piece_id
+    if len(w.decode_authors(after[0].payload)) == 1 and len(w.decode_authors(blocks[0].payload)) == 1:
+        problems: Counter = Counter()
+        rights_hold(after, problems)
+        ok = ok and not any("WRONG" in name for name in problems)
+    try:
+        ok = ok and len(rm_parser.parse(erased.page).strokes) == len(live) - len(erased.deleted) + len(erased.made)
+    except rm_parser.RmParseError:
+        ok = False
+    if not ok:
+        stats["erasing: WRONG"] += 1
+
+
 def check(data: bytes, stats: Counter, skeleton: dict[bytes, str]) -> None:
     header, blocks = w.split(data)
     stats["pages"] += 1
@@ -166,6 +306,7 @@ def check(data: bytes, stats: Counter, skeleton: dict[bytes, str]) -> None:
         rights_hold(blocks, stats)
 
     check_text(data, blocks, stats)
+    check_strokes(data, blocks, stats)
 
     try:
         before = rm_parser.parse(data)

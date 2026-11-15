@@ -23,6 +23,13 @@ goes after the character named (none: at the start); a range runs from its first
 character to its last. A page with no text box gets one (its first paragraph a title,
 as the app makes one), and changes its .rm, .content and .metadata like an image does.
 
+Pen strokes (viewer.rm_stroke): a stroke drawn on a page (StrokeAdd: the finished
+line, as the app would add it), an eraser taken over a page (StrokeErase: the eraser's
+own line; what it deletes and what pieces it leaves is worked out on the page as it is
+when the edit is made again, as the app works it out when the eraser is lifted), and
+strokes deleted whole (StrokeDelete: by item, as ImageRestore names one). They change
+the page's .rm, .content and .metadata like an image does, and no other file.
+
 Undo and redo (PageHistory) work as in reMarkable.exe (SceneActionStack): they do not
 take edits back but make new ones, so they upload like any other edit.
 
@@ -67,6 +74,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from viewer import rm_stroke
 from viewer import rm_writer
 from viewer import rm_text
 from viewer.rm_parser import ParagraphStyle, RmParseError
@@ -230,6 +238,124 @@ class ImageRestore:
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "ImageRestore":
         return cls.new(raw["doc_id"], raw["page_id"], raw["key"], raw["item"], raw["created_ms"], raw.get("uid") or "")
+
+
+# ------------------------------------------------------------------ pen strokes
+
+def _points(value) -> str:
+    """A line's points as an edit keeps them: the 14 bytes of each, in hex."""
+    data = bytes(value) if isinstance(value, (bytes, bytearray)) else bytes.fromhex(str(value))
+    if not data or len(data) % rm_stroke.POINT.size:
+        raise EditError("not the points of a line")
+    return data.hex()
+
+
+def _number(value, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or abs(value) == float("inf"):
+        raise EditError(f"not a {what}: {value!r}")
+    return float(value)
+
+
+@dataclass(frozen=True)
+class StrokeAdd:
+    """A stroke drawn on a page: the line as the app adds it once the pen is lifted
+    (rm_stroke.draw: its points made from the pen's samples, then thinned out), which
+    goes on top of the page's current layer under the page's next id
+    (rm_stroke.append_stroke). `thickness` is the pen's size, the line's
+    thicknessScale; `argb` its colour when `color` is 9 (ArgbCode)."""
+
+    doc_id: str
+    page_id: str
+    tool: int
+    color: int
+    thickness: float
+    points: str                     # 14 bytes a point, hex
+    created_ms: int
+    argb: int | None = None
+    uid: str = ""                   # names the item it makes (ItemRef)
+
+    def line(self) -> rm_stroke.LineValue:
+        return rm_stroke.new_line(self.tool, self.color, self.thickness, bytes.fromhex(self.points), argb=self.argb)
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, line: rm_stroke.LineValue, created_ms: int, uid: str | None = None) -> "StrokeAdd":
+        if line.tool in rm_stroke.NOT_DRAWN:
+            raise EditError(f"tool {line.tool} does not draw")
+        if line.count >= rm_stroke.MAX_LINE_POINTS:
+            raise EditError("the line has too many points")
+        return cls(str(doc_id), str(page_id), int(line.tool), int(line.color), _number(line.thickness_scale, "pen size"),
+                   _points(line.points), int(created_ms),
+                   (rm_stroke.DEFAULT_ARGB if line.argb is None else int(line.argb)) if line.color == rm_stroke.COLOR_ARGB
+                   else None, uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "StrokeAdd":
+        argb = raw.get("argb")
+        return cls(str(raw["doc_id"]), str(raw["page_id"]), int(raw["tool"]), int(raw["color"]),
+                   _number(raw["thickness"], "pen size"), _points(raw["points"]), int(raw["created_ms"]),
+                   None if argb is None else int(argb), str(raw.get("uid") or ""))
+
+
+@dataclass(frozen=True)
+class StrokeErase:
+    """An eraser taken over a page's current layer: the eraser's own line (`tool` 6,
+    the Eraser, whose line is as wide as its first point; or 8, EraseSection, whose
+    line is the outline of what goes). Every stroke it touches is deleted, and what is
+    left of each put in its place as new strokes (rm_stroke.erase). The pieces it
+    makes are named ("edit", "<uid>/<n>"), n counting them in the order made."""
+
+    doc_id: str
+    page_id: str
+    tool: int
+    thickness: float
+    points: str
+    created_ms: int
+    uid: str = ""
+
+    def line(self) -> rm_stroke.LineValue:
+        return rm_stroke.new_line(self.tool, 2, self.thickness, bytes.fromhex(self.points))
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, eraser: rm_stroke.LineValue, created_ms: int,
+            uid: str | None = None) -> "StrokeErase":
+        if eraser.tool not in (rm_stroke.ERASER, rm_stroke.ERASE_SECTION):
+            raise EditError(f"tool {eraser.tool} does not erase")
+        if eraser.count >= rm_stroke.MAX_STORED_POINTS:
+            raise EditError("the eraser line is too large")
+        return cls(str(doc_id), str(page_id), int(eraser.tool), _number(eraser.thickness_scale, "eraser size"),
+                   _points(eraser.points), int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "StrokeErase":
+        return cls(str(raw["doc_id"]), str(raw["page_id"]), int(raw["tool"]), _number(raw["thickness"], "eraser size"),
+                   _points(raw["points"]), int(raw["created_ms"]), str(raw.get("uid") or ""))
+
+
+@dataclass(frozen=True)
+class StrokeDelete:
+    """Strokes deleted whole, each as the app deletes an item (rm_stroke.delete_strokes):
+    its block stays where it is, without its value and counting one deleted id, joined
+    to deleted neighbours. A stroke gone meanwhile is passed over."""
+
+    doc_id: str
+    page_id: str
+    items: tuple[ItemRef, ...]
+    created_ms: int
+    uid: str = ""
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, items, created_ms: int, uid: str | None = None) -> "StrokeDelete":
+        refs = tuple(_ref(item) for item in items)
+        if not refs:
+            raise EditError("a delete of no strokes")
+        return cls(str(doc_id), str(page_id), refs, int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "StrokeDelete":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["items"], raw["created_ms"], raw.get("uid") or "")
+
+
+STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete)
 
 
 # ------------------------------------------------------------------ page edits
@@ -448,10 +574,11 @@ PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete)
 DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
 
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
-        | TextEdit)
+        | TextEdit | StrokeAdd | StrokeErase | StrokeDelete)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
-                          "page-move": PageMove, "page-delete": PageDelete, "text": TextEdit}
+                          "page-move": PageMove, "page-delete": PageDelete, "text": TextEdit,
+                          "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete}
 
 
 class PendingEdits:
@@ -635,9 +762,32 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
         if uid and live is not None:
             made[uid] = live[0]
 
-    for edit in edits:
+    edits, at = list(edits), 0
+    while at < len(edits):
+        edit = edits[at]
+        at += 1
         if isinstance(edit, TextEdit):
             page = _text_edit(page, edit, author, Replay(page, made, removed, typed))
+            continue
+        if isinstance(edit, StrokeAdd):
+            # Strokes drawn one after the other are put on the page together.
+            run = [edit]
+            while at < len(edits) and isinstance(edits[at], StrokeAdd):
+                run.append(edits[at])
+                at += 1
+            page = _draw(page, run, author, made)
+            continue
+        if isinstance(edit, StrokeErase):
+            if page is not None:
+                erased = rm_stroke.erase(page, author=author, eraser=edit.line())
+                page = erased.page
+                for n, piece in enumerate(erased.made):
+                    made[f"{edit.uid}/{n}"] = piece
+            continue
+        if isinstance(edit, StrokeDelete):
+            if page is not None:
+                done = Replay(page, made, removed, typed)
+                page = rm_stroke.delete_strokes(page, [i for i in map(done.resolve, edit.items) if i is not None])
             continue
         key = bytes.fromhex(edit.key)
         if isinstance(edit, ImageInsert):
@@ -675,6 +825,28 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
     if deleted and page is not None:
         page, _ = rm_writer.prune_images(page, deleted)
     return Replay(page, made, removed, typed)
+
+
+def _draw(page: bytes | None, edits: list[StrokeAdd], author: bytes, made: dict[str, tuple[int, int]]) -> bytes | None:
+    """`page` with the strokes of `edits` drawn on it, in order. One the page has
+    already (the very same line, not yet taken for an edit before this one: an upload
+    that went through without being noticed) is not drawn again."""
+    lines, uids = [], []
+    taken = set(made.values())
+    for edit in edits:
+        line = edit.line()
+        there = next((item for item in rm_stroke.find_strokes(page, line) if item not in taken), None)
+        if there is not None:
+            taken.add(there)
+            if edit.uid:
+                made[edit.uid] = there
+        else:
+            lines.append(line)
+            uids.append(edit.uid)
+    if lines:
+        page, ids = rm_stroke.append_strokes(page, author=author, lines=lines)
+        made.update((uid, item) for uid, item in zip(uids, ids) if uid)
+    return page
 
 
 def apply_text_edit(doc: rm_text.TextDocument, clock: rm_text.Clock, edit: TextEdit, done: Replay) -> bool:

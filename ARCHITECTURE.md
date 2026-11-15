@@ -491,11 +491,11 @@ Parser: `client/src/viewer/rm_parser.py` (v3, v5, v6).
 |---|---|---|
 | Structure | Flat streams: layers → strokes → points, counts as `i32` | Length-framed blocks `<u32 len><u8 0><u8 minVer><u8 ver><u8 type>` holding a CRDT scene tree (`rm.crdt.*`) |
 | Values | Fixed little-endian fields | Tagged values: varuint `(index<<4)\|type`; types `0x1` u8, `0x4` 32-bit, `0x8` f64, `0xC` sub-block, `0xF` CrdtId (`u8` + varuint) |
-| Stroke header | `i32 tool, i32 color, i32 _, f32 width` (+ `i32 _` in v5) | SceneLineItem (0x05) value: `u8 3`, then 1 tool, 2 color, 3 `thicknessScale` f64, 4 `startingLength` f32, 5 points, 6 timestamp, 7 `moveId`, 8 ARGB colour [O names; field numbers verified on real files] |
+| Stroke header | `i32 tool, i32 color, i32 _, f32 width` (+ `i32 _` in v5) | SceneLineItem (0x05) value: `u8 3`, then 1 tool, 2 color, 3 `thicknessScale` f64, 4 `startingLength` f32, 5 points, 6 timestamp, 7 `moveId`, 8 ARGB colour, 9 `sourceId` (see "Pen strokes" below) |
 | Points | 6 × f32: x, y, speed, direction, width, pressure | Block v2: 14 bytes `f32 x, f32 y, u16 speed×4, u16 width×4, u8 direction×255/2π, u8 pressure×255`; block v1: 6 × f32 |
 | Layers | Implicit, by position | TreeNode (0x02) with last-write-wins label/visibility, attached to root `0:1` via SceneGroupItem (0x04) |
 | Coordinates | x from left edge, 0–1404 | x centred on the page (−702…702); pages can extend beyond 1404 × 1872 |
-| Erasing | Eraser strokes drawn in white | Items deleted in the CRDT (`deleted_length`, tombstone 0x08); erase-section is not ink |
+| Erasing | Eraser strokes drawn in white | Items deleted in the CRDT: the stroke's own block stays, without its value and with `deletedLength`; what an eraser leaves of a stroke comes back as new strokes (see "Deleting and the eraser" below) |
 | Typed text | — | RootText (0x07): CRDT character sequence (left/right ids) + paragraph styles (last write wins) + box position/width |
 | Images | — | SceneImagesTable (0x0E) + CrdtImageItem (0x0F) |
 | Groups | — | Layers are children of root `0:1` (Layer 1 is usually `0:11`); groups nest inside layers via CrdtGroupItem. A group TreeNode may carry an **anchor** (LWW fields 7 char id, 8 type, 9 threshold, 10 origin x): its strokes' x is relative to origin x and y to the line holding that typed-text character, so handwriting follows the text |
@@ -506,10 +506,14 @@ that `strings -n 4` hides):
 - **Tool:** Paintbrush 0, Pencil 1, Ballpoint 2, Marker 3, Fineliner 4, Highlighter 5, Eraser 6,
   SharpPencil 7, EraseSection 8, ClearPage 9, ZoomTool 10, SelectionTool 11, Paintbrushv2 12,
   SharpPencilv2 13, Pencilv2 14, Ballpointv2 15, Markerv2 16, Finelinerv2 17, Highlighterv2 18,
-  SolidPen 19, ReservedPen 20, Calligraphy 21, MaskedEraser 22, ShadingMarker 23.
+  SolidPen 19, ReservedPen 20, Calligraphy 21, MaskedEraser 22, ShadingMarker 23, Undefined 24.
+  The toolbar's names for the nine pens: Ballpoint pen (15), Fineliner (17), Marker (16), Pencil (14),
+  Mechanical pencil (13), Paintbrush (12), Highlighter (18), Calligraphy pen (21), Shader (23).
 - **Color:** Black 0, Gray 1, White 2, HighlighterYellow 3, HighlighterGreen 4,
   HighlighterPink 5, Blue 6, Red 7, HighlighterStackedGray 8, ArgbCode 9, Green 10, Cyan 11,
-  Magenta 12, Yellow 13, HighlighterBlue 14, HighlighterOrange 15, HighlighterGray 16.
+  Magenta 12, Yellow 13, HighlighterBlue 14, HighlighterOrange 15, HighlighterGray 16, LastColor 17.
+  Both enums are also in the moc metadata of class `Line` with these values (`tools/moc_api.py`);
+  the ARGB of each colour is in §5.2.
 
 **Block types** [O]: `const char* names[16]` indexed by type (data at file offset
 0x121ab20): 0 Conversion, 1 SceneTreeMove, 2 SceneTreeNode, 3 CrdtGlyphItem,
@@ -559,6 +563,153 @@ base_style/style_properties (0x140a92b30). The cursor is drawn by the view, not 
 (`CursorBlinkManager` only toggles `setCursorVisible`). Undo of text: remove by id, put back with
 new ids after the original neighbour, ids translated across the stack (as the app's undo
 "translated" log).
+
+**Pen strokes** [O] (`viewer.rm_stroke`; every rule below holds on all 812,546 line blocks of
+a real library, 746,526 of them live). A stroke is one CrdtLineItem block, type 0x05, always
+`min_version 2, version 2` (0x06, CrdtTextItem, never occurs and is not a stroke). Payload, in
+this order (writers 0x140a094e0 / 0x1409f9a90):
+
+| Tag | Field | Type | |
+|---|---|---|---|
+| `1F` | parent | CrdtId | the layer's node, or a group nested in it |
+| `2F` | id | CrdtId | the page's next id (`++clock`, 0x1408e43e0) |
+| `3F` | left | CrdtId | the item it was put after |
+| `4F` | right | CrdtId | the item it was put before; `0:0` when appended |
+| `54` | deletedLength | u32 | 0 live; n: a run of n deleted ids starting at `id` |
+| `6C` | value | sub-block | only when deletedLength is 0 |
+
+The value (writer 0x140a24bf0, reader 0x140a20dd0), a `u8 3` and then:
+
+| Tag | Field | Type | |
+|---|---|---|---|
+| `14` | tool | u32 | Line::Tool |
+| `24` | color | u32 | Line::Color |
+| `38` | thicknessScale | f64 | the pen's size setting: 1 thin, 2 medium, 3 thick |
+| `44` | startingLength | f32 | 0; for a piece an eraser left, the length of the original stroke up to where the piece starts |
+| `5C` | points | u32 length + n × 14 bytes | at most 30,000 are written |
+| `6F` | timestamp | CrdtId | always written; `0:1` for a new item, another id only after a transform that carried one (0x1405b67f0) |
+| `7F` | moveId | CrdtId | only when not `0:0`: the item this one replaced (move, undo, redo) |
+| `84 01` | argb | u32 | only when color is 9 (ArgbCode) |
+| `9F 01` | sourceId | CrdtId | only when not `0:0`: for a Shader's piece, the stroke it was cut from |
+
+Bytes after the last field the app knows are kept and written back (value, item and PageStats
+alike); real pages have none. No bounding box is stored (`Line::boundingRect`, 0x140b3d760,
+works it out: the box of the points widened by half of what the tool can reach), and the
+"timestamp" is a last-write-wins id, not a time. A point is 14 bytes for every tool
+(0x14045dae0, written by memcpy):
+
+    f32 x, f32 y                 scene units, x 0 = centre of the page
+    u16 roundf(speed * 4)        u16 roundf(width * 4)
+    u8  roundf(direction * 255 / 2pi)        u8 roundf(pressure * 255)
+
+**Where a new stroke goes** [O]: `addLine` (0x1409578c0) refuses an empty line, layer `0:0`
+and the tools that do not draw (Eraser, EraseSection, ClearPage, SelectionTool; the layer,
+0x1408c2bc0, also ZoomTool and MaskedEraser). The layer gives the item the page's next id
+and appends it to its CRDT sequence: left = the last id of the sequence (deleted ones count),
+right = `0:0`. There are no fractional keys in a page: order is the left/right ids, replayed
+in id order (`rm_writer.sequence`). Item blocks are stored sorted by (parent, id). PageStats
+(0x0A: loads, merges, textChars, textLines, keyboardCount) has no stroke counters; the writer
+stores `loads + 1` on every save and the rest as they are. On a page with typed text the
+scene has an anchoring manager (0x14096ca70) that can put the stroke into a group anchored
+to a text line instead: not traced, so `rm_stroke` refuses to draw or erase on pages with a
+RootText block for now.
+
+**Pen input** [O] (`rm_stroke.StrokeBuilder`, `simplify`, `draw`). The desktop app's QML
+never creates a pen surface or a toolbar, so reMarkable.exe cannot draw; but the tablet's pen
+code is in the binary, mouse path included:
+
+- `PenInputSurface` (vtable 0x140e8b250; press 0x140ad8e90, move 0x140ad8d80, release
+  0x140ad9060): a mouse gives samples `{x, y, pressure 0.7, tiltX 0, tiltY 0}`: one for the
+  press, one per move, one more every 25 ms while the pressed mouse rests (QTimer,
+  0x140ad9200), one for the release. Alt held: the eraser ("Simulating Eraser Tip").
+- `PenInputLineHandler` (vtable 0x140e8a3d8): `beginStroke` 0x140ac8060 makes the line
+  (0x140b40c30: thicknessScale = the pen's size; argb only for colour 9), `addPoint`
+  0x140ac9360 maps the sample into the scene and makes one point of it, `endStroke`
+  0x140ac86d0 emits `stroke(Line)`.
+- One point per sample: 0x140b40df0, and for tools 13, 14, 15, 16, 19, 20, 21, 23 its second
+  half 0x140b41680. With T the size, p the pressure, `scale` = sqrt(|det|) of the scene-to-
+  screen transform (0x140b0d080), all in single precision:
+
+  | Tool | speed, direction, pressure | width |
+  |---|---|---|
+  | Ballpoint (15) | from the sample before: dist × scale; atan2 in 0..2π; p | max(2, 3p) × T′, T′ = T/1.35 if T > 1 else T |
+  | Mechanical pencil (13) | same; p′ = 0.3·smoothstep(p) + 0.7 | 4 × T′ |
+  | Pencil (14) | same; p′ = 0.8·(pressure stored for the point before) + 0.2·p | (15·a⁴ + p′ + 2) × T, a = tilt between 30° and 55° as 0..1 |
+  | Marker (16) | same; p | (tilt² · (0.5p + 0.5) · 10 + 2.5) × T, tilt capped at 1 rad |
+  | Calligraphy (21) | same; p | f = max(0, 1 − \|angle between the stroke and the nib\| / 60°), nib at 40° (right hand; 170° left) + rotation; max(1.5, (4.5·f·p + 1) × T), then ¾ of the width before + ¼ of it |
+  | Shader (23) | speed = 0.9·(speed before) + 0.1·speed; p | (10T + 2) × (⅓ + ⅔t), t = p between 0.1 and 0.3 as 0..1 |
+  | Fineliner (17) | means over this sample and the one before: (d₁ + d₂)/2 × scale; (a₁ + a₂)/2; min(1, (p + p₁)/2) | max(2, 2T) |
+  | Highlighter (18) | same as Fineliner | 30 × T |
+  | Paintbrush (12) | same, then p × clamp(1 − speed/scale/100, 0.5, 1), p′ = max(0.25, p) | max(2, 4.5·p′^4.5 + 4.5·tilt⁴) × T |
+  | Eraser (6) | same as Fineliner | 10 × T |
+
+  Tilt is atan(hypot(tan tiltX, tan tiltY)). The append (0x140b3cf40) gives a stroke whose
+  first point came out with width 0 the third point's numbers for its first two. On the
+  real library the Ballpoint width is exact for 99.1 % of 7.27 M points (the rest are 1/4
+  unit off: the stored pressure is rounded) and the Fineliner's for every one of 456,838
+  strokes; stored speed and direction cannot be checked point by point because of the next step.
+- Before `addLine`, SceneController (0x1404473a0 → 0x140b3f850) thins the line out with
+  Ramer-Douglas-Peucker (0x140b3ede0): between two kept points the one farthest from the
+  straight line through them is kept too when it is more than 0.2 off it, or when some point
+  between them differs from the first of the two by more than ⅔ in width, 0.1 in pressure
+  (tools 0, 1, 2, 3, 12, 13, 14, 15, 16, 21, 23) or 2.0 in speed (tools 0, 1, 3, 12, 15, 16,
+  23). A line that still has 29,990 points or more is thinned again (1.0, 0.1, 0.5, 1.0), and
+  not added if that is not enough. Real Fineliner strokes are fixed points of it (99.4 %),
+  and lose a third of their points at twice the tolerances.
+- The size and colour of each tool are kept per document in `.content` `extraMetadata`:
+  `LastPen`, `Last<Tool>Size` ("1", "2", "3"), `Last<Tool>Color`, `Last<Tool>ColorCode`
+  (decimal ARGB), `SecondaryPen`…, `LastEraserTool`, `LastEraserSize`
+  (`DocumentToolSettings`, 0x14060e1e0). `PenThicknessModel` and `ToolModel` exist in the
+  desktop exe only as translation strings.
+
+**Deleting and the eraser** [O] (`rm_stroke.delete_strokes`, `can_join`, `erase`,
+`erase_line`).
+
+- Deleting an item (0x1408ce450) leaves its block where it is, under the same block type,
+  without field 6 and with deletedLength 1: an erased stroke is a 0x05 block, not a
+  tombstone. A CrdtTombstoneItem (0x08) is written only for an item that has no value object
+  in memory, i.e. one that was read from a 0x08.
+- Then it is joined to the deleted item after it, and to the one before it, when the two are
+  neighbours in the sequence and (0x1408c3e60) **(1)** the later one's left is the earlier
+  one's last id, **(2)** both have the same author, **(3)** the later one's id is the very
+  next counter, **(4)** both have the same right; both ids must be newer than their own
+  neighbours (0x1408d2f40) and both deleted. The earlier one stays, with the lengths added
+  up, under its own block type; the later block goes. Real pages have no pair of line or
+  tombstone neighbours that this would still join, and putting a live stroke back for every
+  deleted id of a page and deleting them in a shuffled order gives the page's own runs again
+  (`tools/rm_roundtrip.py`: 462,685 deleted ids on 3,976 pages, none different).
+- The eraser ("erase with line", 0x14041a8e0 → 0x140994f30) works on the outline of its own
+  stroke (0x140a5f380): a QPainterPath through the eraser line's points, for the Eraser
+  stroked as wide as the line's **first** point with round caps and joins
+  (`QPainterPathStroker::createStroke`), then `toFillPolygon()`; an EraseSection line is the
+  outline itself. For every live line item of the node, in sequence order (0x140996fb0 →
+  0x140a63920), unless the line's bounding box misses the outline's:
+  1. cuts (0x140a62500): the stroke's start, every crossing of one of its segments with an
+     edge of the outline (0x140a63300), its end; each with its place in points (i + s), the
+     stroke's length up to it (from `startingLength` on) and a margin
+     `((1 − c)·a + c·b) × width there × ½`, c = |cos| of the angle between segment and edge,
+     (a, b) = (0.7, 2.0), for highlighters (0, 1.5);
+  2. erased or not (0x140a62f60): the stretch between two cuts is erased when it is shorter
+     than 1e-5 points or its middle (the first whole point in it, when its ends lie in
+     different segments) is inside the outline (winding ≠ 0, 0x140a63420); two kept stretches
+     in a row get an empty erased one between them;
+  3. margins (0x140a64210): a kept stretch is shortened at each end by that cut's margin,
+     measured along the stroke, and dropped when it is no longer than the two together;
+  4. pieces (0x140a612c0): one stretch covering the whole stroke means untouched. Else each
+     kept stretch becomes a line with the stroke's tool, colour, ARGB and thicknessScale: a
+     point worked out for a cut end (every stored number taken between its two neighbours'
+     and rounded again), the whole points between, `startingLength` = the stroke's length at
+     the piece's start; fewer than two points: no piece.
+- All strokes hit are deleted first (and so joined into runs); then each one's pieces are
+  inserted right after it (InsertItemsAfter, 0x14095b8e0 → 0x1408c8920) as new items with the
+  next ids, timestamp `0:1`, no moveId: left = the erased item for the first piece, then the
+  piece before; right = what followed. A run of deleted ids is cut where a piece goes in: in
+  real pages the left of a live stroke is never an id inside a run, and the second part of
+  such a run has the id before it as its left and the run's right. A Shader's piece carries
+  `sourceId` = the first stroke it descends from. A stroke nothing is left of is simply
+  deleted.
+- Stored Eraser-tool strokes (white, in old pages) are legacy; the app prunes those at the
+  bottom of a node (0x1408c5030).
 
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in

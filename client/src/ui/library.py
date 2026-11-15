@@ -23,7 +23,8 @@ from typing import Callable
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
 from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageAdd,
-                        PageCopy, PageDelete, PageHistory, PageMove, Staged, document_files, swapped)
+                        PageCopy, PageDelete, PageHistory, PageMove, Staged, StrokeAdd, StrokeDelete, StrokeErase,
+                        document_files, swapped)
 from core.sync import SyncClient, SyncError, sha256_hex
 from core.config import atomic_write_json, read_json
 from viewer import rm_writer
@@ -684,6 +685,32 @@ class LibrarySource:
             for step in steps:
                 history.push(step)
             history.seen = self._seen(doc.id, page_id)
+
+    def add_stroke(self, doc: Document, page_id: str, line, now_ms: int) -> StrokeAdd:
+        """Keep a stroke drawn on a page: `line` as the app would add it
+        (viewer.rm_stroke.draw). Refused, with nothing kept, on a document that may not
+        be edited and on a page the stroke engine does not draw on yet (one with typed
+        text). Not an undo step yet: the page's undo history starts over."""
+        doc = self._editable(doc, page_id)
+        edit = StrokeAdd.new(doc.id, page_id, line, now_ms)
+        self._add_edit(doc, edit)
+        return edit
+
+    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int) -> StrokeErase:
+        """Keep an eraser taken over a page: `eraser`, the eraser's own line
+        (viewer.rm_stroke.eraser_line). Refused like add_stroke."""
+        doc = self._editable(doc, page_id)
+        edit = StrokeErase.new(doc.id, page_id, eraser, now_ms)
+        self._add_edit(doc, edit)
+        return edit
+
+    def delete_strokes(self, doc: Document, page_id: str, items, now_ms: int) -> StrokeDelete:
+        """Keep a delete of whole strokes of a page, named as edits name items:
+        ("page", author, counter) or ("edit", uid)."""
+        doc = self._editable(doc, page_id)
+        edit = StrokeDelete.new(doc.id, page_id, items, now_ms)
+        self._add_edit(doc, edit)
+        return edit
 
     def forget_history(self, doc_id: str) -> None:
         """The document was closed: its undo and redo go, as the app's go with its pages."""
