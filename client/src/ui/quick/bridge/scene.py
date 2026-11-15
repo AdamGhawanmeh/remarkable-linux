@@ -168,7 +168,9 @@ def set_edit_notifier(notify: Callable[[str], None]) -> None:
 
 
 def forget_history(doc_id: str) -> None:
-    """A document was closed: its pages' undo and redo go with it."""
+    """A document was closed: its pages' undo and redo go with it, and the pen in hand
+    is put down (it is not in hand when the document is opened again)."""
+    pen_bridge.document_closed(doc_id)
     source = _source()
     if source is not None and hasattr(source, "forget_history"):
         source.forget_history(doc_id)

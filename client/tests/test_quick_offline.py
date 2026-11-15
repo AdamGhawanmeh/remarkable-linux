@@ -1649,6 +1649,50 @@ class PenTests(unittest.TestCase):
         QTest.keyClick(self.window, key, modifiers)
         wait(30)
 
+    STYLUS = None
+
+    def stylus(self, kind, at: QPointF, pressure: float = 0.5, tilt=(0.0, 0.0), eraser: bool = False) -> None:
+        """A stylus event at window point `at`, delivered as Qt delivers one: the tablet event
+        to the window first, then, when nothing took it, the mouse event Qt makes of it
+        (QGuiApplication, AA_SynthesizeMouseForUnhandledTabletEvents: same device,
+        source MouseEventSynthesizedByQt)."""
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QMouseEvent, QPointingDevice, QTabletEvent
+        if PenTests.STYLUS is None:
+            PenTests.STYLUS = QPointingDevice("stylus", 77, QPointingDevice.DeviceType.Stylus,
+                                              QPointingDevice.PointerType.Pen,
+                                              QPointingDevice.Capability.Position | QPointingDevice.Capability.Pressure
+                                              | QPointingDevice.Capability.XTilt | QPointingDevice.Capability.YTilt, 1, 3)
+            PenTests.ERASER_END = QPointingDevice("stylus eraser", 78, QPointingDevice.DeviceType.Stylus,
+                                                  QPointingDevice.PointerType.Eraser,
+                                                  QPointingDevice.Capability.Position | QPointingDevice.Capability.Pressure,
+                                                  1, 3)
+        device = PenTests.ERASER_END if eraser else PenTests.STYLUS
+        down = kind in (QEvent.Type.TabletPress, QEvent.Type.TabletMove) and pressure > 0
+        buttons = Qt.MouseButton.LeftButton if kind == QEvent.Type.TabletPress or (kind == QEvent.Type.TabletMove and down) \
+            else Qt.MouseButton.NoButton
+        event = QTabletEvent(kind, device, at, self.window.mapToGlobal(at), pressure, tilt[0], tilt[1], 0.0, 0.0, 0.0,
+                             Qt.KeyboardModifier.NoModifier, Qt.MouseButton.LeftButton, buttons)
+        event.setAccepted(False)
+        QApplication.sendEvent(self.window, event)
+        if not event.isAccepted():
+            mouse = {QEvent.Type.TabletPress: QEvent.Type.MouseButtonPress, QEvent.Type.TabletMove: QEvent.Type.MouseMove,
+                     QEvent.Type.TabletRelease: QEvent.Type.MouseButtonRelease}[kind]
+            QApplication.sendEvent(self.window, QMouseEvent(mouse, at, at, self.window.mapToGlobal(at),
+                                                            Qt.MouseButton.LeftButton if mouse != QEvent.Type.MouseMove
+                                                            else Qt.MouseButton.NoButton, buttons,
+                                                            Qt.KeyboardModifier.NoModifier,
+                                                            Qt.MouseEventSource.MouseEventSynthesizedByQt, device))
+        wait(10)
+
+    def stylus_tap(self, item) -> None:
+        from PySide6.QtCore import QEvent
+        at = item.mapToScene(QPointF(item.width() / 2, item.height() / 2))
+        self.stylus(QEvent.Type.TabletMove, at, 0.0)                 # hovering over it first, as a stylus does
+        self.stylus(QEvent.Type.TabletPress, at, 0.5)
+        self.stylus(QEvent.Type.TabletRelease, at, 0.0)
+        wait(30)
+
     def redo_key(self) -> None:
         """The first key the platform binds to Redo (the one the app's Shortcut takes)."""
         from PySide6.QtGui import QKeySequence
@@ -1717,6 +1761,44 @@ class PenTests(unittest.TestCase):
         self.assertEqual((tools.property("size"), tools.property("color")), (3, "blue"))
         self.assertEqual(real_warnings(self.app.warnings), [])
 
+    def test_the_toolbar_works_by_clicking_its_buttons_on_screen(self):
+        """Only window-level input, as a hand gives it: the pointer rests on each button (its
+        tooltip opens), then a click there; then a stylus tap; then a drag on the page."""
+        from PySide6.QtTest import QTest
+        from PySide6.QtGui import QPointingDevice, QTabletEvent
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        tools, options = self.pens(view).tools, self.toolbar_item(view, "penOptions")
+        before = len(self.strokes())
+        self.assertFalse(options.isVisible())
+        for key in ("fineliner", "ballpoint", "marker", "pencil", "mechanical_pencil", "paintbrush", "highlighter",
+                    "calligraphy", "eraser"):
+            button = self.toolbar_item(view, f"penTool_{key}")
+            centre = button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint()
+            QTest.mouseMove(self.window, centre)
+            wait(700)                                           # longer than the tooltip's delay
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, centre)
+            wait(30)
+            self.assertEqual((tools.property("active"), tools.property("tool")), (True, key))
+            self.assertTrue(options.isVisible(), key)
+            self.assertFalse(self.document_view_text_mode(), "the click went through to the page")
+        # The size and colour buttons beside the toolbar, clicked on screen.
+        self.click(self.toolbar_item(view, "penTool_fineliner"))
+        self.click(self.toolbar_item(view, "penSize_1"))
+        self.click(self.toolbar_item(view, "penColor_red"))
+        self.assertEqual((tools.property("size"), tools.property("color")), (1, "red"))
+        # A stylus tap on a tool button, with a tool in hand.
+        self.stylus_tap(self.toolbar_item(view, "penTool_marker"))
+        self.assertEqual(tools.property("tool"), "marker")
+        # Back to the fineliner by a click, and a drag on the page draws with it.
+        self.click(self.toolbar_item(view, "penTool_fineliner"))
+        self.drag(view, [(-250.0 + 9 * n, 800.0 + 2 * n) for n in range(25)])
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 1), self.notices)
+        from viewer import rm_stroke
+        from viewer.rm_parser import Color
+        line = self.strokes()[-1].line
+        self.assertEqual((line.tool, line.color, line.thickness_scale), (rm_stroke.FINELINER_V2, int(Color.RED), 1.0))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
     def test_drawing_erasing_undo_and_redo(self):
         view = self.open_document(self.THROWAWAY, self.PAGE1)
         controller, tools = view._controller, self.pens(view).tools
@@ -1777,25 +1859,34 @@ class PenTests(unittest.TestCase):
         self.assertEqual(self.notices, [])
         self.assertEqual(real_warnings(self.app.warnings), [])
 
-    def test_a_stylus_draws_with_its_pressure(self):
-        from PySide6.QtGui import QPointingDevice, QTabletEvent
+    def test_a_stylus_draws_with_its_pressure_and_switches_tools_on_the_toolbar(self):
+        from PySide6.QtCore import QEvent
         view = self.open_document(self.THROWAWAY, self.PAGE1)
+        tools = self.pens(view).tools
         before = len(self.strokes())
-        self.pens(view).tools.chooseTool("fineliner")
-        device = QPointingDevice.primaryPointingDevice()
-
-        def send(kind, x, y, pressure, buttons):
-            at = QPointF(self.window_point(view, x, y))
-            event = QTabletEvent(kind, device, at, self.window.mapToGlobal(at), pressure, 10.0, -5.0, 0.0, 0.0, 0.0,
-                                 Qt.KeyboardModifier.NoModifier, Qt.MouseButton.LeftButton, buttons)
-            QApplication.sendEvent(self.window, event)
-        send(QTabletEvent.Type.TabletPress, 100.0, 900.0, 0.2, Qt.MouseButton.LeftButton)
+        self.stylus_tap(self.toolbar_item(view, "penTool_fineliner"))
+        self.assertEqual((tools.property("active"), tools.property("tool")), (True, "fineliner"))
+        at = lambda x, y: QPointF(self.window_point(view, x, y))           # noqa: E731
+        self.stylus(QEvent.Type.TabletMove, at(100.0, 900.0), 0.0)
+        self.stylus(QEvent.Type.TabletPress, at(100.0, 900.0), 0.2, (10.0, -5.0))
         for n in range(1, 10):
-            send(QTabletEvent.Type.TabletMove, 100.0 + 15 * n, 900.0, 0.2 + 0.08 * n, Qt.MouseButton.LeftButton)
-        send(QTabletEvent.Type.TabletRelease, 250.0, 900.0, 0.9, Qt.MouseButton.NoButton)
+            self.stylus(QEvent.Type.TabletMove, at(100.0 + 15 * n, 900.0), 0.2 + 0.08 * n, (10.0, -5.0))
+        self.stylus(QEvent.Type.TabletRelease, at(250.0, 900.0), 0.0)
         self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 1), self.notices)
         pressures = [p.pressure for p in self.strokes()[-1].line.unpacked()]
         self.assertLess(pressures[0], pressures[-1])            # not the mouse's 0.7 throughout
+        # With a tool in hand, a stylus tap on the toolbar switches tools: it is not taken as a stroke.
+        self.stylus_tap(self.toolbar_item(view, "penTool_marker"))
+        self.assertEqual((tools.property("active"), tools.property("tool")), (True, "marker"))
+        self.stylus_tap(self.toolbar_item(view, "penSize_3"))
+        self.assertEqual(tools.property("size"), 3)
+        self.assertEqual(len(self.strokes()), before + 1)
+        # The stylus's eraser end erases whatever pen is in hand.
+        self.stylus(QEvent.Type.TabletPress, at(175.0, 860.0), 0.5, eraser=True)
+        for n in range(1, 9):
+            self.stylus(QEvent.Type.TabletMove, at(175.0, 860.0 + 10 * n), 0.5, eraser=True)
+        self.stylus(QEvent.Type.TabletRelease, at(175.0, 940.0), 0.0, eraser=True)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 2), self.notices)    # cut in two
         self.assertEqual(real_warnings(self.app.warnings), [])
 
     def test_a_page_with_typed_text_takes_no_strokes(self):

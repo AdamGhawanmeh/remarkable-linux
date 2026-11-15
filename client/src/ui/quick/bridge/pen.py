@@ -23,8 +23,13 @@ per viewport, handed on from page to page.
 A mouse gives the samples the app's PenInputSurface gives (0x140ad8e90, 0x140ad8d80,
 0x140ad9060): pressure 0.7, no tilt, one sample per press, move and release and one
 more every 25 ms the pressed mouse is held still. Alt, or a stylus's eraser end, erases
-(PenInputSurface's "Simulating Eraser Tip"). A stylus gives its own pressure and tilt
-(QTabletEvent, taken from the window before Qt makes mouse events of it).
+(PenInputSurface's "Simulating Eraser Tip"). A stylus gives its own pressure and tilt:
+its press goes where Qt delivers it (what is on top there, such as the toolbar, takes
+it first), and only the stroke it starts on the page reads its moves and release from
+the window's QTabletEvents (TabletFilter).
+
+The toolbar's buttons are TapHandlers, which take a mouse, a touchpad, a touch screen
+and a stylus alike.
 """
 
 from __future__ import annotations
@@ -265,7 +270,10 @@ class PenSurface(QQuickPaintedItem):
         self.setVisible(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton if on else Qt.MouseButton.NoButton)
         self.setAcceptHoverEvents(on)
-        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+        if on:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()          # the app's own cursors (I-beam, link) show through
         if not on and self._drawing is not None:
             self._end(commit=True)
 
@@ -359,12 +367,36 @@ class PenSurface(QQuickPaintedItem):
             event.ignore()
             return
         alt = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+        pressed = self._stylus_press(event)
+        if pressed is not None:
+            # A stylus press nothing above the page took, which Qt turned into this mouse
+            # press: a stylus stroke, its samples from the stylus itself (TabletFilter).
+            rest, eraser = pressed
+            if not self.begin(event.position(), rest, eraser or alt, stylus=True):
+                event.ignore()
+                return
+            event.accept()
+            return
         if not self.begin(event.position(), (), alt, stylus=False):
             event.ignore()
             return
         event.accept()
         if self._drawing is not None:
             self._still.start()
+
+    def _stylus_press(self, event):
+        """(pressure and tilt, eraser end) of the stylus press `event` was made from, or
+        None for a mouse's own press."""
+        device = event.pointingDevice()
+        if device is None or device.type() not in (QPointingDevice.DeviceType.Stylus,
+                                                   QPointingDevice.DeviceType.Airbrush):
+            return None
+        window = self.window()
+        found = window.findChild(TabletFilter) if window is not None else None
+        press = found.last_press if found is not None else None
+        if press is None:
+            return ((s.MOUSE_PRESSURE, 0.0, 0.0), False)
+        return press
 
     def mouseMoveEvent(self, event) -> None:
         if self._drawing is not None and not self._drawing.stylus:
@@ -382,21 +414,17 @@ class PenSurface(QQuickPaintedItem):
 
     # -- the stylus (from TabletFilter) --
     def tablet(self, event) -> bool:
+        """A stylus move or release during a stylus stroke of this surface: taken (its
+        pressure and tilt), so Qt makes no mouse event of it."""
         kind = event.type()
+        if self._drawing is None or not self._drawing.stylus or kind == QEvent.Type.TabletPress:
+            return False
         pos = self.mapFromScene(event.position())
         rest = (float(event.pressure()), math.radians(event.xTilt()), math.radians(event.yTilt()))
-        if kind == QEvent.Type.TabletPress:
-            if not self.isEnabled() or not self.contains(pos) or event.button() != Qt.MouseButton.LeftButton:
-                return False
-            eraser = event.pointerType() == QPointingDevice.PointerType.Eraser
-            if not self.begin(pos, rest, eraser, stylus=True):
-                return False
-            return True
-        if self._drawing is None or not self._drawing.stylus:
-            return False
         self.add(pos, rest)
         if kind == QEvent.Type.TabletRelease:
             self._end()
+            self.ungrabMouse()          # Qt makes no mouse release of a stylus release taken here
         return True
 
     # -- drawing --
@@ -443,21 +471,37 @@ class PenSurface(QQuickPaintedItem):
 
 
 class TabletFilter(QObject):
-    """Takes stylus events from a window to the pen surface they land on, before Qt
-    turns them into mouse events (Qt Quick items get no QTabletEvent of their own)."""
+    """The stylus for the pen surfaces of a window (Qt Quick items get no QTabletEvent of
+    their own). A press is left to Qt, which gives it to whatever is on top at that
+    point (the pen toolbar's buttons, the page buttons, ...) and, when nothing there
+    takes it, makes a mouse press of it that reaches the pen surface: here only its
+    pressure, tilt and pen end are noted (`last_press`). The moves and the release of a
+    stroke the surface then started are taken here, with their pressure and tilt."""
 
     def __init__(self, parent: QObject) -> None:
         super().__init__(parent)
         self.surfaces: list[PenSurface] = []
+        self.last_press: tuple | None = None        # ((pressure, tilt x, tilt y), eraser end)
+
+    _TABLET = (QEvent.Type.TabletPress, QEvent.Type.TabletMove, QEvent.Type.TabletRelease)
 
     def eventFilter(self, obj, event) -> bool:
-        if event.type() not in (QEvent.Type.TabletPress, QEvent.Type.TabletMove, QEvent.Type.TabletRelease):
-            return False
-        self.surfaces = [x for x in self.surfaces if shiboken6.isValid(x)]
-        for surface in self.surfaces:
-            if surface.tablet(event):
-                event.accept()
-                return True
+        """Never in the way of any other event, and never fails one: a stylus event no
+        surface takes goes on as Qt would deliver it."""
+        try:
+            if event.type() not in self._TABLET:
+                return False
+            if event.type() == QEvent.Type.TabletPress:
+                self.last_press = ((float(event.pressure()), math.radians(event.xTilt()), math.radians(event.yTilt())),
+                                   event.pointerType() == QPointingDevice.PointerType.Eraser)
+                return False
+            self.surfaces = [x for x in self.surfaces if shiboken6.isValid(x)]
+            for surface in self.surfaces:
+                if surface.isVisible() and surface.tablet(event):
+                    event.accept()
+                    return True
+        except RuntimeError:           # a surface or the window going away (shutting down)
+            pass
         return False
 
 
@@ -527,7 +571,7 @@ Item {
                         objectName: "penTool_" + modelData.key
                         readonly property bool inHand: penTools.active && penTools.tool === modelData.key
                         width: 40; height: 40; radius: 4
-                        color: inHand ? bar.picked : (toolMouse.containsMouse ? bar.hover : "transparent")
+                        color: inHand ? bar.picked : (toolMouse.hovered ? bar.hover : "transparent")
                         border.color: !penTools.active && penTools.tool === modelData.key ? bar.frame : "transparent"
                         ArkControls.Icon {
                             anchors.centerIn: parent
@@ -535,13 +579,17 @@ Item {
                             size: 24
                             color: "#000000"
                         }
-                        MouseArea {
-                            id: toolMouse
-                            anchors.fill: parent
-                            hoverEnabled: true
-                            onClicked: penTools.chooseTool(modelData.key)
+                        // Pointer handlers take a mouse, a touchpad, a touch screen and a stylus alike
+                        // (a MouseArea sees a stylus only through Qt's mouse synthesis).
+                        TapHandler {
+                            objectName: "tap"
+                            gesturePolicy: TapHandler.ReleaseWithinBounds
+                            onTapped: penTools.chooseTool(modelData.key)
                         }
-                        ToolTip.visible: toolMouse.containsMouse
+                        HoverHandler {
+                            id: toolMouse
+                        }
+                        ToolTip.visible: toolMouse.hovered
                         ToolTip.delay: 600
                         ToolTip.text: modelData.label
                     }
@@ -570,20 +618,24 @@ Item {
                             objectName: "penSize_" + modelData.size
                             width: 36; height: 36; radius: 4
                             color: penTools.size === modelData.size ? bar.picked
-                                   : (sizeMouse.containsMouse ? bar.hover : "transparent")
+                                   : (sizeMouse.hovered ? bar.hover : "transparent")
                             ArkControls.Icon {
                                 anchors.centerIn: parent
                                 source: "qrc:/ark/icons/" + modelData.icon
                                 size: 22
                                 color: "#000000"
                             }
-                            MouseArea {
-                                id: sizeMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                onClicked: penTools.setSize(modelData.size)
+                            // Pointer handlers take a mouse, a touchpad, a touch screen and a stylus alike
+                            // (a MouseArea sees a stylus only through Qt's mouse synthesis).
+                            TapHandler {
+                                objectName: "tap"
+                                gesturePolicy: TapHandler.ReleaseWithinBounds
+                                onTapped: penTools.setSize(modelData.size)
                             }
-                            ToolTip.visible: sizeMouse.containsMouse
+                            HoverHandler {
+                                id: sizeMouse
+                            }
+                            ToolTip.visible: sizeMouse.hovered
                             ToolTip.delay: 600
                             ToolTip.text: modelData.label
                         }
@@ -613,13 +665,17 @@ Item {
                                 border.width: 1
                                 border.color: "#b8b2a7"
                             }
-                            MouseArea {
-                                id: colorMouse
-                                anchors.fill: parent
-                                hoverEnabled: true
-                                onClicked: penTools.setColor(modelData.key)
+                            // Pointer handlers take a mouse, a touchpad, a touch screen and a stylus alike
+                            // (a MouseArea sees a stylus only through Qt's mouse synthesis).
+                            TapHandler {
+                                objectName: "tap"
+                                gesturePolicy: TapHandler.ReleaseWithinBounds
+                                onTapped: penTools.setColor(modelData.key)
                             }
-                            ToolTip.visible: colorMouse.containsMouse
+                            HoverHandler {
+                                id: colorMouse
+                            }
+                            ToolTip.visible: colorMouse.hovered
                             ToolTip.delay: 600
                             ToolTip.text: modelData.label
                         }
@@ -662,6 +718,19 @@ def _filter(window) -> TabletFilter:
     return found
 
 
+_sets: list = []                    # every _Set made (weakly: dropped once gone)
+
+
+def document_closed(doc_id: str) -> None:
+    """The document `doc_id` was closed: the tool in hand for it is put down."""
+    _sets[:] = [x for x in _sets if shiboken6.isValid(x)]
+    for found in _sets:
+        node = found.tools._node
+        if node is not None and node.id == doc_id:
+            found.tools.deactivate()
+            found.tools._node = None            # opened again, its settings are read again
+
+
 def tools_of(viewport: QQuickItem) -> _Set | None:
     return viewport.findChild(_Set) if viewport is not None and shiboken6.isValid(viewport) else None
 
@@ -675,6 +744,7 @@ def attach(view: QQuickItem) -> _Set | None:
     found = tools_of(viewport)
     if found is None:
         found = _Set(viewport)
+        _sets.append(found)
         engine = qmlEngine(view)
         container = viewport.parentItem()
         if engine is not None and container is not None:

@@ -728,9 +728,12 @@ code is in the binary, mouse path included:
   areas that is enabled only while a tool is in hand (otherwise a click does what the app
   does). Taking a tool ends text and selection mode; turning either on puts the tool down;
   Escape too. Mouse samples are PenInputSurface's (pressure 0.7, a sample every 25 ms the
-  button is held still, Alt erases); stylus samples come from `QTabletEvent`s taken off the
-  window before Qt makes mouse events of them (pressure, tilt in radians, the eraser end
-  erases). The line drawn so far is previewed with the page renderer and stays until the
+  button is held still, Alt erases). A stylus press is left to Qt's own delivery, so
+  whatever is on top (the toolbar, the page buttons) takes it first; only when nothing
+  does and Qt makes a mouse press of it does the surface start a stroke, whose moves and
+  release it then reads from the window's `QTabletEvent`s (pressure, tilt in radians; the
+  eraser end erases). The toolbar's buttons are `TapHandler`s, which take a mouse, touch
+  and a stylus alike (a `MouseArea` sees a stylus only through Qt's mouse synthesis). The line drawn so far is previewed with the page renderer and stays until the
   page has been drawn again with it.
 - Settings are written as `extraMetadata` strings, the enum names real documents have:
   `LastTool`/`LastPen` (or `LastEraserTool`), `Last<Tool>Size`, `Last<Tool>Color`. Pen
