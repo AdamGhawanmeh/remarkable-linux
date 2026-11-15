@@ -610,9 +610,22 @@ right = `0:0`. There are no fractional keys in a page: order is the left/right i
 in id order (`rm_writer.sequence`). Item blocks are stored sorted by (parent, id). PageStats
 (0x0A: loads, merges, textChars, textLines, keyboardCount) has no stroke counters; the writer
 stores `loads + 1` on every save and the rest as they are. On a page with typed text the
-scene has an anchoring manager (0x14096ca70) that can put the stroke into a group anchored
-to a text line instead: not traced, so `rm_stroke` refuses to draw or erase on pages with a
-RootText block for now.
+scene has an anchoring manager (0x14096ca70) that puts the stroke into a group anchored
+to a text line instead (not traced). On the 30 cached pages with a RootText block, the
+tablet's strokes are in such groups: all 472 on the 5 pages with real text, 3,664 of 3,907
+on the 25 with an empty box; the other 243 (4 pages, all with an empty box) sit directly
+on the layer, so a layer stroke beside a RootText block is a page the tablet writes and
+reads. `rm_stroke` draws on such pages as on any other: the stroke goes on the current
+layer, unanchored (it will not follow the text when the text reflows on the tablet, as
+the tablet's own anchored strokes do; no cached page has an unanchored stroke beside real
+text), and the eraser takes the layer's own line items only, leaving the text block byte
+for byte as it was (checked on all 30 pages: draw, erase, put back). Anchored strokes
+store coordinates relative to their text line, so the eraser does not reach the tablet's
+anchored strokes yet.
+
+A text box nothing was typed in is not made: the text session holds its `create` back
+until something is typed, and a `create` with no text edit after it on its page (kept by
+earlier versions of this client) makes no box when the edits are replayed.
 
 **Pen input** [O] (`rm_stroke.StrokeBuilder`, `simplify`, `draw`). The desktop app's QML
 never creates a pen surface or a toolbar, so reMarkable.exe cannot draw; but the tablet's pen

@@ -1178,8 +1178,6 @@ class _SceneView:
             return "The page is still loading"
         if self._content.has_pdf_page:
             return "Strokes can only be drawn on notebook pages"
-        if self._content.scene is not None and self._content.scene.text is not None:
-            return "This page has typed text: drawing and erasing on it is not supported on Linux yet"
         return ""
 
     def pen_commit(self, kind: str, line, seq: int) -> None:

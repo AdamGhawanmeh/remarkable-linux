@@ -206,6 +206,16 @@ class KeptEditTests(unittest.TestCase):
         s.move(T.WORD_RIGHT, T.KEEP_ANCHOR)
         s.paste("Pasted\ntext ")
 
+    def test_a_text_box_nothing_is_typed_in_is_not_kept(self):
+        s = session(w.blank_page(ME))
+        self.assertEqual([e.op for e in s.edits], ["create"])
+        s.place(0)                                          # a click in it
+        self.assertEqual(s.take(), ([], []))                # held back, not handed over
+        typed(s, "hi")
+        edits, steps = s.take()
+        self.assertEqual([e.op for e in edits], ["create", "insert"])       # with the first thing typed
+        self.assertEqual(s.take(), ([], []))
+
     def test_the_edits_kept_make_the_same_page(self):
         page = w.blank_page(ME)
         s = session(page)

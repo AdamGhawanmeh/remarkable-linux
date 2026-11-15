@@ -355,13 +355,27 @@ class AppendTests(unittest.TestCase):
         with mock.patch.object(s, "MAX_LINE_POINTS", 2), self.assertRaises(s.StrokeError):
             s.append_stroke(None, author=DESKTOP, line=line)
 
-    def test_a_page_with_typed_text_is_refused_for_now(self):
-        typed = page(stroke((1, 15)), extra=root_text([], []))
-        self.assertTrue(s.has_text(w.split(typed)[1]))
-        with self.assertRaises(s.StrokeError):
-            s.append_stroke(typed, author=DESKTOP, line=ruled())
-        with self.assertRaises(s.StrokeError):
-            s.erase(typed, author=DESKTOP, eraser=upright())
+    def test_a_page_with_typed_text_is_drawn_and_erased_on_its_layer(self):
+        from viewer import rm_text
+        empty_box = page(stroke((1, 15)), extra=root_text([], []))
+        typed = rm_text.edit_text(page(stroke((1, 15))), author=DESKTOP,
+                                  change=lambda doc, clock: doc.insert(0, "meeting notes", clock))
+        for data in (empty_box, typed):
+            self.assertTrue(s.has_text(w.split(data)[1]))
+            text_block = [b.payload for b in w.split(data)[1] if b.type == w.BLOCK_ROOT_TEXT]
+            drawn = s.append_stroke(data, author=DESKTOP, line=ruled())
+            [new] = [x for x in s.strokes(drawn) if x.item not in {y.item for y in s.strokes(data)}]
+            # On the layer itself, unanchored, after the layer's last item.
+            self.assertEqual((new.parent, new.left), (LAYER, w.sequence(w.split(data)[1], LAYER)[-1][0]))
+            self.assertEqual([b.payload for b in w.split(drawn)[1] if b.type == w.BLOCK_ROOT_TEXT], text_block)
+            erased = s.erase(drawn, author=DESKTOP, eraser=upright())
+            self.assertIn(new.item, erased.deleted)
+            self.assertEqual([b.payload for b in w.split(erased.page)[1] if b.type == w.BLOCK_ROOT_TEXT], text_block)
+            self.assertEqual(parse(erased.page).text.text if parse(erased.page).text else "",
+                             parse(data).text.text if parse(data).text else "")
+        # Undo of the erasure puts the stroke back on the text page too.
+        restored, _ = s.restore_stroke(erased.page, author=DESKTOP, item=new.item, line=new.line)
+        self.assertIn(new.line.points, [x.line.points for x in s.strokes(restored)])
 
     def test_strokes_and_find(self):
         line = ruled()
@@ -734,13 +748,37 @@ class StrokeEditTests(Base):
             self.source.add_stroke(self.doc, "aaaaaaaa-0000-4000-8000-00000000dead", self.line(), NOW)
         self.assertEqual(len(self.sync.edits.all()), 3)
 
-    def test_a_page_with_typed_text_is_refused_and_nothing_is_kept(self):
-        self.cloud.put_item(THROWAWAY, self.doc.metadata.raw, json.loads(self.source.blob(self.doc, f"{THROWAWAY}.content")),
-                            {f"{THROWAWAY}/{PAGE1}.rm": page(stroke((1, 15)), extra=root_text([], []))})
-        self.tree = self.source.refresh()
-        with self.assertRaises(EditError):
-            self.source.add_stroke(self.tree.get(THROWAWAY), PAGE1, self.line(), NOW)
-        self.assertEqual(self.sync.edits.all(), [])
+    def test_a_page_with_typed_text_takes_strokes_and_erasers(self):
+        from core.edits import TextEdit
+        from viewer import rm_text
+        # The page as the tablet left it, with typed text added (pending text edits).
+        create = TextEdit.new(THROWAWAY, PAGE1, "create", NOW, paragraph=0)
+        typed = TextEdit.new(THROWAWAY, PAGE1, "insert", NOW, text="agenda")
+        self.sync.edits.add(create)
+        self.sync.edits.add(typed)
+        self.assertEqual(rm_text.page_text(self.source.staged(self.doc).page(PAGE1)).text, "agenda")
+        edit = self.source.add_stroke(self.doc, PAGE1, self.line(), NOW + 1)
+        erase = self.source.erase_strokes(self.doc, PAGE1, upright(), NOW + 2)
+        self.assertIsNotNone(erase)
+        self.assertEqual(self.sync.edits.of(THROWAWAY), [create, typed, edit, erase])
+        uploaded = self.files(self.sync.edits.of(THROWAWAY))[f"{THROWAWAY}/{PAGE1}.rm"]
+        self.assertEqual(rm_text.page_text(uploaded).text, "agenda")              # the text as typed
+        self.assertEqual(len(s.strokes(uploaded)), 3)               # the tablet's (out of reach), ours in two pieces
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 3))
+        self.assertEqual(len(s.strokes(self.source.staged(self.doc).page(PAGE1))), 2)      # ours whole again
+
+    def test_a_text_box_nothing_was_typed_in_is_not_made(self):
+        from core.edits import TextEdit
+        from viewer import rm_text
+        create = TextEdit.new(THROWAWAY, PAGE1, "create", NOW, paragraph=0)
+        self.assertIsNone(rm_text.page_text(replay(drawn_page(), [create], self.sync.author()).page))
+        self.assertEqual(self.files([create]), {})                            # nothing to upload
+        # With a stroke after it, the page gets the stroke and still no box.
+        files = self.files([create, StrokeAdd.new(THROWAWAY, PAGE1, self.line(), NOW)])
+        self.assertIsNone(rm_text.page_text(files[f"{THROWAWAY}/{PAGE1}.rm"]))
+        # Typed in, it is made.
+        typed = TextEdit.new(THROWAWAY, PAGE1, "insert", NOW, text="x")
+        self.assertEqual(rm_text.page_text(replay(drawn_page(), [create, typed], self.sync.author()).page).text, "x")
 
     def test_the_plan_says_what_was_drawn_and_erased(self):
         yellow = self.line(tool=s.HIGHLIGHTER_V2, color=9, thickness=1.0, argb=0xFFFFED75)

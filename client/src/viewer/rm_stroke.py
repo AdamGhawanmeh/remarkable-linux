@@ -512,14 +512,13 @@ def strokes(page: bytes | None, parent: tuple[int, int] | None = None) -> list[S
 
 
 def has_text(blocks: list[w.Block]) -> bool:
+    """Whether the page has a text box (RootText, 0x07). Strokes are drawn and erased on
+    such a page as on any other: a new one goes on the current layer itself, unanchored;
+    the eraser takes only the layer's own line items (0x05) and leaves the text as it
+    is. (The app puts strokes drawn on a page with text into anchored groups, which
+    follow the text when it reflows: 472 of 472 strokes on the cached pages with real
+    text, ARCHITECTURE.md 5.1. Those are not made here.)"""
     return any(b.type == w.BLOCK_ROOT_TEXT for b in blocks)
-
-
-def _refuse_text(blocks: list[w.Block]) -> None:
-    """A page with typed text anchors what is drawn on it to the text (the scene's
-    anchoring manager, 0x14096ca70), which this does not do yet."""
-    if has_text(blocks):
-        raise StrokeError("drawing on a page with typed text is not supported yet")
 
 
 def _layer(blocks: list[w.Block], layer: tuple[int, int] | None) -> tuple[int, int]:
@@ -549,7 +548,6 @@ def append_strokes(page: bytes | None, *, author: bytes, lines: list[LineValue],
     took): append_stroke for several."""
     lines = [_drawable(line) for line in lines]
     header, blocks = w.split(w.blank_page(author) if page is None else page)
-    _refuse_text(blocks)
     before, original = list(blocks), [b.payload for b in blocks]
     me = w._author_index(blocks, author)
     layer = _layer(blocks, layer)
@@ -1072,7 +1070,6 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
     if eraser.count >= MAX_STORED_POINTS:
         raise StrokeError("the eraser line is too large")       # 0x140997e60
     header, blocks = w.split(page)
-    _refuse_text(blocks)
     layer = _layer(blocks, layer)
     outline = eraser_outline(eraser)
     if not outline.points:
@@ -1121,7 +1118,6 @@ def restore_stroke(page: bytes, *, author: bytes, item: tuple[int, int], line: L
     `move_id` (default: `item`) unless the value has one already. StrokeError when the
     page has no deleted item `item`."""
     header, blocks = w.split(page)
-    _refuse_text(blocks)
     item = tuple(item)
     owner = None
     for block in blocks:

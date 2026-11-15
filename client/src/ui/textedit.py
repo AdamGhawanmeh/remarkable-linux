@@ -798,7 +798,12 @@ class TextSession:
 
     # -- handing over ---------------------------------------------------------------------
     def take(self) -> tuple[list[TextEdit], list[list]]:
-        """The edits made, and their undo steps, to keep (and forget here)."""
+        """The edits made, and their undo steps, to keep (and forget here). A text box
+        made for the page and nothing typed in it yet is held back: opening text mode
+        on a page, or clicking it, leaves no empty box behind."""
+        if all(e.op == "create" for e in self.edits) and not self.steps:
+            self._stop_typing()
+            return [], []
         edits, steps = self.edits, self.steps
         self.edits, self.steps = [], []
         self._stop_typing()

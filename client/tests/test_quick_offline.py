@@ -1889,27 +1889,62 @@ class PenTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 2), self.notices)    # cut in two
         self.assertEqual(real_warnings(self.app.warnings), [])
 
-    def test_a_page_with_typed_text_takes_no_strokes(self):
+    def test_a_page_with_typed_text_takes_strokes_and_the_eraser(self):
         from test_rm_stroke_offline import page, root_text, stroke
+        from viewer import rm_text
         doc = self.source.sync.tree.get(self.THROWAWAY)
-        self.cloud.put_item(self.THROWAWAY, doc.metadata.raw, json.loads(self.source.blob(doc, f"{self.THROWAWAY}.content")),
-                            {f"{self.THROWAWAY}/{self.PAGE1}.rm": page(stroke((1, 15)), extra=root_text([], []))})
-        self.source.refresh()
-        try:
-            view = self.open_document(self.THROWAWAY, self.PAGE1)
-            self.pens(view).tools.chooseTool("ballpoint")
-            self.drag(view, [(-300.0 + 10 * n, 600.0) for n in range(10)])
-            self.assertTrue(self.wait_for(lambda: self.notices))
-            self.assertIn("typed text", self.notices[-1])
-            self.assertEqual([type(e).__name__ for e in self.pending()], ["ToolSettings"])
-            self.assertFalse(self.document_view_text_mode())
-        finally:
-            self.close_document()
-            from test_edits_offline import drawn_page
-            self.cloud.put_item(self.THROWAWAY, doc.metadata.raw,
-                                json.loads(self.source.blob(doc, f"{self.THROWAWAY}.content")),
-                                {f"{self.THROWAWAY}/{self.PAGE1}.rm": drawn_page()})
+        content = json.loads(self.source.blob(doc, f"{self.THROWAWAY}.content"))
+        typed = rm_text.edit_text(page(stroke((1, 15))), author=bytes(16),
+                                  change=lambda d, clock: d.insert(0, "agenda", clock))
+        for rm in (page(stroke((1, 15)), extra=root_text([], [])), typed):     # an empty text box; real text
+            self.cloud.put_item(self.THROWAWAY, doc.metadata.raw, content, {f"{self.THROWAWAY}/{self.PAGE1}.rm": rm})
             self.source.refresh()
+            try:
+                view = self.open_document(self.THROWAWAY, self.PAGE1)
+                before = len(self.strokes())
+                self.click(self.toolbar_item(view, "penTool_ballpoint"))
+                self.drag(view, [(-300.0 + 10 * n, 600.0) for n in range(20)])
+                self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 1), self.notices)
+                self.click(self.toolbar_item(view, "penTool_eraser"))
+                self.drag(view, [(-200.0, 560.0 + 10 * n) for n in range(9)])
+                self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 2), self.notices)
+                self.assertEqual(self.notices, [])
+                shown = self.source.staged(self.source.sync.tree.get(self.THROWAWAY)).page(self.PAGE1)
+                self.assertEqual(rm_text.page_text(shown).text, rm_text.page_text(rm).text)      # the text untouched
+            finally:
+                self.close_document()
+                self.source.sync.edits.clear()
+        from test_edits_offline import drawn_page
+        self.cloud.put_item(self.THROWAWAY, doc.metadata.raw, content, {f"{self.THROWAWAY}/{self.PAGE1}.rm": drawn_page()})
+        self.source.refresh()
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_text_mode_without_typing_leaves_no_text_box(self):
+        from PySide6.QtTest import QTest
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        # A click on the page with no pen in hand: the app's text mode, a cursor, nothing typed.
+        at = self.window_point(view, 0.0, 400.0)
+        QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None), self.notices)
+        self.assertTrue(self.document_view_text_mode())
+        wait(1500)                                              # past the pause after which typing is kept
+        self.qml("DocumentView_").setProperty("textMode", False)
+        self.assertTrue(self.wait_for(lambda: view.text_session is None))
+        wait(300)
+        self.assertEqual(self.pending(), [])
+        # The Text button's way in and out again, then the document closed: still nothing.
+        self.qml("DocumentView_").setProperty("textMode", True)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None))
+        wait(1500)
+        self.qml("DocumentView_").setProperty("textMode", False)
+        self.assertTrue(self.wait_for(lambda: view.text_session is None))
+        self.close_document()
+        wait(300)
+        self.assertEqual(self.pending(), [])
+        from viewer import rm_text
+        doc = self.source.sync.tree.get(self.THROWAWAY)
+        self.assertIsNone(rm_text.page_text(self.source.staged(doc).page(self.PAGE1)))
+        self.assertEqual(real_warnings(self.app.warnings), [])
 
     def document_view_text_mode(self) -> bool:
         return bool(self.qml("DocumentView_").property("textMode"))

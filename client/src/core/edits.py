@@ -846,6 +846,10 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
         edit = edits[at]
         at += 1
         if isinstance(edit, TextEdit):
+            if edit.op == "create" and not any(isinstance(e, TextEdit) and e.op != "create" for e in edits[at:]):
+                # A text box nothing was ever typed in (kept so by earlier versions of
+                # this client when text mode was only opened): no box.
+                continue
             page = _text_edit(page, edit, author, Replay(page, made, removed, typed))
             continue
         if isinstance(edit, StrokeAdd):

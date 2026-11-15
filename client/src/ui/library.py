@@ -700,8 +700,8 @@ class LibrarySource:
     def add_stroke(self, doc: Document, page_id: str, line, now_ms: int) -> StrokeAdd:
         """Keep a stroke drawn on a page: `line` as the app would add it
         (viewer.rm_stroke.draw), one action for undo (the app's AddItem). Refused, with
-        nothing kept, on a document that may not be edited and on a page the stroke
-        engine does not draw on yet (one with typed text)."""
+        nothing kept, on a document that may not be edited. On a page with typed text
+        it goes on the layer, unanchored (viewer.rm_stroke.has_text)."""
         with self._history_lock:
             doc = self._editable(doc, page_id)
             history = self._history(doc.id, page_id)
