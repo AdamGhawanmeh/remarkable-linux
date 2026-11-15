@@ -756,6 +756,93 @@ code is in the binary, mouse path included:
   change uploads `.content` alone; whether the app also bumps `.metadata` lastModified then
   is not traced.
 
+**Text-anchored stroke groups** [O, checked on the 710 anchored nodes of a real library,
+all on pages with a RootText block]. `scene::AnchorManager` (ctor 0x1409690f0, log category
+`rm.scene.anchors`; scene+0x370) owns them. An anchored group is three blocks:
+
+| Block | Fields (writer) |
+|---|---|
+| SceneTreeMove 0x01, v1.1 (0x1409faf50) | `1F` move id (= the node id N when the node is made), `2F` node (`0:0` then), `31` u8 is_update (1), `4C` { `1F` parent = the layer } |
+| SceneTreeNode 0x02, v1.2 (0x1409fb4f0) | `1F` id N, `2C` label LWW, `3C` visible LWW; then, only when the anchor id's timestamp is not `0:0`: `7C` { `1F` ts, `2F` anchorId }, `8C` { `1F` ts, `21` u8 anchorType }, `9C` { `1F` ts, `24` f32 anchorThreshold }, `AC` { `1F` ts, `24` f32 anchorOriginX }; unknown tail kept |
+| CrdtGroupItem 0x04, v1.1 | an ordinary sequence item of the layer (parent, id N+1, left, right, deletedLength), value `u8 2` + `2F` node id N |
+
+A node has no other fields (all 9,255 real nodes are `1,2,3` or `1,2,3,7,8,9,10`): there is
+no transform matrix anywhere in a page. `createGroup` (0x1408dfdb0, action
+"create-group-crdt" 0x14095d470) takes N = `++clock` for the node and appends the group
+item with the next id; the anchor fields are then stamped anchorId N+2, type N+3,
+threshold N+4, originX N (369 real nodes; the other 341 were re-anchored later: anchorId
+and originX carry later, consecutive ids). In memory (node object): +0x170 anchorId, +0x180
+type, +0x190 threshold, +0x1a0 originX, each followed by its timestamp, +0x1f0 the anchor
+position as a QPointF (never stored).
+
+- **anchorId**: the id of a RootText character, or `0:0xfffffffffffe` (before the text,
+  index −1) / `0:0xffffffffffff` (after it, index = length) (0x140972ed0, 0x140972cf0).
+- **anchorType**: 2 "Vertical" (700 real nodes) or 1 "Bidirectional" (10).
+  **anchorThreshold**: 35.748032 (0x420efdfc at manager+0x18 = 4 mm at 227 dpi) for type
+  2, 0.0 for type 1, exactly as stored in all 710. It is not half a text line.
+- **Coordinate transform**: scene point = stored point + anchor position, and
+  anchor position = (x, y) with (0x14097c4f0, 0x1409342a0, on the text's QTextDocument):
+  i = index of the anchor character clamped to 0..length−1;
+  y = text.pos_y + layout position y of i's block + y of the QTextLine holding i + that
+  line's ascent, i.e. the **baseline of the visual line holding the character** (not the
+  paragraph's first line);
+  x = for type 2 the stored anchorOriginX (set once, to the x below, when the group is
+  made); for type 1 `(boxWidth − textWidth)/2 + text.pos_x + layout x + cursorToX(i)`, so
+  type 1 follows the character sideways as well. An anchor id the text does not hold is
+  skipped with a warning.
+- **The text layout it hangs on** (0x140a3c480, 0x140a3c280, text ctor 0x1409247b0):
+  QTextDocument, document margin 4 (Qt's default), indent width 48, fonts with
+  PreferNoHinting. Paragraph: reMarkable Sans 32 px weight 400, top margin 24, line
+  height type LineDistanceHeight with 0.2 × the font's height. Title: reMarkable Serif
+  Small 64 px weight 300, top margin 88. Subheading (12): Serif Small 46 px weight 400,
+  top margin 56. Subheading2 (1): Sans 36 px weight 500, top margin 40. A checked
+  checkbox is struck out. With the app's Qt (6.10.3) and fonts: body height 37.75, ascent
+  29.59375, Title ascent 59.1875, body paragraph pitch 69.546875; the first block gets no
+  top margin, so the first baseline is pos_y + 4 + ascent.
+  Checked on real pages: every sentinel anchor has originX = text x + 4 (36 groups, box
+  widths 936 and 1152); on empty Title boxes at y 234 the anchored strokes' stored y starts
+  at −291…−294, which is the page top (3…6) only with the baseline 234 + 4 + 59.19, and a
+  page holding both kinds ends at 1869 (anchored) and 1871 (layer strokes).
+  **Deviation to fix in the client**: `renderer.stroke_offsets` uses the box top for
+  sentinel anchors (63 px too high on such pages) and the paragraph's first line for the
+  others; the 71.5 line height of §5.2 is a fit, not the app's 69.55.
+- **Where a new stroke goes** (0x14096ca70 → 0x140977bf0): items larger than 178.74 (20
+  mm) both ways, or not over text, are type 2; an item over text (0x1409741d0: its box
+  grown by a third of a line, against the text lines' rectangles; for a stroke one of its
+  points must lie in one) is type 1. It joins the overlapping group with the most children
+  (0x140971e20, within the threshold) or a new group anchored at the character under the
+  centre of its box (0x140974950: above the box → before-text sentinel, below → after-text
+  sentinel), and is stored translated by −anchor position (float32 adds, 0x1405b8440).
+- **Eraser** (0x140996ae0): the outline is built once in scene coordinates; the layer's own
+  items are searched (0x140996fb0), then every group node below it at any depth, through
+  live group items (visitor 0x1408d1670, callback 0x140991f10). In a node whose anchorId is
+  set, the node's anchor position is added to each stroke point for the cut test
+  (0x140a63920 takes it as dx, dy); cuts are parametric, so the pieces keep the group's
+  local coordinates and are inserted after the erased item in the same group, as on a
+  layer. A glyph range goes when more than half of its rectangles' centres are inside.
+  Afterwards, per touched anchored group (0x140979810): what is left is clustered by the
+  threshold, the largest cluster stays, the others are deleted and anchored afresh
+  (clones in scene coordinates, moveId = the old item); a group left empty loses its
+  anchor and is detached by a second SceneTreeMove (new id, node N, is_update 0, parent
+  `0:0`; real pages have these, with the group item still live). A client eraser needs
+  only the first part to erase the tablet's anchored strokes: compute the anchor position
+  as above, test in scene coordinates, write the pieces into the same group.
+
+**Moving, scaling and rotating a selection** [O, binary only; not yet checked against the
+library's strokes that carry a moveId]. There is no transform on nodes: the commit
+(0x1409b48a0) works per node, deletes the selected items (0x1408c5910) and adds
+transformed copies as new items (0x1408c2bc0: next id, appended), under one undoable
+action; moveId is set to the replaced item when it was `0:0` (0x1408cbd60). In an anchored
+group the transform is conjugated with the translation by the group's anchor position
+(0x1408c3570), and the group is re-anchored afterwards (0x140975b10). A stroke is
+transformed by `Line::transform(QTransform)` (0x140b3d4d0; item wrapper 0x1405b67f0, which
+changes the timestamp only when given a non-zero one): nothing for an identity; s = 1 for
+a pure translation, else sqrt(|det|); thicknessScale × s; each point's x, y mapped and
+stored as float32; each width `roundf(width_u16 × 0.25 × s × 4)`; speed, direction and
+pressure unchanged. Not traced yet: how many id generations a gesture costs, the
+selection's live preview, stroke copy/paste, and the remaining areas of this survey
+(hold-to-snap shapes, PDF/EPUB annotation pages, sync upload and merge rules).
+
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in
 the corpus is interpreted or understood (no unaccounted blocks). Full-library run: every
