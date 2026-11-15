@@ -1111,6 +1111,37 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
     return Erased(w.join(header, chain.write(blocks)), tuple(item.item for item, _, _ in hit), tuple(made))
 
 
+def restore_stroke(page: bytes, *, author: bytes, item: tuple[int, int], line: LineValue,
+                   move_id: tuple[int, int] | None = None) -> tuple[bytes, tuple[int, int]]:
+    """(`page` with a deleted stroke put back, its new id), as the app's undo and redo
+    put an item back (SceneActionStack -> 0x14095e690 / 0x14095f520 -> 0x1408cbd60): the
+    deleted item stays deleted, and a new line item with the page's next id goes right
+    after it (`item`: the deleted id; inside a run of deleted ids the run is cut there,
+    as _Chain.insert_after does), with `line` as its value and its moveId set to
+    `move_id` (default: `item`) unless the value has one already. StrokeError when the
+    page has no deleted item `item`."""
+    header, blocks = w.split(page)
+    _refuse_text(blocks)
+    item = tuple(item)
+    owner = None
+    for block in blocks:
+        if block.type in w.ITEM_BLOCKS:
+            found = w.decode_item(block.payload)
+            if found.item[0] == item[0] and 0 <= item[1] - found.item[1] < max(found.deleted_length, 1):
+                owner = found
+                break
+    if owner is None or owner.value is not None or owner.deleted_length < 1:
+        raise StrokeError(f"the page has no deleted item {item}")
+    line = _drawable(line) if line.tool not in NOT_DRAWN else line
+    if line.move_id in (None, ZERO_ID):
+        line = replace(line, move_id=tuple(move_id) if move_id is not None else item)
+    me = w._author_index(blocks, author)
+    new_id = (me, w.highest_counter(blocks) + 1)
+    chain = _Chain(blocks, owner.parent)
+    chain.insert_after(item, new_id, line.encode())
+    return w.join(header, chain.write(blocks)), new_id
+
+
 def eraser_line(samples: Iterable[tuple], thickness: float = MEDIUM, tool: int = ERASER, **how) -> LineValue:
     """The line an eraser draws over pen `samples` (as draw takes them): what erase
     takes. Its points are 10 scene units wide for each unit of `thickness`."""
@@ -1125,5 +1156,5 @@ __all__ = ["BALLPOINT_V2", "CALLIGRAPHY", "COLOR_ARGB", "DEFAULT_TIMESTAMP", "ER
            "Outline", "PAINTBRUSH_V2", "PENCIL_V2", "PENS", "Point", "SHADING_MARKER", "SHARP_PENCIL_V2",
            "StrokeBuilder", "StrokeError", "StrokeItem", "THICK", "THIN", "append_stroke", "append_strokes", "can_join",
            "decode_line_value", "delete_strokes", "draw", "erase", "erase_line", "eraser_line", "eraser_outline",
-           "find_strokes", "has_text",
+           "find_strokes", "has_text", "restore_stroke",
            "line_bounds", "make_point", "new_line", "pack_points", "simplify", "simplify_points", "strokes", "unpack_points"]

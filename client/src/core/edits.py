@@ -31,7 +31,11 @@ strokes deleted whole (StrokeDelete: by item, as ImageRestore names one). They c
 the page's .rm, .content and .metadata like an image does, and no other file.
 
 Undo and redo (PageHistory) work as in reMarkable.exe (SceneActionStack): they do not
-take edits back but make new ones, so they upload like any other edit.
+take edits back but make new ones, so they upload like any other edit. A stroke put
+back by one is a new item right after its deleted self (StrokeRestore).
+
+A document's pen settings (ToolSettings: LastTool, Last<Tool>Size, ... in .content
+"extraMetadata") are kept as an edit too, only the newest one per document.
 
 Four more change the page list itself (core.pagemap, as the app's DocumentWorker):
 a page added (PageAdd), pages duplicated (PageCopy), pages moved (PageMove) and pages
@@ -355,7 +359,74 @@ class StrokeDelete:
         return cls.new(raw["doc_id"], raw["page_id"], raw["items"], raw["created_ms"], raw.get("uid") or "")
 
 
-STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete)
+@dataclass(frozen=True)
+class StrokeRestore:
+    """A deleted stroke put back, as the app's undo and redo put an item back
+    (rm_stroke.restore_stroke): a new item right after the deleted one (`item`), with
+    the value it had (`value`: the line value's bytes, hex) and, unless that value
+    names one, moveId = the id of `origin` (default `item`): the item it first was."""
+
+    doc_id: str
+    page_id: str
+    item: ItemRef
+    value: str
+    created_ms: int
+    origin: ItemRef | None = None
+    uid: str = ""
+
+    def line(self) -> rm_stroke.LineValue:
+        return rm_stroke.decode_line_value(bytes.fromhex(self.value))
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, item, value, created_ms: int, origin=None,
+            uid: str | None = None) -> "StrokeRestore":
+        data = bytes(value) if isinstance(value, (bytes, bytearray)) else bytes.fromhex(str(value))
+        try:
+            rm_stroke.decode_line_value(data)
+        except (RmParseError, ValueError) as err:
+            raise EditError(f"not the value of a stroke: {err}") from err
+        return cls(str(doc_id), str(page_id), _ref(item), data.hex(), int(created_ms),
+                   None if origin is None else _ref(origin), uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "StrokeRestore":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["item"], raw["value"], raw["created_ms"],
+                       raw.get("origin"), raw.get("uid") or "")
+
+
+STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore)
+
+
+# ------------------------------------------------------------------ the pen settings of a document
+
+TOOL_SETTING_PREFIXES = ("Last", "Secondary")
+
+
+@dataclass(frozen=True)
+class ToolSettings:
+    """The pen settings a document keeps in its .content "extraMetadata" (the app's
+    DocumentToolSettings, 0x14060e1e0): LastTool, LastPen, Last<Tool>Size,
+    Last<Tool>Color, ..., all strings. `values` are the keys set, each with its new
+    value; made again, they are set on the newer .content and nothing else is."""
+
+    doc_id: str
+    values: tuple[tuple[str, str], ...]
+    created_ms: int
+
+    @property
+    def page_id(self) -> str:
+        return ""
+
+    @classmethod
+    def new(cls, doc_id: str, values, created_ms: int) -> "ToolSettings":
+        pairs = tuple(sorted((str(k), str(v)) for k, v in dict(values).items()))
+        if not pairs or any(not k.startswith(TOOL_SETTING_PREFIXES) for k, _ in pairs):
+            raise EditError(f"not pen settings: {values!r}")
+        return cls(str(doc_id), pairs, int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "ToolSettings":
+        return cls.new(raw["doc_id"], dict(raw["values"]), raw["created_ms"])
 
 
 # ------------------------------------------------------------------ page edits
@@ -574,11 +645,12 @@ PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete)
 DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
 
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
-        | TextEdit | StrokeAdd | StrokeErase | StrokeDelete)
+        | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | ToolSettings)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
                           "page-move": PageMove, "page-delete": PageDelete, "text": TextEdit,
-                          "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete}
+                          "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete,
+                          "stroke-restore": StrokeRestore, "tool-settings": ToolSettings}
 
 
 class PendingEdits:
@@ -674,6 +746,13 @@ class PendingEdits:
                 tmp.write_bytes(data)
                 tmp.replace(path)
             self._edits.append(edit)
+
+    def replace(self, old: list[Edit], edit: Edit) -> None:
+        """Forget `old` and keep `edit` in one change of the file (a document's pen
+        settings: only the newest are kept)."""
+        gone = set(old)
+        with self._changing():
+            self._edits = [e for e in self._edits if e not in gone] + [edit]
 
     def data(self, edit: ImageInsert) -> bytes:
         try:
@@ -788,6 +867,23 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
             if page is not None:
                 done = Replay(page, made, removed, typed)
                 page = rm_stroke.delete_strokes(page, [i for i in map(done.resolve, edit.items) if i is not None])
+            continue
+        if isinstance(edit, StrokeRestore):
+            done = Replay(page, made, removed, typed)
+            item = done.resolve(edit.item)
+            origin = done.resolve(edit.origin) if edit.origin is not None else None
+            if page is None or item is None:
+                log.warning("not putting back a stroke on page %s: the item it was is not known", edit.page_id)
+                continue
+            try:
+                page, new_id = rm_stroke.restore_stroke(page, author=author, item=item, line=edit.line(), move_id=origin)
+            except rm_stroke.StrokeError as err:
+                log.warning("not putting back a stroke on page %s: %s", edit.page_id, err)
+                continue
+            if edit.uid:
+                made[edit.uid] = new_id
+            continue
+        if isinstance(edit, ToolSettings):
             continue
         key = bytes.fromhex(edit.key)
         if isinstance(edit, ImageInsert):
@@ -1009,6 +1105,28 @@ class StyleChange:
     remove: tuple | None
 
 
+@dataclass(frozen=True)
+class StrokePart:
+    """A stroke an undo or redo takes away or puts back: its name (while on the page, or
+    the deleted item it was), its value (hex), and the item it first was (its moveId
+    when it is put back; None: itself)."""
+
+    ref: ItemRef
+    value: str
+    origin: ItemRef | None = None
+
+
+@dataclass(frozen=True)
+class StrokeChange:
+    """What a pen or eraser action did, as the app's item actions record it (AddItem,
+    InsertItemsAfter: `remove`, the strokes it put on the page; `readd`, those it took
+    off), swapped by every undo and redo: the strokes to remove are deleted, those to
+    put back come back as new items right after their deleted ones."""
+
+    remove: tuple[StrokePart, ...] = ()
+    readd: tuple[StrokePart, ...] = ()
+
+
 BODY_TEXT = (1, None, None)         # how a paragraph without a style of its own is stored
 
 
@@ -1027,6 +1145,21 @@ def swapped(changes: tuple, doc_id: str, page_id: str, now_ms: int,
     edits: list[Edit] = []
     back: list = []
     for change in reversed(changes):
+        if isinstance(change, StrokeChange):
+            gone = tuple(StrokePart(name(p.ref), p.value, p.origin) for p in change.remove)
+            if gone:
+                edits.append(StrokeDelete.new(doc_id, page_id, [p.ref for p in gone], now_ms))
+            readded = []
+            for part in change.readd:
+                at = name(part.ref)
+                restore = StrokeRestore.new(doc_id, page_id, at, part.value, now_ms, part.origin or at)
+                edits.append(restore)
+                made = ("edit", restore.uid)
+                if aliases is not None:
+                    aliases[at] = made
+                readded.append(StrokePart(made, part.value, part.origin or at))
+            back.append(StrokeChange(tuple(readded), gone))
+            continue
         if isinstance(change, StyleChange):
             paragraph = name(change.paragraph)
             edits.append(TextEdit.new(doc_id, page_id, "style", now_ms, first=paragraph,
@@ -1121,11 +1254,15 @@ class Staged:
         self.page_list_edits: list[Edit] = []
         self.content: dict | None = None                # .content with the new page list
         self._pages: dict[str, bytes | None] = {}
+        self.tool_settings: dict[str, str] = {}         # extraMetadata keys set, newest last
         live = [p.id for p in doc.content.pages if not p.deleted]
         pagemap: PageMap | None = None
         for edit in edits:
             if edit.doc_id != doc.id:
                 raise EditError("an edit of another document")
+            if isinstance(edit, ToolSettings):
+                self.tool_settings.update(edit.values)
+                continue
             if not isinstance(edit, PAGE_EDITS):
                 if edit.page_id not in self.deleted:   # edits of a page deleted after them are moot
                     self.page_edits.setdefault(edit.page_id, []).append(edit)
@@ -1317,7 +1454,7 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
             out[name] = None
 
     content_name, metadata_name = f"{doc.id}.content", f"{doc.id}.metadata"
-    if not changed and not staged.changes_page_list:
+    if not changed and not staged.changes_page_list and not staged.tool_settings:
         return out if out else {}
     original = json.loads(read(content_name))
     content = staged.content if staged.changes_page_list else json.loads(read(content_name))
@@ -1325,10 +1462,17 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
     for entry in listed if isinstance(listed, list) else []:
         if isinstance(entry, dict) and entry.get("id") in changed:
             entry["modifed"] = _later(entry.get("modifed"), changed[entry["id"]])
+    if staged.tool_settings:
+        extra = content.get("extraMetadata")
+        content["extraMetadata"] = {**(extra if isinstance(extra, dict) else {}), **staged.tool_settings}
     if content != original:
         out[content_name] = json_bytes(content)
     if not out:
         return {}
+    if not changed and not staged.page_list_edits:
+        # Pen settings alone change no page: lastModified is left as it is (whether the
+        # app bumps it for a settings-only save has not been traced).
+        return out
     newest = max([*changed.values(), *(e.created_ms for e in staged.page_list_edits)])
     metadata = json.loads(read(metadata_name))
     stamp = _later(metadata.get("lastModified"), newest)

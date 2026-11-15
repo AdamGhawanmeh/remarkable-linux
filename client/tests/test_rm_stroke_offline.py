@@ -29,8 +29,8 @@ from rmfixtures import f_id, f_sub, line_item, points_v2, root_text, tombstone  
 from test_edits_offline import NOW, OTHER, PAGE1, PAGE2, THEN, THROWAWAY, Base, drawn_page  # noqa: E402
 
 import push_edits  # noqa: E402
-from core.edits import (EditError, PendingEdits, StrokeAdd, StrokeDelete, StrokeErase, document_files,  # noqa: E402
-                        page_with_edits, replay)
+from core.edits import (EditError, PendingEdits, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,  # noqa: E402
+                        ToolSettings, document_files, page_with_edits, replay)
 from core.sync import SyncClient, describe_edit, json_changes  # noqa: E402
 from fakecloud import paired_auth  # noqa: E402
 from viewer import rm_stroke as s  # noqa: E402
@@ -799,6 +799,156 @@ class StrokeEditTests(Base):
         self.assertEqual([x.item for x in s.strokes(uploaded)], [(1, 15), (2, 17), (2, 18)])
         self.assertEqual(struct.unpack_from("<I", uploaded, w.split(uploaded)[1][2].offset)[0],
                          len(w.split(drawn_page())[1][2].payload))      # PageStats: as it was
+
+
+class StrokeUndoTests(Base):
+    """Stroke undo and redo as the app's item actions do them: what was drawn is deleted,
+    what was taken off comes back as a new item right after its deleted self, its
+    moveId the item it first was."""
+
+    files = StrokeEditTests.files
+
+    def line(self, y: float = 100.0, **pen) -> s.LineValue:
+        return ruled(y=y, **pen)
+
+    def page(self) -> bytes:
+        return self.source.staged(self.tree.get(THROWAWAY)).page(PAGE1)
+
+    def live(self) -> list:
+        return [(x.item, x.line.points) for x in s.strokes(self.page())]
+
+    def test_restore_puts_a_new_item_right_after_the_deleted_one(self):
+        data = chain(3)
+        deleted = s.delete_strokes(data, [(1, 16)])
+        value = s.strokes(data)[1].line
+        restored, new_id = s.restore_stroke(deleted, author=DESKTOP, item=(1, 16), line=value)
+        self.assertEqual(new_id, (2, 18))
+        self.assertEqual(sorted(i[1:5] for i in items(restored)),
+                         [((1, 15), ZERO, ZERO, 0), ((1, 16), (1, 15), ZERO, 1), ((1, 17), (1, 16), ZERO, 0),
+                          ((2, 18), (1, 16), (1, 17), 0)])
+        self.assertEqual([i for i, _ in w.sequence(w.split(restored)[1], LAYER)], [(1, 15), (1, 16), (2, 18), (1, 17)])
+        [back] = [x for x in s.strokes(restored) if x.item == new_id]
+        self.assertEqual(back.line, dataclasses.replace(value, move_id=(1, 16)))
+        # In the middle of a run of deleted ids the run is cut there; a moveId it has is kept.
+        run = s.delete_strokes(data, [(1, 15), (1, 16), (1, 17)])
+        self.assertEqual([i[1:5] for i in items(run)], [((1, 15), ZERO, ZERO, 3)])
+        again, new_id = s.restore_stroke(run, author=TABLET, item=(1, 16),
+                                         line=dataclasses.replace(value, move_id=(1, 3)))
+        self.assertEqual(sorted(i[1:5] for i in items(again)),
+                         [((1, 15), ZERO, ZERO, 2), ((1, 17), (1, 16), ZERO, 1), ((1, 18), (1, 16), (1, 17), 0)])
+        self.assertEqual([i for i, _ in w.sequence(w.split(again)[1], LAYER)], [(1, 15), (1, 16), (1, 18), (1, 17)])
+        self.assertEqual(s.strokes(again)[0].line.move_id, (1, 3))
+        with self.assertRaises(s.StrokeError):
+            s.restore_stroke(data, author=TABLET, item=(1, 16), line=value)         # not deleted
+
+    def test_undo_and_redo_of_a_stroke(self):
+        tablet = self.live()
+        edit = self.source.add_stroke(self.doc, PAGE1, self.line(), NOW)
+        drawn = self.live()
+        self.assertEqual(self.source.history_state(self.doc, PAGE1), (True, False))
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 1))
+        self.assertEqual(self.live(), tablet)
+        self.assertEqual(self.source.history_state(self.doc, PAGE1), (False, True))
+        self.assertTrue(self.source.redo(self.doc, PAGE1, NOW + 2))
+        self.assertEqual([p for _, p in self.live()], [p for _, p in drawn])
+        [back] = [x for x in s.strokes(self.page()) if x.item not in dict(tablet)]
+        self.assertEqual(back.line.move_id, dict((uid, i) for uid, i in [(edit.uid, drawn[-1][0])])[edit.uid])
+        # Undo again deletes the stroke the redo put back (named by its new item).
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 3))
+        self.assertEqual(self.live(), tablet)
+        self.assertEqual([type(e).__name__ for e in self.sync.edits.of(THROWAWAY)],
+                         ["StrokeAdd", "StrokeDelete", "StrokeRestore", "StrokeDelete"])
+        # Uploaded, the page is the tablet's with three deleted items.
+        files = self.files(self.sync.edits.of(THROWAWAY))
+        self.assertEqual([x.item for x in s.strokes(files[f"{THROWAWAY}/{PAGE1}.rm"])], [i for i, _ in tablet])
+
+    def test_undo_and_redo_of_an_eraser_pass(self):
+        self.source.add_stroke(self.doc, PAGE1, self.line(), NOW)
+        drawn = self.live()
+        self.assertIsNotNone(self.source.erase_strokes(self.doc, PAGE1, upright(), NOW + 1))
+        erased = self.live()
+        self.assertEqual(len(erased), len(drawn) + 1)               # ours cut in two
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 2))
+        self.assertEqual(sorted(p for _, p in self.live()), sorted(p for _, p in drawn))
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 3))         # the stroke, put back by the undo
+        self.assertEqual(len(self.live()), len(drawn) - 1)
+        self.assertTrue(self.source.redo(self.doc, PAGE1, NOW + 4))
+        self.assertTrue(self.source.redo(self.doc, PAGE1, NOW + 5))
+        self.assertEqual(sorted(p for _, p in self.live()), sorted(p for _, p in erased))
+        self.assertEqual(self.source.history_state(self.doc, PAGE1), (True, False))
+        # An eraser that meets nothing keeps nothing, and is no undo step.
+        count = len(self.sync.edits.of(THROWAWAY))
+        self.assertIsNone(self.source.erase_strokes(self.doc, PAGE1, upright(x=600.0), NOW + 6))
+        self.assertEqual(len(self.sync.edits.of(THROWAWAY)), count)
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 7))
+        self.assertEqual(sorted(p for _, p in self.live()), sorted(p for _, p in drawn))
+
+    def test_a_restore_edit_round_trips_and_is_described(self):
+        value = self.line().encode()
+        edit = StrokeRestore.new(THROWAWAY, PAGE1, ("page", 1, 15), value, NOW, ("edit", "abc"))
+        raw = json.loads(json.dumps({"kind": "stroke-restore", **dataclasses.asdict(edit)}))
+        self.assertEqual(StrokeRestore.load(raw), edit)
+        self.assertIn("put back a stroke", describe_edit(edit))
+        with self.assertRaises(EditError):
+            StrokeRestore.new(THROWAWAY, PAGE1, ("page", 1, 15), b"\x03\x01", NOW)
+        # The item it was is gone: nothing is put back.
+        self.assertEqual(replay(drawn_page(), [StrokeRestore.new(THROWAWAY, PAGE1, ("page", 1, 15), value, NOW)],
+                                self.sync.author()).page, drawn_page())
+
+
+class PenSettingsTests(Base):
+    """A document's pen settings: its .content extraMetadata, as the app keeps them."""
+
+    files = StrokeEditTests.files
+
+    def test_the_settings_are_read_with_defaults_where_missing(self):
+        from ui import pen
+        self.assertEqual(pen.current_tool({}).key, "ballpoint")
+        self.assertEqual(pen.current_tool({"LastTool": "SelectionTool", "LastPen": "Markerv2"}).key, "marker")
+        p = pen.pen_of({"LastFinelinerv2Size": "3", "LastFinelinerv2Color": "Blue"}, pen.BY_KEY["fineliner"])
+        self.assertEqual((p.size, p.color.key, p.line_color), (3, "blue", int(Color.BLUE)))
+        p = pen.pen_of({}, pen.BY_KEY["highlighter"])
+        self.assertEqual((p.size, p.color.name, p.line_color), (1, "HighlighterYellow", int(Color.HIGHLIGHTER_YELLOW)))
+        p = pen.pen_of({"LastFinelinerv2Color": "ArgbCode", "LastFinelinerv2ColorCode": "4294962549"},
+                       pen.BY_KEY["fineliner"])
+        self.assertEqual((p.color, p.argb, p.line_color), (None, 0xFFFFED75, 9))
+        self.assertEqual(pen.pen_of({"LastPencilv2Size": "7"}, pen.BY_KEY["pencil"]).size, 2)
+        self.assertEqual({c.name for c in pen.PEN_COLORS},
+                         {"Black", "Gray", "White", "Blue", "Red", "Green", "Yellow", "Magenta", "Cyan"})
+        self.assertEqual(pen.tool_values(pen.BY_KEY["eraser"]), {"LastTool": "Eraser", "LastEraserTool": "Eraser"})
+        with self.assertRaises(ValueError):
+            pen.color_values(pen.BY_KEY["highlighter"], "black")
+
+    def test_settings_are_one_pending_edit_and_change_only_the_content(self):
+        self.assertEqual(self.source.tool_settings(self.doc).get("LastTool"), None)
+        first = self.source.set_tool_settings(self.doc, {"LastTool": "Finelinerv2", "LastPen": "Finelinerv2"}, NOW)
+        self.source.set_tool_settings(self.doc, {"LastFinelinerv2Size": "3"}, NOW + 1)
+        self.assertIsNone(self.source.set_tool_settings(self.doc, {"LastFinelinerv2Size": "3"}, NOW + 2))
+        [edit] = self.sync.edits.of(THROWAWAY)
+        self.assertIsInstance(edit, ToolSettings)
+        self.assertNotEqual(edit, first)
+        self.assertEqual(dict(edit.values), {"LastTool": "Finelinerv2", "LastPen": "Finelinerv2",
+                                             "LastFinelinerv2Size": "3"})
+        self.assertEqual(self.source.tool_settings(self.doc)["LastFinelinerv2Size"], "3")
+        files = self.files([edit])
+        content = f"{THROWAWAY}.content"
+        self.assertEqual(sorted(files), [content])
+        self.assertEqual(json_changes(json.loads(self.source.blob(self.doc, content)), json.loads(files[content])),
+                         [("extraMetadata.LastFinelinerv2Size", None, "3"), ("extraMetadata.LastPen", None, "Finelinerv2"),
+                          ("extraMetadata.LastTool", None, "Finelinerv2")])
+        self.assertIn("pen settings: LastFinelinerv2Size = 3", describe_edit(edit))
+        # With a stroke, the page's times change as well.
+        self.source.add_stroke(self.doc, PAGE1, ruled(), NOW + 3)
+        self.assertEqual(sorted(self.files(self.sync.edits.of(THROWAWAY))),
+                         sorted([content, f"{THROWAWAY}.metadata", f"{THROWAWAY}/{PAGE1}.rm"]))
+        with self.assertRaises(EditError):
+            ToolSettings.new(THROWAWAY, {"Orientation": "landscape"}, NOW)
+        with self.assertRaises(EditError):
+            self.source.set_tool_settings(self.tree.get(OTHER), {"LastTool": "Eraser"}, NOW)
+        self.sync.push_edits(THROWAWAY)
+        uploaded = json.loads(self.cloud.item(THROWAWAY)[content])
+        self.assertEqual(uploaded["extraMetadata"]["LastFinelinerv2Size"], "3")
+        self.assertEqual(self.sync.edits.all(), [])
 
 
 @unittest.skipUnless(os.environ.get("RM_TEST_CACHED_LIBRARY"),

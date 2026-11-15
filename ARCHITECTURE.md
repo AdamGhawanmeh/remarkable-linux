@@ -711,6 +711,35 @@ code is in the binary, mouse path included:
 - Stored Eraser-tool strokes (white, in old pages) are legacy; the app prunes those at the
   bottom of a node (0x1408c5030).
 
+**Undo, redo and the pen UI** [O] (`rm_stroke.restore_stroke`, `core.edits.StrokeChange`,
+`StrokeRestore`, `ToolSettings`; `ui/pen.py`, `ui/quick/bridge/pen.py`).
+
+- A stroke drawn is one AddItem action, an eraser pass one action whose remove half is the
+  pieces it left and whose readd half the strokes it deleted (the item actions' shared
+  redo/undo, 0x14095e690 / 0x14095f520). Undo and redo delete the remove half and put the
+  readd half back as **new** items with the next ids, each right after its own deleted item
+  (0x1408cbd60; a run of deleted ids is cut there), moveId = the item it first was unless the
+  value has one. The client keeps each half's values (hex) and names (ItemRef, renamed via
+  the page history's aliases) so the swap can be made again on a newer page. An eraser pass
+  that touches nothing keeps no edit and no undo step.
+- The desktop QML has no pen UI, so the client adds one without changing it: a toolbar
+  (QML built in Python, the app's own `qrc:/ark/icons` pen icons) beside the page in the
+  DocumentView's view container, and a `PenSurface` item over the DocumentViewport's mouse
+  areas that is enabled only while a tool is in hand (otherwise a click does what the app
+  does). Taking a tool ends text and selection mode; turning either on puts the tool down;
+  Escape too. Mouse samples are PenInputSurface's (pressure 0.7, a sample every 25 ms the
+  button is held still, Alt erases); stylus samples come from `QTabletEvent`s taken off the
+  window before Qt makes mouse events of them (pressure, tilt in radians, the eraser end
+  erases). The line drawn so far is previewed with the page renderer and stays until the
+  page has been drawn again with it.
+- Settings are written as `extraMetadata` strings, the enum names real documents have:
+  `LastTool`/`LastPen` (or `LastEraserTool`), `Last<Tool>Size`, `Last<Tool>Color`. Pen
+  colours Black, Gray, White, Blue, Red, Green, Yellow, Magenta ("Pink"), Cyan; the
+  highlighter's own HighlighterYellow/Green/Pink/Blue/Gray. Defaults: Ballpointv2, size 2,
+  Black; highlighter size 1, HighlighterYellow (as every cached document has). A settings-only
+  change uploads `.content` alone; whether the app also bumps `.metadata` lastModified then
+  is not traced.
+
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in
 the corpus is interpreted or understood (no unaccounted blocks). Full-library run: every

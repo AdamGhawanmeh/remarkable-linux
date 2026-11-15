@@ -9,6 +9,7 @@ order mirror the official sidebar (qml/client/Sidebar.qml):
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import threading
 import uuid
@@ -23,11 +24,11 @@ from typing import Callable
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
 from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageAdd,
-                        PageCopy, PageDelete, PageHistory, PageMove, Staged, StrokeAdd, StrokeDelete, StrokeErase,
-                        document_files, swapped)
+                        PageCopy, PageDelete, PageHistory, PageMove, Staged, StrokeAdd, StrokeChange, StrokeDelete,
+                        StrokeErase, StrokePart, ToolSettings, document_files, swapped)
 from core.sync import SyncClient, SyncError, sha256_hex
 from core.config import atomic_write_json, read_json
-from viewer import rm_writer
+from viewer import rm_stroke, rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
@@ -305,6 +306,16 @@ def start_page(doc: Document, page_count: int) -> int:
     if page_count <= 0:
         return 0
     return min(max(doc.metadata.last_opened_page, 0), page_count - 1)
+
+
+def _stroke_values(page: bytes | None) -> dict[tuple[int, int], str]:
+    """The live strokes of a page: id -> value (hex), as undo keeps them ({} for a page
+    the stroke engine cannot read whole: no undo step is kept then)."""
+    try:
+        return {s.item: s.line.encode().hex() for s in rm_stroke.strokes(page)}
+    except (RmParseError, ValueError) as err:
+        log.warning("strokes of a page not readable for undo: %s", err)
+        return {}
 
 
 class LibrarySource:
@@ -688,20 +699,52 @@ class LibrarySource:
 
     def add_stroke(self, doc: Document, page_id: str, line, now_ms: int) -> StrokeAdd:
         """Keep a stroke drawn on a page: `line` as the app would add it
-        (viewer.rm_stroke.draw). Refused, with nothing kept, on a document that may not
-        be edited and on a page the stroke engine does not draw on yet (one with typed
-        text). Not an undo step yet: the page's undo history starts over."""
-        doc = self._editable(doc, page_id)
-        edit = StrokeAdd.new(doc.id, page_id, line, now_ms)
-        self._add_edit(doc, edit)
+        (viewer.rm_stroke.draw), one action for undo (the app's AddItem). Refused, with
+        nothing kept, on a document that may not be edited and on a page the stroke
+        engine does not draw on yet (one with typed text)."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            edit = StrokeAdd.new(doc.id, page_id, line, now_ms)
+            self._add_edit(doc, edit)
+            done = self.staged(doc).replay(page_id)
+            item = done.made.get(edit.uid)
+            value = _stroke_values(done.page).get(item) if item is not None else None
+            if value is not None:
+                history.push([StrokeChange(remove=(StrokePart(("edit", edit.uid), value),))])
+            history.seen = self._seen(doc.id, page_id)
         return edit
 
-    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int) -> StrokeErase:
+    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int) -> StrokeErase | None:
         """Keep an eraser taken over a page: `eraser`, the eraser's own line
-        (viewer.rm_stroke.eraser_line). Refused like add_stroke."""
-        doc = self._editable(doc, page_id)
-        edit = StrokeErase.new(doc.id, page_id, eraser, now_ms)
-        self._add_edit(doc, edit)
+        (viewer.rm_stroke.eraser_line), one action for undo (the app's eraser action:
+        the strokes it deleted put back, the pieces it left taken away). None, with
+        nothing kept, when it touches no stroke. Refused like add_stroke."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            if before.page is None:
+                return None
+            try:
+                erased = rm_stroke.erase(before.page, author=self.sync.author(), eraser=eraser)
+            except (RmParseError, ValueError) as err:
+                raise EditError(f"the page cannot be erased on: {err}") from err
+            if not erased.deleted:
+                return None
+            edit = StrokeErase.new(doc.id, page_id, eraser, now_ms)
+            self._add_edit(doc, edit)
+            old = _stroke_values(before.page)
+            after = self.staged(doc).replay(page_id)
+            new = _stroke_values(after.page)
+            readd = tuple(StrokePart(before.ref(item), old[item]) for item in erased.deleted if item in old)
+            pieces = []
+            for n in range(len(erased.made)):
+                item = after.made.get(f"{edit.uid}/{n}")
+                if item in new:
+                    pieces.append(StrokePart(("edit", f"{edit.uid}/{n}"), new[item]))
+            history.push([StrokeChange(remove=tuple(pieces), readd=readd)])
+            history.seen = self._seen(doc.id, page_id)
         return edit
 
     def delete_strokes(self, doc: Document, page_id: str, items, now_ms: int) -> StrokeDelete:
@@ -710,6 +753,44 @@ class LibrarySource:
         doc = self._editable(doc, page_id)
         edit = StrokeDelete.new(doc.id, page_id, items, now_ms)
         self._add_edit(doc, edit)
+        return edit
+
+    # -- pen settings --
+
+    def tool_settings(self, doc: Document) -> dict[str, str]:
+        """The pen settings of a document (its .content "extraMetadata", with the
+        pending ToolSettings over it): {} when it has none or they cannot be read."""
+        synced = self.sync.tree.get(doc.id)
+        extra: dict = {}
+        if isinstance(synced, Document) and f"{doc.id}.content" in synced.files:
+            try:
+                content = json.loads(self.blob(synced, f"{doc.id}.content"))
+                extra = content.get("extraMetadata") if isinstance(content, dict) else {}
+            except (SyncError, OSError, ValueError) as err:
+                log.warning("cannot read the pen settings of %s: %s", doc.id, err)
+        out = {str(k): str(v) for k, v in (extra if isinstance(extra, dict) else {}).items()}
+        for edit in self.sync.edits.of(doc.id):
+            if isinstance(edit, ToolSettings):
+                out.update(edit.values)
+        return out
+
+    def set_tool_settings(self, doc: Document, values: dict[str, str], now_ms: int) -> ToolSettings | None:
+        """Keep new pen settings for a document (`values`: extraMetadata keys), merged
+        into its one pending ToolSettings. None when they change nothing."""
+        doc = self._editable(doc)
+        current = self.tool_settings(doc)
+        values = {str(k): str(v) for k, v in values.items()}
+        if all(current.get(k) == v for k, v in values.items()):
+            return None
+        old = [e for e in self.sync.edits.of(doc.id) if isinstance(e, ToolSettings)]
+        merged: dict[str, str] = {}
+        for edit in old:
+            merged.update(edit.values)
+        merged.update(values)
+        edit = ToolSettings.new(doc.id, merged, now_ms)
+        self.sync.edits.replace(old, edit)
+        with self._lock:
+            self._staged.clear()
         return edit
 
     def forget_history(self, doc_id: str) -> None:

@@ -1580,6 +1580,265 @@ class TypingTests(unittest.TestCase):
         self.text_mode(False)
 
 
+class PenTests(unittest.TestCase):
+    """Pens and the eraser through the app's own document view: the pen toolbar this
+    client puts beside it (bridge/pen.py) sets the tool, size and colour (kept in the
+    document's .content extraMetadata), the mouse or a stylus draws on the page through
+    PenSurface, and each stroke or eraser pass is kept as pending edits and is one
+    undo step (Ctrl+Z, and the platform's Redo key) of the page."""
+
+    setUpClass = classmethod(EditingTests.setUpClass.__func__)
+    tearDownClass = classmethod(EditingTests.tearDownClass.__func__)
+    setUp, tearDown, pending = EditingTests.setUp, EditingTests.tearDown, EditingTests.pending
+    wait_for, qml, scene_views = EditingTests.wait_for, EditingTests.qml, EditingTests.scene_views
+    close_document = EditingTests.close_document
+
+    def open_document(self, doc_id: str, page_id: str | None = None):
+        """EditingTests.open_document, then the app's editing tutorial (shown the first
+        time a notebook opens, over the whole window) closed, as its Done button does."""
+        view = EditingTests.open_document(self, doc_id, page_id)
+        onboarding = self.qml("OnboardingClientEdit_")
+        if onboarding.property("visible"):
+            QMetaObject.invokeMethod(onboarding, "navDone")
+            self.assertTrue(self.wait_for(lambda: not onboarding.property("visible")))
+        return view
+
+    def pens(self, view):
+        from ui.quick.bridge import pen
+        found = pen.tools_of(view.parentItem())
+        self.assertIsNotNone(found, "no pen tools for the viewport")
+        return found
+
+    def toolbar_item(self, view, name: str) -> QObject:
+        toolbar = self.pens(view).toolbar
+        self.assertIsNotNone(toolbar, "no pen toolbar")
+        todo = [toolbar]
+        while todo:
+            item = todo.pop()
+            if item.objectName() == name:
+                return item
+            todo.extend(item.childItems())
+        self.fail(f"no {name} in the pen toolbar")
+
+    def click(self, item) -> None:
+        """A left click in the middle of a toolbar item, through the window."""
+        from PySide6.QtTest import QTest
+        centre = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, centre)
+        wait(30)
+
+    def window_point(self, view, x: float, y: float) -> QPoint:
+        """Scene coordinates -> window coordinates."""
+        return view.mapToScene(view._tiles.to_view(QPointF(x, y))).toPoint()
+
+    def drag(self, view, points, modifiers=Qt.KeyboardModifier.NoModifier) -> None:
+        """A mouse drag through scene points, as the system delivers it."""
+        from PySide6.QtTest import QTest
+        at = [self.window_point(view, x, y) for x, y in points]
+        QTest.mousePress(self.window, Qt.MouseButton.LeftButton, modifiers, at[0])
+        for p in at[1:]:
+            QTest.mouseMove(self.window, p)
+            wait(5)
+        QTest.mouseRelease(self.window, Qt.MouseButton.LeftButton, modifiers, at[-1])
+        wait(30)
+
+    def keys(self, key, modifiers=Qt.KeyboardModifier.ControlModifier) -> None:
+        """A key press, as the system hands it to the (active) window: shortcuts first."""
+        from PySide6.QtTest import QTest
+        self.window.requestActivate()
+        QTest.keyClick(self.window, key, modifiers)
+        wait(30)
+
+    def redo_key(self) -> None:
+        """The first key the platform binds to Redo (the one the app's Shortcut takes)."""
+        from PySide6.QtGui import QKeySequence
+        combo = QKeySequence.keyBindings(QKeySequence.StandardKey.Redo)[0][0]
+        self.keys(combo.key(), combo.keyboardModifiers())
+
+    def strokes(self) -> list:
+        from viewer import rm_stroke
+        doc = self.source.sync.tree.get(self.THROWAWAY)
+        return rm_stroke.strokes(self.source.staged(doc).page(self.PAGE1))
+
+    def settings(self) -> dict:
+        return self.source.tool_settings(self.source.sync.tree.get(self.THROWAWAY))
+
+    def test_the_toolbar_shows_in_the_editable_notebook_only(self):
+        view = self.open_document(self.OTHER)
+        self.assertFalse(self.pens(view).tools.property("available"))
+        self.assertFalse(self.pens(view).toolbar.property("visible"))
+        self.close_document()
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        tools = self.pens(view).tools
+        self.assertTrue(self.wait_for(lambda: self.pens(view).toolbar.property("visible")))
+        self.assertEqual([t["key"] for t in tools.property("tools")],
+                         ["fineliner", "ballpoint", "marker", "pencil", "mechanical_pencil", "paintbrush",
+                          "highlighter", "calligraphy", "eraser"])
+        self.assertFalse(tools.property("active"))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_tool_size_and_colour_are_chosen_and_kept_with_the_document(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        tools = self.pens(view).tools
+        self.click(self.toolbar_item(view, "penTool_fineliner"))
+        self.assertTrue(tools.property("active"))
+        self.assertEqual(tools.property("tool"), "fineliner")
+        self.assertTrue(self.wait_for(lambda: self.toolbar_item(view, "penOptions").property("visible")))
+        self.click(self.toolbar_item(view, "penSize_3"))
+        self.click(self.toolbar_item(view, "penColor_blue"))
+        self.assertEqual((tools.property("size"), tools.property("color")), (3, "blue"))
+        self.assertEqual({k: v for k, v in self.settings().items() if "Fineliner" in k or k in ("LastTool", "LastPen")},
+                         {"LastTool": "Finelinerv2", "LastPen": "Finelinerv2", "LastFinelinerv2Size": "3",
+                          "LastFinelinerv2Color": "Blue"})
+        # One pending edit holds the settings; the upload sets them in .content and nothing else.
+        self.assertEqual([type(e).__name__ for e in self.pending()], ["ToolSettings"])
+        from core.edits import document_files
+        doc = self.source.sync.tree.get(self.THROWAWAY)
+        files = document_files(doc, self.pending(), lambda name: self.source.blob(doc, name), lambda e: b"",
+                               self.source.sync.author())
+        self.assertEqual(sorted(files), [f"{self.THROWAWAY}.content"])
+        extra = json.loads(files[f"{self.THROWAWAY}.content"])["extraMetadata"]
+        self.assertEqual((extra["LastTool"], extra["LastFinelinerv2Color"]), ("Finelinerv2", "Blue"))
+        # The highlighter has its own colours; the eraser none.
+        self.click(self.toolbar_item(view, "penTool_highlighter"))
+        self.assertEqual([c["key"] for c in tools.property("colors")], ["yellow", "green", "pink", "blue", "grey"])
+        self.assertEqual((tools.property("size"), tools.property("color")), (1, "yellow"))
+        self.click(self.toolbar_item(view, "penTool_eraser"))
+        self.assertEqual(tools.property("colors"), [])
+        self.assertEqual(self.settings()["LastEraserTool"], "Eraser")
+        # The tool in hand clicked again is put down; reopened, the document remembers.
+        self.click(self.toolbar_item(view, "penTool_eraser"))
+        self.assertFalse(tools.property("active"))
+        self.close_document()
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        tools = self.pens(view).tools
+        self.assertEqual(tools.property("tool"), "eraser")
+        tools.chooseTool("fineliner")
+        self.assertEqual((tools.property("size"), tools.property("color")), (3, "blue"))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_drawing_erasing_undo_and_redo(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        controller, tools = view._controller, self.pens(view).tools
+        files = dict(self.cloud.item(self.THROWAWAY))
+        before = self.strokes()
+        self.assertFalse(controller.property("undoAvailable"))
+        self.click(self.toolbar_item(view, "penTool_ballpoint"))
+        self.click(self.toolbar_item(view, "penColor_red"))
+        self.drag(view, [(-300.0 + 10 * n, 600.0 + 3 * n) for n in range(30)])
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 1), self.notices)
+        drawn = self.strokes()[-1]
+        from viewer import rm_stroke
+        from viewer.rm_parser import Color
+        self.assertEqual((drawn.line.tool, drawn.line.color, drawn.line.thickness_scale),
+                         (rm_stroke.BALLPOINT_V2, int(Color.RED), 2.0))
+        xs = [p.x for p in drawn.line.unpacked()]
+        self.assertAlmostEqual(min(xs), -300.0, delta=3)
+        self.assertAlmostEqual(max(xs), -10.0, delta=3)
+        # Shown at once, then drawn by the page itself.
+        self.assertTrue(self.wait_for(lambda: not self.pens(view).surface._previews))
+        self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))
+        # A second stroke, then the eraser across both.
+        self.drag(view, [(-300.0 + 10 * n, 700.0) for n in range(30)])
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 2), self.notices)
+        self.click(self.toolbar_item(view, "penTool_eraser"))
+        self.drag(view, [(-150.0, 550.0 + 10 * n) for n in range(25)])
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 4), self.notices)
+        self.assertEqual([type(e).__name__ for e in self.pending() if type(e).__name__ != "ToolSettings"],
+                         ["StrokeAdd", "StrokeAdd", "StrokeErase"])
+        erased = self.strokes()
+        # Ctrl+Z puts both strokes back whole; again, the second stroke goes.
+        self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))
+        self.keys(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 2), self.notices)
+        self.assertEqual(sorted(s.line.points for s in self.strokes()[-2:]),
+                         sorted([drawn.line.points, next(s.line.points for s in self.strokes()
+                                                         if s.line.points != drawn.line.points
+                                                         and s.item not in [b.item for b in before])]))
+        self.keys(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 1), self.notices)
+        # Redo twice (the platform's Redo key: Ctrl+Shift+Z on the desktop, Ctrl+Y offscreen):
+        # the stroke back, then the eraser's pieces again.
+        self.assertTrue(self.wait_for(lambda: controller.property("redoAvailable")))
+        self.redo_key()
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 2), self.notices)
+        self.redo_key()
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(erased)), self.notices)
+        self.assertEqual(sorted(s.line.points for s in self.strokes()), sorted(s.line.points for s in erased))
+        self.assertFalse(controller.property("redoAvailable"))
+        # Undo all the way: the page as the tablet left it; the tablet's stroke untouched.
+        for _ in range(3):
+            self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))
+            self.keys(Qt.Key.Key_Z)
+            wait(200)
+        self.assertTrue(self.wait_for(lambda: [s.line for s in self.strokes()] == [b.line for b in before]),
+                        self.notices)
+        self.assertEqual(dict(self.cloud.item(self.THROWAWAY)), files)        # nothing uploaded
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_a_stylus_draws_with_its_pressure(self):
+        from PySide6.QtGui import QPointingDevice, QTabletEvent
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        before = len(self.strokes())
+        self.pens(view).tools.chooseTool("fineliner")
+        device = QPointingDevice.primaryPointingDevice()
+
+        def send(kind, x, y, pressure, buttons):
+            at = QPointF(self.window_point(view, x, y))
+            event = QTabletEvent(kind, device, at, self.window.mapToGlobal(at), pressure, 10.0, -5.0, 0.0, 0.0, 0.0,
+                                 Qt.KeyboardModifier.NoModifier, Qt.MouseButton.LeftButton, buttons)
+            QApplication.sendEvent(self.window, event)
+        send(QTabletEvent.Type.TabletPress, 100.0, 900.0, 0.2, Qt.MouseButton.LeftButton)
+        for n in range(1, 10):
+            send(QTabletEvent.Type.TabletMove, 100.0 + 15 * n, 900.0, 0.2 + 0.08 * n, Qt.MouseButton.LeftButton)
+        send(QTabletEvent.Type.TabletRelease, 250.0, 900.0, 0.9, Qt.MouseButton.NoButton)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == before + 1), self.notices)
+        pressures = [p.pressure for p in self.strokes()[-1].line.unpacked()]
+        self.assertLess(pressures[0], pressures[-1])            # not the mouse's 0.7 throughout
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_a_page_with_typed_text_takes_no_strokes(self):
+        from test_rm_stroke_offline import page, root_text, stroke
+        doc = self.source.sync.tree.get(self.THROWAWAY)
+        self.cloud.put_item(self.THROWAWAY, doc.metadata.raw, json.loads(self.source.blob(doc, f"{self.THROWAWAY}.content")),
+                            {f"{self.THROWAWAY}/{self.PAGE1}.rm": page(stroke((1, 15)), extra=root_text([], []))})
+        self.source.refresh()
+        try:
+            view = self.open_document(self.THROWAWAY, self.PAGE1)
+            self.pens(view).tools.chooseTool("ballpoint")
+            self.drag(view, [(-300.0 + 10 * n, 600.0) for n in range(10)])
+            self.assertTrue(self.wait_for(lambda: self.notices))
+            self.assertIn("typed text", self.notices[-1])
+            self.assertEqual([type(e).__name__ for e in self.pending()], ["ToolSettings"])
+            self.assertFalse(self.document_view_text_mode())
+        finally:
+            self.close_document()
+            from test_edits_offline import drawn_page
+            self.cloud.put_item(self.THROWAWAY, doc.metadata.raw,
+                                json.loads(self.source.blob(doc, f"{self.THROWAWAY}.content")),
+                                {f"{self.THROWAWAY}/{self.PAGE1}.rm": drawn_page()})
+            self.source.refresh()
+
+    def document_view_text_mode(self) -> bool:
+        return bool(self.qml("DocumentView_").property("textMode"))
+
+    def test_choosing_a_pen_ends_text_mode_and_text_mode_puts_the_pen_down(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        tools = self.pens(view).tools
+        self.qml("DocumentView_").setProperty("textMode", True)
+        self.assertTrue(self.wait_for(lambda: view.text_session is not None), self.notices)
+        tools.chooseTool("marker")
+        self.assertTrue(self.wait_for(lambda: not self.document_view_text_mode()))
+        self.qml("DocumentView_").setProperty("selectionMode", True)
+        self.assertFalse(tools.property("active"))
+        self.qml("DocumentView_").setProperty("selectionMode", False)
+        tools.chooseTool("marker")
+        self.keys(Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+        self.assertFalse(tools.property("active"))
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+
 class FakeNetwork(QObject):
     """Stands in for QNetworkInformation (LinkProvider's `information`)."""
 

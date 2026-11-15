@@ -65,7 +65,8 @@ from viewer import rm_stroke
 from viewer.rm_parser import Color, Tool
 
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd, PageCopy, PageDelete,
-                    PageMove, PendingEdits, STROKE_EDITS, StrokeAdd, StrokeDelete, StrokeErase, TextEdit,
+                    PageMove, PendingEdits, STROKE_EDITS, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
+                    TextEdit, ToolSettings,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
@@ -442,6 +443,12 @@ def describe_edit(e) -> str:
         return f"  stroke on page {e.page_id}: {_pen(e)}, {len(points)} points\n    drawn over {where}"
     if isinstance(e, StrokeDelete):
         return f"  delete {len(e.items)} stroke{'s' if len(e.items) != 1 else ''} on page {e.page_id}"
+    if isinstance(e, StrokeRestore):
+        line = e.line()
+        return (f"  put back a stroke on page {e.page_id} (undo/redo): {_name(Tool, line.tool)}, "
+                f"{line.count} points")
+    if isinstance(e, ToolSettings):
+        return "  pen settings: " + ", ".join(f"{k} = {v}" for k, v in e.values)
     if isinstance(e, ImageDelete):
         return f"  delete image {e.key} on page {e.page_id}"
     if isinstance(e, ImageRestore):

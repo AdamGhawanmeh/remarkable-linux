@@ -24,8 +24,9 @@ Editing so far is images on notebook pages, where the library allows editing
 (selectImageAtPoint) then moved, resized, turned or deleted through the app's own
 SceneSelectionHandler (moveSelectedItems, scaleSelectedItems, rotateSelectedItems,
 deleteSelectedItems), with SelectionImage drawing the selected image while it is
-dragged. The other editing members (pens, text, conversion, copying) exist so the QML
-binds, and do nothing yet (generated.py).
+dragged. Pens and the eraser draw through bridge/pen.py, which hands each finished
+stroke or eraser pass to the view (pen_commit). The other editing members (conversion,
+stroke selection) exist so the QML binds, and do nothing yet (generated.py).
 
 Scene coordinates are the app's: tablet pixels at 226 DPI, x = 0 on the page's vertical
 centre line, y = 0 at its top (ui/pages.py uses x = 0 at the left edge). The tile
@@ -60,6 +61,7 @@ from ...library import pdf_name
 from ...pages import DocumentPages, PageContent, render_content
 from ...workers import EXPECTED_ERRORS, _Job, emit_from_worker
 from .generated import qml_class
+from . import pen as pen_bridge
 
 log = logging.getLogger("rm.ui.quick.scene")
 
@@ -142,6 +144,7 @@ def set_page_source(provider: Callable[[], object]) -> None:
     """Where SceneView and the page models load documents from (the app's LibrarySource)."""
     global _source
     _source = provider
+    pen_bridge.set_source(provider)
 
 
 _clipboard = None                       # the app's Clipboard singleton (pictures pasted from other programs)
@@ -161,6 +164,7 @@ def _js(value):
 def set_edit_notifier(notify: Callable[[str], None]) -> None:
     global _notify
     _notify = notify
+    pen_bridge.set_source(pen_bridge._source, notify)
 
 
 def forget_history(doc_id: str) -> None:
@@ -767,6 +771,8 @@ class _SceneView:
     _edited = Signal(object)
     _text_opened = Signal(object)
     _text_kept = Signal(object)
+    _pen_done = Signal(object)
+    penShown = Signal(int)          # the page is drawn with pen commit n (and those before it) on it
 
     def __init__(self, parent: QQuickItem | None = None) -> None:
         QQuickPaintedItem.__init__(self, parent)
@@ -811,6 +817,10 @@ class _SceneView:
         self._text_opened.connect(self._on_text_opened)
         self._text_kept.connect(self._on_text_kept)
         self.setFlag(QQuickItem.ItemAcceptsInputMethod, False)
+        # Pens: the last commit waiting for the page to load, and to be drawn.
+        self._pen_done.connect(self._on_pen_done)
+        self._pen_loading = 0
+        self._pen_rendering = 0
 
     # -- loading --
     def componentComplete(self) -> None:
@@ -819,12 +829,15 @@ class _SceneView:
         if inherited is not None:
             self._tiles.setFocalPoint(*inherited)
         self._load()
+        pen_bridge.attach(self)
 
     def _property_changed(self, name: str) -> None:
         if name in ("pageId", "document") and self.isComponentComplete():
             self._set_selected(None)
             self.stop_text()
             self._load()
+            if name == "document":
+                pen_bridge.attach(self)
         elif name == "textModeEnabled" and not self._get("textModeEnabled"):
             self.stop_text()
 
@@ -874,10 +887,13 @@ class _SceneView:
             self._set("pageStatus", PAGE_LOAD_ERROR)
             self._set("pageStatusDetails", str(error))
             self._set("status", 2)
+            self._pen_shown(self._pen_loading)
             return
         if self._pages is not None:
             self._pages.close()
         self._pages, self._content, self._bounds, self._page_id = pages, content, bounds, shown
+        if self._pen_loading:
+            self._pen_rendering, self._pen_loading = self._pen_loading, 0
         layers = content.scene.layers if content.scene is not None else []
         self._controller.set_page(frame, bounds, layers, links)
         # The layer edits go to: Layer 1, the one the app uses until another is chosen.
@@ -1134,6 +1150,76 @@ class _SceneView:
                 error = f"The image could not be deleted: {type(err).__name__}"
             emit_from_worker(self, lambda: self._edited.emit((error, None)))
         self._pool.start(_Job(job))
+
+    # -- pens --
+    def scene_point(self, pos: QPointF) -> QPointF:
+        """A point of this item -> scene coordinates."""
+        return self._tiles.to_scene(QPointF(pos))
+
+    def scene_to_view(self) -> QTransform:
+        c, sc, half = self._tiles._get("center"), self._tiles._get("scale"), self._tiles._view_half()
+        return QTransform().translate(half.x(), half.y()).scale(sc, sc).translate(-c.x(), -c.y())
+
+    def pen_scale(self) -> float:
+        """How many screen pixels a scene unit covers (the pen handler's scale)."""
+        return float(self._tiles._get("scale"))
+
+    def pen_refusal(self) -> str:
+        """Why nothing may be drawn on or erased from the page shown ("": it may)."""
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        if source is None or node is None:
+            return "No document is open"
+        refusal = source.edit_refusal(node)
+        if refusal:
+            return refusal
+        if self._content is None or not self._page_id:
+            return "The page is still loading"
+        if self._content.has_pdf_page:
+            return "Strokes can only be drawn on notebook pages"
+        if self._content.scene is not None and self._content.scene.text is not None:
+            return "This page has typed text: drawing and erasing on it is not supported on Linux yet"
+        return ""
+
+    def pen_commit(self, kind: str, line, seq: int) -> None:
+        """Keep a stroke drawn (`kind` "draw") or an eraser pass ("erase") on the page
+        shown, on the view's worker, then draw the page again; penShown(seq) once it is."""
+        source, node, page_id = _source(), getattr(self._get("document"), "node", None), self._page_id
+        if source is None or node is None or not page_id:
+            self._pen_shown(seq)
+            return
+        if self._selected is not None:
+            self._set_selected(None)
+            self._controller.selectionCleared.emit()
+        now_ms = _now_ms()
+
+        def job():
+            error, changed = None, True
+            try:
+                if kind == "erase":
+                    changed = source.erase_strokes(node, page_id, line, now_ms) is not None
+                else:
+                    source.add_stroke(node, page_id, line, now_ms)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:      # a stroke never takes the page view down with it
+                log.exception("keeping a stroke on page %s", page_id)
+                error = f"The stroke could not be kept: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._pen_done.emit((error, changed, seq)))
+        self._pool.start(_Job(job))
+
+    def _on_pen_done(self, result) -> None:
+        error, changed, seq = result
+        if error is not None:
+            _notify(error)
+        if not changed and error is None:
+            self._pen_shown(seq)
+            return
+        self._pen_loading = max(self._pen_loading, seq)
+        self._load(quiet=True)
+
+    def _pen_shown(self, seq: int) -> None:
+        if seq:
+            self.penShown.emit(int(seq))
 
     # -- undo and redo --
     def history_step(self, redo: bool) -> None:
@@ -1458,6 +1544,9 @@ class _SceneView:
             self._render_again = False
             self._render()
             return
+        if self._pen_rendering:
+            self._pen_shown(self._pen_rendering)
+            self._pen_rendering = 0
         wanted = self._tiles._get("scale") * self._dpr()
         capped = self._bounds.width() * self._bounds.height() * wanted * wanted > MAX_PIXELS
         if not capped and abs(self._image_scale - wanted) / wanted > 0.01:
