@@ -828,20 +828,115 @@ position as a QPointF (never stored).
   only the first part to erase the tablet's anchored strokes: compute the anchor position
   as above, test in scene coordinates, write the pieces into the same group.
 
-**Moving, scaling and rotating a selection** [O, binary only; not yet checked against the
-library's strokes that carry a moveId]. There is no transform on nodes: the commit
-(0x1409b48a0) works per node, deletes the selected items (0x1408c5910) and adds
-transformed copies as new items (0x1408c2bc0: next id, appended), under one undoable
-action; moveId is set to the replaced item when it was `0:0` (0x1408cbd60). In an anchored
-group the transform is conjugated with the translation by the group's anchor position
-(0x1408c3570), and the group is re-anchored afterwards (0x140975b10). A stroke is
-transformed by `Line::transform(QTransform)` (0x140b3d4d0; item wrapper 0x1405b67f0, which
-changes the timestamp only when given a non-zero one): nothing for an identity; s = 1 for
-a pure translation, else sqrt(|det|); thicknessScale × s; each point's x, y mapped and
-stored as float32; each width `roundf(width_u16 × 0.25 × s × 4)`; speed, direction and
-pressure unchanged. Not traced yet: how many id generations a gesture costs, the
-selection's live preview, stroke copy/paste, and the remaining areas of this survey
-(hold-to-snap shapes, PDF/EPUB annotation pages, sync upload and merge rules).
+**Moving, scaling and rotating a selection** [O; the stroke math checked on a real library:
+4,226 cached v6 pages, 31,999 live strokes with a moveId]. There is no transform on nodes; a
+moved stroke is a new item.
+
+- **Selecting** (0x1409b2ab0, per node: the layer and every group below it). The node
+  keeps the picked scene items (node+0x208, 0x1408cdb10); the selection keeps, per node, the
+  set of their ids and a **clone** of each. A clone (line item copy constructor
+  0x1405b5930) has the value, the timestamp and the sourceId of its original, and id,
+  parent and moveId `0:0`; the selection then stamps it `moveId = the original's moveId,
+  or the original's id when that is 0:0`. So a moveId always names the first item a stroke
+  ever was, however often it is moved.
+- **The gesture** changes nothing in the page. `moveSelectedItems`, `scaleSelectedItems`
+  and `rotateSelectedItems` multiply a pending QTransform held by the SceneController
+  (+0x2c8) and ask the scene only for the transformed bounds (0x1409b1e40, "previewing
+  selection transform": clones of the clones, thrown away). The QML calls each once, when
+  the drag is released; what moves under the pointer is a QML item.
+  `applyPendingEdit(layer)` (0x140438540) does nothing when the pending transform is the
+  identity; else it hands layer and transform to the scene and resets it. The desktop QML
+  calls it once, when the selection closes (`endItemSelection`): every move, scale and
+  rotation of one selection is **one** commit with the product of the transforms.
+  `cancelPendingEdit` only clears the selection (0x14094bcb0).
+- **The commit** (0x1409b48a0), per node holding selected items: **(1)** the live items
+  whose ids are in the set are deleted (0x1408c5910; the blocks stay, joined into runs);
+  **(2)** the clones are added (0x1408c2ae0 → 0x1408c2bc0: each the next id, appended);
+  **(3)** the node's transform (0x1408c3570) deletes what (2) added, transforms each clone
+  (item vtable +0x58 = 0x1405b67f0 with timestamp 0, so the timestamp stays) and adds it
+  again (next id, appended). In an anchored group the transform is conjugated with the
+  translation by the group's anchor position, and the group is re-anchored afterwards
+  (0x140975b10). All of it is one `SceneDeleteAppendItems` action
+  ("scene-delete-append-items-crdt", vtable 0x140d6dd70; undo puts the originals back,
+  redo the clones, both through 0x1408cbd60); when the action on top of the stack is
+  already this selection's (after a paste, selection+0x1d0), the two are merged into one
+  undo step (0x1408f3920).
+- **Ids used** (the calls of `++clock`, 0x1408e43e0, on this path): for n strokes **2n**
+  counter values: n for the untransformed clones of step (2), which step (3) leaves as
+  one run of n deleted ids, then n for the strokes that stay. Deleting takes no id, and
+  neither does the timestamp (not touched). On a page with typed text the re-anchoring
+  that follows takes its own (new groups, anchor stamps, above). Only a Shader's pieces cost more: before each of the two adds every distinct
+  sourceId among the items is replaced by a fresh id (0x1408cb8d0), one counter value per
+  distinct source each time. The previews of a gesture cost nothing.
+  Real pages (tablet-written, pages without text, 356 commits of 3 or more strokes whose
+  ids are consecutive, which 563 of 601 are): the n ids before the n live ones are a
+  deleted run in the cleanly readable cases (exactly n deleted ids before in 31, 2n in 30,
+  which is a paste and then a move, see below), and where the strokes moved were the last
+  ones drawn the page reads `originals (deleted) · n deleted · n live`. **Not explained
+  by this binary**: 33 of the 356 have no deleted id before them at all (13 of them none
+  after either), i.e. one generation of ids; the tablet build, or a tablet-only
+  operation, does that. A client that writes the single generation (delete the
+  originals, append the transformed strokes with moveId) writes a page the tablet itself
+  also writes; one that follows this binary to the letter writes n deleted line blocks
+  more.
+- **A stroke** is transformed by `Line::transform(QTransform)` (0x140b3d4d0): nothing for
+  an identity; s = 1 for a pure translation, else sqrt(|det|); thicknessScale × s; each
+  point's x, y mapped in double precision and stored as float32; each width
+  `roundf(width_u16 × 0.25 × s × 4)` in single precision; speed, direction and pressure
+  unchanged (direction is not turned by a rotation). Checked by finding the same stroke
+  in two places through its pressure sequence (8 or more points, 4 or more distinct
+  pressures; 10,852 strokes are in the library with more than one geometry) and fitting
+  the affine map between the two:
+
+  | Map between two copies | Pairs | thicknessScale ratio = sqrt(\|det\|) | Widths |
+  |---|---|---|---|
+  | translation | 12,950 | all (ratio exactly 1) | all 360,362 points equal |
+  | rotation (21 by multiples of 90°, 6 free) | 27 | all (unchanged) | all 1,043 points equal |
+  | scale with rotation, from an unscaled copy | 20 | all | `roundf(w × s)` on every point |
+  | both copies scaled (two steps from a third) | 5 | all | within 1 (rounded twice), 9 points further off |
+
+  Speed and direction are byte for byte the same in all 13,002 pairs (the 52 pairs where
+  they differ are not affine images of each other: other strokes with the same
+  pressures). Of them 366 pairs are an original and the item that names it as moveId,
+  from an older version or a copy of the page: all translations, timestamp `0:1` kept.
+  A source cannot be matched by id alone across pages: a copied page goes on counting
+  from the same clock, so the same id is another stroke there.
+  Without a second copy: every moved Fineliner stroke with thicknessScale 1, 2 or 3 has the
+  pen's own width (13,853 strokes), and the 276 scaled ones have `roundf(24 × T/3)` on
+  every point; moved Ballpoint strokes keep the pen's width rule within the usual
+  quarter unit (all 15,804), scaled ones in 1,882 of 2,071 (the rest were scaled more
+  than once). Every moveId names a deleted item of its own page (29,895 line blocks,
+  2,104 tombstone blocks), 27,324 times in the same node; never a live one.
+- **Copy** (`cloneSelectedItems(layer, scale)`, 0x14043a320): a clone of every selected
+  item of the layer and of the groups below it: id and parent `0:0`, **moveId `0:0`**
+  (the copy constructor never copies it), timestamp and sourceId kept. A clone from an
+  anchored group is translated by the group's anchor position, so clipboard items are in
+  scene coordinates and carry no anchor. Then all are transformed by
+  `scale × the pending transform` when that is not the identity (the QML passes the
+  view's `defaultScale`): a copy taken while a move is pending is the moved one. The
+  clones stay in `Clipboard.items`, in memory; cut is copy and `deleteSelectedItems`.
+- **Paste** (`cloneAddAndSelectItems(layer, items, scale, pos)`, 0x14043a060 → 0x1409af310):
+  the clipboard items are cloned again (id, parent, moveId `0:0`), transformed by the
+  scale when it is not 1 (the QML passes `1/defaultScale`, times page width / clip width
+  when the clip is wider than the page; thicknessScale and widths follow as above),
+  translated so that their box is centred on `pos`, and added to the **layer** node
+  (0x1408c2ae0): n new ids, appended, in clipboard order, moveId `0:0`, as one
+  `SceneDeleteAppendItems` action with nothing deleted. A distinct sourceId costs one more
+  id, as above. The anchoring manager is not asked here: on a page with typed text the
+  pasted strokes lie on the layer in scene coordinates until a commit re-anchors them.
+  The pasted items are then the selection (its clones named after them), so moving them
+  before the selection closes costs 2n more ids, leaves the n pasted ids deleted, and
+  gives the strokes that stay `moveId = the pasted item`, never the stroke copied.
+  Real pages: 1,425 times a page holds the same stroke twice or more, live (1,439 later
+  twins, always by the same author, timestamp `0:1`, another position, 1,406 in the same
+  node): 865 have moveId `0:0`, and the other 574 a moveId that is neither a twin nor a
+  twin's moveId, i.e. the deleted pasted item. 2,033 more strokes have a thicknessScale
+  that is not 1, 2 or 3 and no moveId (17 values such as 2.8358 and its half 1.4179, on 70
+  pages), which is what a paste with a scale leaves [I]; with a moveId there are 397.
+
+Not traced yet: the remaining areas of this survey (hold-to-snap shapes, PDF/EPUB annotation
+pages, sync upload and merge rules), `insertItemsAtCursorPosition` (paste in text mode),
+and which tablet operation writes a moved stroke with one generation of ids.
 
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in
