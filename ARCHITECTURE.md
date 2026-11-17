@@ -361,6 +361,7 @@ Conflicts:
   last sync" (error code `RootHashGenerationMismatch`), i.e. HTTP 412.
 - The client treats 409 the same way. It fetches the root again, re-applies the change
   and retries up to 3 times.
+- Per-file merging of `.rm`/`.content`/`.metadata` against newer server versions: §3.5.
 
 What the operations write:
 - **Delete:** removes the entry from the root index.
@@ -380,6 +381,150 @@ Safety:
   `integrationsUpdated`, `searchIndexUpdated`, `roomNotification`, `resetPasscode*`. Ping/pong keepalive.
 - `POST /convert/v1/handwriting` — `application/vnd.myscript.jiix`.
 - Screen-share broker: see §4.
+
+### 3.5 Sync merge: three-way file resolution and conflict resolvers
+
+This section covers what happens when local edits meet newer `.rm`, `.content` or
+`.metadata` versions on the server. The 412/409 retry in §3.3 only protects the root
+hash. This is the per-file merge under it.
+
+Traced in reMarkable.exe 3.29 [O unless marked]. Sources:
+- `xofm/libs/sync/core/src/resolve-tree-helper.cpp`
+- `state-action/check-downloads.cpp`
+- `xochitl/src/crdtconflictresolver.cpp`
+- `entryfile/src/entrytag_merge.cpp`
+- `xofm/libs/syncinterface`
+
+The Ghidra decompilation was done on demand (headless, `-noanalysis`). Function bounds
+come from `.pdata`. Strings were tied to code by a rip-relative displacement scan.
+
+**Per-file state.** Each file of an entry is a node in the sync tree. A node holds four
+optional SHA-256 hashes plus marker bits:
+- `final` at +0x00;
+- `server` at +0x40;
+- `local` at +0x80;
+- `previous` at +0xC0, the hash at the last completed sync.
+
+The order comes from the log line `final={}, server={}, local={}, previous={}`. "Absent"
+is a flag at +0x20 of each hash (0x1401eb670).
+
+**Resolution per file** (`compare`, 0x1402b9dc0). The rules below are tried in order and
+the first one that applies wins. Values: 0 all gone, 1 Local (upload), 2 Server
+(download), 3 Either, 4 RemoveLocal, 5 RemoveServer, 6 Conflict.
+
+| # | Function | Applies when | Result |
+|---|---|---|---|
+| 1 | 0x1402b7d30 | `.metadata`, `.content` or `.rm`; local and server both present and exactly one is the empty-file hash `e3b0c442…b855` | The non-empty side wins: Local if the server copy is empty, Server if the local copy is empty. Marker 0x400 is set |
+| 2 | 0x1402b7ce0 | Server present and marker 0x2000 | Server |
+| 3 | 0x1402b7f10 | Server, local and previous all present, no marker 0x1000 | server = local → Either; server = previous → **Local**; local = previous → **Server**; otherwise **Conflict** |
+| 4 | 0x1402b8000 | Server and local present (no previous, or marker 0x1000) | Equal → Either, else Conflict |
+| 5 | 0x1402b8070 | Local absent; server and previous present | server = previous → RemoveServer (deleted here). Otherwise Server: the remote edit beats the local delete |
+| 6 | 0x1402b8120 | Server absent; local and previous present | local = previous → RemoveLocal (deleted on the server). Otherwise Local: the local edit beats the remote delete |
+| 7 | — | Only server → Server; only local → Local; neither → all gone | |
+
+**Applying the resolution** (0x1402b9100):
+- Local: `final` = local, marker 1 (upload).
+- Server: `final` = server, marker 2 (download).
+- Either: `final` = local.
+- RemoveLocal: marker 4.
+- RemoveServer: marker 8. For `.metadata` the tombstone is checked first ("Deleting {} without a tombstone {}").
+- **Conflict**: `final` = server, markers 0x22 (download + conflict). The local file is
+  not touched. The server copy is stored next to it under a conflict name. The suffix
+  table holds `.remote`, and the open-document path accepts only `<pageId>.rm.remote`
+  (below), so the name is `<file>.remote` [I].
+
+**Page resources.** These are files whose id has two `/`, i.e. `<doc>/<page>/<file>`.
+They then pass through `adjustResourceResolution` (0x1402b7930):
+- Conflict → Server ("marked as conflict, indicating a corrupt file, re-download from server").
+- Local while a server copy exists → Server.
+- Server while a local copy exists → Local.
+- A resource under no page of the document → RemoveLocal.
+
+**Entry-level rules.** These are log strings in the same file:
+- An entry that was deleted here without a tombstone marker is un-deleted (rule 0x1402b7780 turns RemoveServer into Server).
+- "local version {} != server version {}. Force upload": an optional int per entry node. When the two differ, the entry is uploaded.
+- A local remove where not all files are gone uploads instead.
+- A document left with only its `.metadata` because of a conflict is removed.
+
+**Conflicts become a `Choice`** (`onEntryUpdate`, 0x140135fe0). This runs for each
+conflicting path of an entry that is not a `Document`, or whose document lock can be
+taken (try-lock 0x1406621e0). Open documents handle their own conflicts (see below).
+1. A `SyncConflict` is built: `{choice, entry id, ours = local path, theirs = conflict path}`.
+   **`choice` starts as `Theirs`** (`mov [rbp+0x10], 2` at 0x1401362b6).
+2. The kind comes from the path suffix (0x140132750): `.rm` Rm, `.json` JSON,
+   `.content` Content, `.metadata` Metadata, `.pagedata` Pagedata, otherwise Undefined.
+3. The resolver registered for that kind is called (map built at 0x1400a0be0). Enum names
+   come from the magic_enum tables at 0x141001110 and 0x141001160:
+   `Choice {None, Ours, Theirs, MergedOurs}`,
+   `Kind {Undefined, JSON, Rm, Content, Metadata, Pagedata}`.
+   Resolvers exist only for Rm, Content and Metadata. Pagedata and JSON keep `Theirs`.
+4. `processSyncConflict` (0x1401390d0, "Resolved choice={} for {} in {}") applies the
+   choice. If the theirs file is missing it aborts.
+   - None: logged ("Got a resolved conflict without a resolution"); both files stay.
+   - Ours: the theirs file is deleted.
+   - Theirs: ours is deleted, theirs is moved onto it, and its mtime is set to now.
+   - MergedOurs: the theirs file is deleted (the merge is already in ours).
+
+   Ours and MergedOurs leave local ≠ server, so the next pass uploads the file
+   (rule 3: Local).
+
+**Resolvers:**
+
+- **`.metadata`** (0x140131b90). It acts only when the incoming choice is `Ours`. With
+  the default `Theirs` it logs "Keep choice {} for {}" and returns `Theirs`. So
+  **in 3.29 a `.metadata` conflict always ends with the server's copy.**
+  The `Ours` branch (not reachable from the caller above):
+  1. Both files are read (≤ 10 MiB) and parsed. On a parse error the incoming choice is kept.
+  2. If either `lastModified` lies outside [1.5e12 ms (2017-07-14), now + 1 day], the incoming choice is kept ("Fallback since modfied is not valid").
+  3. Ours is kept if ours ≥ now − 50 days, or if theirs − ours < 1 day.
+  4. Otherwise the result is `Theirs` ("Changing resolution from {} to {}, our modified: {} their modified: {}").
+- **`.content`** (0x1401007e0 → 0x140101db0, "Resolving content conflict for {}"):
+  1. Both files must parse as JSON objects; otherwise the incoming choice is kept.
+  2. Each file is converted to formatVersion 2 if needed (0x140100cf0, "Converted our/their .content to v2"). If one cannot be converted: "Only version 2 is supported for crdt resolution", and the incoming choice is kept.
+  3. `matchContentsAgainstFS` (0x140101a70) runs. A PDF/EPUB on either side skips it.
+     Otherwise each page map is checked against the files in `<doc>/` (0x140101000:
+     "{} references page {} which does not exist in {}"; the exact page set it requires
+     is not fully decoded):
+     - only ours matches → `Ours`;
+     - only theirs matches → `Theirs`;
+     - neither matches → `None` ("Neither pagemap matches the file system");
+     - both match → merge.
+  4. **Merge:**
+     - Both `cPages` go through one `PageMap` (0x1406d04e0 twice). Registers merge per
+       register: the newer timestamp wins (§5.4).
+     - All other keys come from ours if the incoming choice is `Ours`, otherwise from
+       theirs. With the default, that means the server copy.
+     - `tags` and `pageTags` are merged when either side has them (0x14085f080 and
+       0x14085f100, `entrytag_merge.cpp`, "found newer tag in other (add)").
+     - The result is written over ours and the resolver returns **`MergedOurs`**. A
+       failed write keeps the incoming choice.
+- **`.rm`** (0x1400ff950):
+  1. Both files must be v6 ("File versions {} and {}, fallback to {} for {}" otherwise; the incoming choice is kept).
+  2. Each file is parsed (0x140a06fe0 → 0x140a02290) into a summary that holds a `CrdtId`
+     (counter: low 48 bits, author: high 16).
+  3. The two are compared (0x140a263e0). Ours ahead → `Ours`; theirs ahead → `Theirs`.
+     On equal counters a check on the author index decides (0x140a26050, via
+     0x140a977d0). An identical id, or an empty side, gives `None`.
+  4. So a closed document does **not** merge strokes: one whole file wins. That the id is
+     the scene's highest id (its clock) is an inference [I].
+  5. With `None`, the `.rm.remote` file stays for the open-document path.
+
+**Open documents** (`Document::processConflictingPathsAndUpdateState`, 0x140663c70):
+- Only `<pageId>.rm.remote` paths are accepted ("missing conflict extension",
+  "missing rm extension", "bad pageId").
+- If the document is archived, the conflict file is deleted.
+- Otherwise `DocumentWorker::doResolveConflict` (0x14055ec20) loads the `.remote` file into
+  the page's live scene (0x1405a6bc0; "Error during load of {} {}, version: {}"). It then
+  stores the page and deletes the conflict file ("Unable to remove conflict file {}").
+- This is the CRDT merge: both files' items end up in one scene. The second PageStats
+  block that is read counts as a merge (§5.5). 16 cached pages have `merges` > 0.
+  That this loader is the same one as 0x140a02fb0 is inferred from that counter [I].
+
+**This client** never creates conflict files. Pending edits are operations (core/edits.py).
+`commit` (core/sync.py) refetches the root on every attempt and replays the operations onto
+the server's current `.rm`/`.content`/`.metadata`. That yields what the app's open-document
+CRDT merge would. For `.metadata` it keeps the server's other fields, as the app's default
+`Theirs` does.
 
 ## 4. LiveView / Screen Share
 
@@ -1165,6 +1310,129 @@ PDF / EPUB-backed):
   (182 of 4151 sideways, 55 downwards: scrolled or zoomed pages), so a reader must not
   clip either kind. EPUB pages behave like PDF pages: the `.pdf` rendition is the
   background.
+
+### 5.5 Saving edits: `.metadata`, page `modifed` and PageStats
+
+Traced in reMarkable.exe 3.29 [O unless marked]:
+- `entryfile/src/metadatafile.cpp`;
+- `Entry`/`Document` setters;
+- `DocumentWorker`;
+- the scene writer 0x140a094e0 and the scene loader 0x140a02fb0.
+
+Checked read-only on the cache: 524 `.metadata`, 4,253 v6 pages, and 214 documents with
+both `.content` and `.metadata` in one index. 30 `.metadata` names and 13 `.rm` names have
+more than one cached version.
+
+**`.metadata` keys.** The reader is 0x14084cf70, the writer 0x14084d720. Key strings are
+at 0x140d53a60–0x140d53ab8; `convertLegacyFailed`, `lastOpened` and `lastOpenedPage` are
+`QStringView`s at 0x140d539c8.
+
+| Key | Field | Form | Read | Written |
+|---|---|---|---|---|
+| `type` | +0x60 | `"DocumentType"`, `"CollectionType"`, … (`Entry::Type {Invalid, Document, Collection, Template}`) | always | always |
+| `lastModified` | +0x18 | decimal ms **string** (`QString::number`) | always (`toLongLong`) | always |
+| `visibleName` | +0x30 | string | always | always |
+| `createdTime` | +0x20 | decimal ms string | always | always |
+| `pinned` | +0x28 | bool | always | always |
+| `parent` | +0x48 | string (`""`, `"trash"`, UUID) | always | always |
+| `new` | +0x64 | bool | always | always |
+| `source` | +0x68 | string | always | always |
+| `convertLegacyFailed` | +0x80 | bool | if `true` | documents, only when set |
+| `lastOpened` | +0x88 | decimal ms string | if present, **else = `lastModified`** (0x14084cef0) | documents only |
+| `lastOpenedPage` | +0x90 | int | if present | documents only |
+
+- The writer starts from the whole object it read (kept at +0x10), so unknown keys pass
+  through verbatim. That covers the legacy `deleted`, `metadatamodified`, `modified`,
+  `synced` and `version`, found on 90 of 524 cached files. **3.29 never writes or bumps
+  `version`.**
+- Collections (2) and templates (3) stop after `source`: they get no `lastOpened` or
+  `lastOpenedPage`. 46 of the 47 cached `CollectionType` files have neither. The one
+  that has them also carries the legacy keys from an older writer. All 477 cached
+  `DocumentType` files have both.
+- Every setter (0x14084d460 `lastModified`, 0x14084d480 `lastOpened`, 0x14084d4a0
+  `lastOpenedPage`, 0x14084d4c0 `parent`, 0x14084d520 `pinned`, 0x14084d5d0
+  `visibleName`, 0x14084d5a0 `type`) compares the value first. It sets the file's dirty
+  byte (+8) only when the value changes.
+
+**Who moves which timestamp.** `Entry::setLastModified` (0x1406840c0) logs
+"Setting lastModified of {} to {}" and emits `lastModifiedChanged` (Entry signal 11).
+Every caller passes `QDateTime::currentMSecsSinceEpoch()`.
+
+| Action | Code | `lastModified` | Other |
+|---|---|---|---|
+| Rename | 0x1406843c0 | now (if the name changed) | `visibleNameChanged` |
+| Move / trash / restore | 0x140684270 | now (if `parent` changed) | `parentIdChanged` |
+| Pin / unpin | 0x1406842c0 | now (if changed) | `isPinnedChanged` |
+| Add / remove one tag | 0x140681650 / 0x1406819e0 | now | `entryTagsChanged` |
+| setTags / setPageTags | 0x140683f80 / 0x140668730 | now | §5.4 tags |
+| **Page saved** (`DocumentWorker::linesStored(page, pageId, size)` → slot 0x1406606b0) | | now | then that page's cPages **`modifed` = now** (a second clock read, 0x140876eb0; "Unknown page id {} when setting modified time"); then the upload timer (below) |
+| Page operations (5 functor bodies 0x140645430, 0x140645570, 0x140655170, 0x140655990, 0x140659cb0; not named one by one) | | now | the same page's `modifed` = now, upload timer |
+| **Page turn** (`Document::setCurrentPage`, 0x140667db0) | | **now** (unconditional once the page differs; asm 0x140667e2a–0x140667e3b) | The index is clamped to [0, pageCount − 1]. It does nothing if `lastOpenedPage` (and, for formatVersion 2, the cPages `lastOpened` register) already match. Otherwise: cPages `lastOpened` = page id, with timestamp = the document clock's next tick (0x140876db0); `lastOpenedPage` = index; `lastOpenedPageChanged` |
+| Opened / created (0x140669d40; called from `createDocument` 0x1404dd3b0 and a queued functor) | | unchanged | `lastOpened` = now, `lastOpenedChanged` |
+| Other callers (0x1404e0c10, 0x14065aff0, 0x140697340) | | now | not identified |
+
+Corpus check:
+- 117 of the 214 documents have a page `modifed` later than `lastModified`. The smallest
+  gaps are 1–5 ms, which fits the two clock reads in `linesStored`: `lastModified` is read
+  first, `modifed` second. 97 have `lastModified` ≥ every `modifed` (a later rename, move,
+  tag or page turn).
+- 87 cached `.metadata` versions, across 20 documents, differ from a sibling version
+  only in `lastOpened` and/or `lastOpenedPage`. Their `lastModified`, name, parent and
+  pin are the same (up to 19 versions of one notebook). The
+  client that wrote those (tablet firmware or another app; the cache cannot tell) does
+  **not** bump `lastModified` on a page turn. Desktop 3.29 does.
+- This client's `SyncClient` (core/sync.py, "Reading is not editing") follows the
+  observed files, not 3.29: a deliberate deviation.
+
+**Upload after a save** [O; interval I].
+- The `linesStored` slot calls 0x140683ab0 unless entry+0x51 is set or entry+0x2cf is
+  clear (flags not named).
+- 0x140683ab0 creates the entry's `Timer` "entryUploadTimer" once (`xofm/libs/timer`), logs
+  "Starting upload timer for {}" and starts it. Its timeout is wired in 0x14067f8b0.
+- The timer is built with interval argument 0, so it fires on the next event-loop pass and
+  coalesces saves that land before it [I].
+- The upload then follows §3.3 (blobs, docSchema, root, `PUT /sync/v3/root`).
+
+**PageStats, block 0x0A.** The scene writer 0x140a094e0 emits blocks in this order:
+authors 0x09, MigrationInfo 0x00, **PageStats 0x0A** (header 0x140a78ca0(…, 10, 1, 0)),
+SceneInfo 0x0D. PageStats is written as tagged u32 fields:
+
+| Field | Scene offset | Written |
+|---|---|---|
+| 1 `loads` | +0xc8 | **value + 1** |
+| 2 `merges` | +0xcc | as is |
+| 3 `textChars` | +0xd0 | as is |
+| 4 `textLines` | +0xd4 | as is |
+| 5 `keyboardCount` | +0xd8 | as is |
+| tail | +0xe0..+0xe8 | unknown bytes, verbatim |
+
+The writer does not store `loads + 1` back into the scene. So every save of one loaded
+scene writes the same number: `loads` counts load→save generations, not saves.
+
+The loader (0x140a02fb0, `case 10`):
+
+```
+if scene.loads == 0:  read PageStats (0x1409ee790: fields 1–5, each optional) into the scene
+else:                 scene.merges += 1        # this file's own counters are dropped
+```
+
+So the first file loaded into a scene sets the counters. Every further PageStats block
+merged into the same scene (a conflict `.rm.remote`, §3.5) adds one to `merges`. A brand
+new page has `loads` 0 and is written with 1 (`rm_writer.blank_page` already writes
+1, 0, 0, 0, 0).
+
+Corpus check:
+- All 4,253 pages have exactly fields 1–5 and no tail.
+- `loads`: 1 on 3,134 pages, 2 on 718, 3 on 214, …, 14 at most. It is never 0.
+- `merges`: 0 on 4,237 pages, 1 on 8, 2 on 8.
+- Across the 13 multi-version `.rm` names, `loads` never falls. It rises by 1 or more
+  per version (1→3, 2→4→5). Equal pairs (1, 1 and 2, 2) exist: two saves from one
+  loaded scene, as the rule predicts.
+
+**Deviations in this client.** `rm_text.edit_text` updates `textChars` and `textLines`.
+The stroke and image writers leave `loads` as it was. The app would write `loads + 1` in
+the first save after loading the page. To match it, add 1 once per page per editing
+session (one replay of a page's pending edits onto its base), not once per stroke.
 
 ## 6. Implications for the Linux client
 
