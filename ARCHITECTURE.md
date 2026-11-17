@@ -986,6 +986,7 @@ form boxes and checkmarks on their checkboxes. Fit-to-page and fit-width (1872 p
 placements visibly miss. `226.0` appears in the binary, used by the template renderer.
 Page mapping: `cPages.pages[].redir.value` is the PDF page; pages without `redir` were
 inserted on the tablet (no background). EPUBs carry a `.pdf` rendition used the same way.
+The full page-map spec, and how PDF/EPUB pages differ from notebook pages, is in §5.4.
 
 **Not 1:1** (needs decompilation; no engine was configured for REA): pencil and brush
 textures (the app rasterises these itself: `renderPencil`, `renderPaintBrush_v2`, ...),
@@ -1035,6 +1036,135 @@ render into a fractional rectangle shifted part of the page by a pixel.
 
 The public `rmscene` (Python) project documents the v6 block layout and is the
 practical reference for a Linux parser; the strings above are consistent with it.
+
+### 5.4 Page maps: notebooks vs PDF/EPUB (`.content` and `.rm`)
+
+A notebook, a PDF and an EPUB are stored the same way: one `.content` page list and one
+`.rm` v6 file per page, named after the page UUID (`<doc>/<page-uuid>.rm`). A PDF or EPUB
+adds the original file and a PDF rendition (`<doc>.pdf`; for an EPUB the `.epub` too), and
+each page that shows a PDF page says which one. Nothing in the `.rm` file says
+"this is a PDF page", apart from one SceneInfo field described below.
+
+Traced in reMarkable.exe 3.29 (`xochitl/src/entry/src/contentmetadata.cpp`,
+`xochitl/src/entryfile/src/pagemap.cpp`) [O]. Checked on the cached library (343
+documents: 230 notebooks, 108 PDFs, 5 EPUBs; counts only, read-only).
+
+**`.content` keys** [O]. The parser (0x1406ce210) reads its key names from a table of
+`QStringView {len, ptr}` entries at 0x140d25ea8–0x140d26068. Besides the keys listed in
+§5 it also knows `lockedByPassword`, `viewBackgroundFilter` and `keyboardMetadata`.
+`dummyDocument` (13 real PDFs/EPUBs, always `false`) is not in the table: the app does not
+read it.
+
+**formatVersion 2: `cPages`** (all 230 notebooks, 48 PDFs, 2 EPUBs). The writer is
+0x140877e60, the reader 0x140872fb0. Key table at 0x140d540f8.
+
+| Key | Form | Notebook | PDF / EPUB |
+|---|---|---|---|
+| `uuids` | `[{"first": "<author UUID>", "second": <index>}]`: the authors behind the `A` of every `"A:C"` timestamp | 1–4 authors | 1–3 authors |
+| `original` | LWW int `{timestamp, value}`: page count of the PDF rendition | `-1` (230/230) | PDF page count (all 50; equal to the cached rendition's count on every cached one) |
+| `lastOpened` | LWW string: page UUID | a page id (`""` in 4) | a page id |
+| `pages[]` | `id` (UUID string), `idx` (LWW sort key), optional LWW `template`, `redir`, `deleted`, `verticalScroll`, `scrollTime`, plain `modifed` (sic, decimal ms string) | never `redir` (0 of 4677) | `redir` on PDF-backed pages (1489 of 1556 PDF entries, 118 of 118 EPUB entries) |
+
+- A page entry is written by 0x140877a70. `id` and `idx` are always written. Each other
+  register is written only once its timestamp counter is non-zero. So a page with no
+  `redir` key never had one set: notebook pages, and pages inserted into a PDF (they have
+  no background). `modifed` is written when its flag is set. Unknown page keys are kept
+  verbatim (the reader 0x1408722f0 logs `Unknown page json key={}` and stores them for the
+  writer). A bad `idx` is logged (`Page {} has invalid index {}`) and replaced.
+- Merging is per register: the newer timestamp wins (0x140a985b0). The file lists the live
+  pages in `idx` order first (0x140871430), then the deleted ones (0x140871390). This is
+  why `pages[]` is not in `idx` order in 30 notebooks and 4 PDFs: those files have deleted
+  pages. `deleted.value` is 1 (146 entries), or 0 for a page deleted and then put back (1).
+- `redir.value` is the 0-based page of `<doc>.pdf`. On every PDF/EPUB the live `redir`
+  values cover exactly 0…`original`−1. They do not have to be unique or increasing: in two
+  PDFs every PDF page is listed 2–3 times, because copied pages keep their `redir`
+  (`core/clone.py` and `edits.PageCopy` do the same). `pageCount` is a cached count: one of
+  those two says 10 with 15 live pages. The live `cPages` entries are what counts.
+- Pages inserted into a PDF (in 15 of 48 PDFs) carry ordinary templates (`Blank` 48,
+  `P Lines small` 5, `P Grid bottom` 4, `Perspective2` 1). PDF-backed pages say `Blank`
+  (1471) or have no template (18).
+- `coverPageNumber`: `-1` on every notebook. On PDFs it is `0` (first page) in 99, `-1` in 9.
+  On EPUBs it is `-1` in 4, `0` in 1.
+
+**formatVersion 1: `pages` + `redirectionPageMap` + `originalPageCount`** (60 PDFs, 3
+EPUBs; no notebook). `pages` is an array of page UUID strings. `redirectionPageMap[i]` is
+the PDF page of `pages[i]`, `-1` for an inserted page. On real data every map has the same
+length as `pages`, equals 0…n−1 and has no `-1`; `originalPageCount` equals n. Two PDFs
+have `"pages": null`, no map, `originalPageCount` 0 and `pageCount` 0. They were uploaded
+without a page list; the client names their pages `pdf-page-<n>`
+(`ui.library.unlisted_page_id`).
+
+The app upgrades version 1 when it loads a document (`fillContentFromDocument`,
+0x1406cd640). The cloud copy stays version 1 until the document is written again:
+1. The current format is 2 (0x1406cdad0). `formatVersion` is read by 0x1406cefc0
+   (missing: caller's default; < 1: 1). If it is already 2, nothing happens.
+2. The page ids come from `pages` (0x1406cf820). The map is used only if **both**
+   `redirectionPageMap` and `originalPageCount` are present (0x1406cf100).
+3. Reading the map (0x1406cf9f0): `originalPageCount` < 1 → warning *"Redirection map,
+   but original page count is invalid"*, map dropped. Any value < −1 or ≥
+   `originalPageCount` → *"Invalid page found in redirection map {} at {} - rejecting"*,
+   **whole map** dropped.
+4. `PageMap::initializePages` (0x140871670; log *"Initialize pages pagemap={}
+   templates={} redirection={}, originalPageCount={} isUsingRedirectionMap={}"*) builds
+   one entry per id. The template is the i-th template given (the `.pagedata` lines), else
+   the default template. `redir` is `map[i]` when the map has as many entries as `pages`;
+   otherwise it is `i` (*"Inconsistent pagemap vs redirection map count"*). With no usable
+   map it is −1, i.e. no `redir` register [I: not traced into the entry constructor
+   0x14086f560; consistent with the writer]. `original` is set to `originalPageCount`
+   when > 0.
+5. `cPages` is written, `formatVersion` becomes 2 and `pageCount` the number of pages.
+   `originalPageCount`, `redirectionPageMap` and `pages` are removed.
+
+*Client deviation (edge cases only, not changed):* `core.models.Content.parse` takes
+`redirectionPageMap[i]` per page, or no background past the map's end. The app uses `i` for
+every page when the lengths differ, and drops every background when one value is out of
+range. No real file reaches either case (all 61 maps are valid identity maps).
+
+**`.rm` v6 on PDF/EPUB pages** [O on real data]. A page only has a `.rm` once something was
+put on it: 87 of 2325 live PDF-backed pages, 53 of 58 inserted pages, 1 of 125 EPUB pages,
+4209 of 4540 notebook pages. Compared by page kind (notebook / PDF-backed / inserted into a
+PDF / EPUB-backed):
+- **Blocks: no difference.** The same block types with the same min/version: 0x00 1/1,
+  0x01 1/1, 0x02 1/2, 0x04 1/1, 0x05 2/2, 0x07 1/1, 0x08 1/1, 0x09 1/1, 0x0A 0/1, 0x0D 0/1,
+  0x0E 3/3, 0x0F 2/2. The same leading order (authors, 0x00, PageStats, SceneInfo,
+  [images table], tree…). Block 0x00 is `{1: 1:1, 2: 1, 3: 0}` on every PDF/EPUB page and
+  on all but 8 notebook pages. Text (0x07) and images (0x0E/0x0F) occur on both kinds.
+- **SceneInfo (0x0D)** is read by 0x1409ef220. Its defaults come from the page loader
+  (0x140a02fb0, `case 0xd`): current layer 0:0, two flags true, a null `QRectF`,
+  `QSize(1404, 1872)`. On disk:
+
+  | Field | Content | Notebook | PDF-backed |
+  |---|---|---|---|
+  | 1 | current layer (LWW id) | ✓ | ✓ |
+  | 2, 3 | LWW bools (background visible, root text visible [I: SceneController `backgroundVisible`, `isRootDocumentVisible`]) | ✓ | ✓ |
+  | 5 | paper size, 2 × u32 | 1404 × 1872 (all) | **1404 × 1872 (all)** |
+  | 6 | LWW `QRectF` (4 × f64: x, y, w, h) | **0,0,0,0** (3034/3034) | **non-zero** (41/41 that have it) |
+  | 7 | 2 × f64 | 1404.0 × 1872.0 | 1404.0 × 1872.0 |
+  | 8 | LWW 2 × f64 | 1404.0 × 1872.0 | 1404.0 × 1872.0 |
+  | 9 | LWW u8 (preferred text layout [I]) | 1 / 3 | 1 / 3 |
+
+  The paper size does **not** become the PDF's size: an A4 page still says 1404 × 1872.
+  Field 6 is the one difference. On PDF pages it is a square centred on x = 0, stamped
+  `1:14` or `1:15` (once `1:23`) when the tablet first made the page:
+  (−1717, −468, 3434, 3433) on US Letter (1921 × 2486 px),
+  (−1764, −468, 3528, 3528) on 1869 × 2580, (−1796, −468, 3592, 3591) on A4 portrait,
+  (−1796, −858, 3592, 3592) on A4 landscape, (−2075, −866, 4150, 4150) on 3199 × 2408,
+  and (−7710, −468, 15420, 15420) / (−8609, −468, 17218, 17217) on 1397 × 14420 / 16209
+  tall single-page PDFs. Its side is the PDF page's longer side + ~950 px. It looks like the scene
+  area the PDF page opens up (`SceneController.sceneExteriorBoundary`/`paperPortraitBounds`
+  are candidates) [?: name and exact formula not traced]. Pages inserted into a PDF carry
+  zeros, like notebooks. 46 PDF pages and the one annotated EPUB page have no field 6 at all (older writers), so
+  it is optional. The client only writes SceneInfo when it creates a page (`rm_writer.blank_page`:
+  zeros); it never rewrites an existing one.
+- **Coordinates: same system, wider extent.** x is centred on the page (0 = middle),
+  y = 0 at the top, in screen pixels. The PDF page fills [−W/2, W/2] × [0, H] with W, H =
+  PDF size × 226/72 (§5.2). On the 46 annotated pages whose PDF is cached, 25 have ink
+  beyond ±702 (the 1404 px screen) and 16 below y = 1872. None goes below the PDF's bottom.
+  6 reach slightly past its side or top edge (≤ 8 % of W/2, margin scribbles). So the
+  bounds follow the PDF page, not 1404 × 1872. Notebook pages also go past 1404 × 1872
+  (182 of 4151 sideways, 55 downwards: scrolled or zoomed pages), so a reader must not
+  clip either kind. EPUB pages behave like PDF pages: the `.pdf` rendition is the
+  background.
 
 ## 6. Implications for the Linux client
 
