@@ -1079,9 +1079,92 @@ moved stroke is a new item.
   that is not 1, 2 or 3 and no moveId (17 values such as 2.8358 and its half 1.4179, on 70
   pages), which is what a paste with a scale leaves [I]; with a moveId there are 397.
 
-Not traced yet: the remaining areas of this survey (hold-to-snap shapes, PDF/EPUB annotation
-pages, sync upload and merge rules), `insertItemsAtCursorPosition` (paste in text mode),
-and which tablet operation writes a moved stroke with one generation of ids.
+**Straight lines and shapes ("hold at end of stroke")** [O; checked on the cached library,
+5,901 files]. There is no hold timer, movement threshold or shape recogniser in
+`PenInputLineHandler` or anywhere else in reMarkable.exe. The handler (vtable 0x140e8a3d8)
+only builds the line, and RDP (0x140b3ede0) is the simplifier described above. The
+exe has the *finishing* half of the feature: `sceneview::ShapesOverlay` (QML type
+`ShapesOverlay`, moc 0x140c7bed0, log category `rm.shapesoverlay`, source
+`xofm/libs/sceneview/src/shapesoverlay.cpp`). Its caller decides when a hold has happened and
+what shape was drawn, and that caller is not in this build: the desktop QML never creates
+a pen surface (see "Pen input"), and the build has no `addEllipse` import that could make
+an ellipse outline. Strings in the build: the gesture cheat sheet's
+"Hold at end of stroke to fix the shape. Drag and rotate it to adjust", the "Enable shapes"
+button (`EnableShapesButton`), and `Settings.shapeSnapEnabled` (key `ShapeSnapEnabled`).
+`PenInputHandler::timeSincePenUp()` (qint64) is the only timing hook it gives QML. The hold
+time and the stillness tolerance therefore belong to the tablet's QML and cannot be read
+from this binary.
+`SceneController::highlightWithLine(line, LineSnapMode)` (`SnapDisabled` 0 / `SnapEnabled` 1)
+is a different feature: highlighter snapped to text (`snapHighlighterToText`).
+
+- **Interface.** The interface is `updateImage(QVariantMap gestureData, QPointF end,
+  QTransform transform, QTransform invTransform)` (0x140462fa0), then `lastLine()`
+  (0x140462400: the result, kept at +0x38), `reset(transform)` and `saveStroke(folder)`
+  (dumps `%1*.line`, debug). Map keys: `line` (the stroke as drawn, a `Line`; fewer than 3
+  points: "Insufficient points in line", nothing made), `type` (`ShapeGeometry::Type`:
+  Unknown 0, **Line 1**, **Triangle 2**, **Rectangle 3**, **Ellipse 4**, **Quad 5**; 0 logs
+  "Invalid shape type"), and for types 2–5 `path` (QPainterPath, the recognised outline
+  in scene units), `bounds` (QRectF) and `rotation` (double, degrees, default 0). `end` is
+  the pen's current position on screen, mapped to the scene with `invTransform`. (0, 0)
+  stands for the line's last point (before the drag starts). scale = sqrt(|det transform|).
+- **Line** (type 1, 0x140461c10 → 0x14046be20). The result is a copy of the drawn line
+  (tool, colour, ARGB, thicknessScale, startingLength, timestamp as drawn): the same number
+  of points, each keeping its own speed, width, direction and pressure bytes. Only x and y
+  change. A = the first point, B = `end`, tol = min(|AB| / 3, 10) / scale. A and B are
+  each rounded to whole scene units (CRT `round`, half away from zero). The line is made
+  **horizontal** (B.y := A.y) when |B.y − A.y| < tol, and **vertical** (B.x := A.x) when
+  |B.x − A.x| < tol. Otherwise the line keeps its slope, with no 15°/45° steps. Point i goes
+  to `A + (B − A) · sᵢ/s_total`, s = arc length along the drawn points (first 0, last 1),
+  computed in double and stored as float32. Then the bounding rect is reset.
+- **Triangle, rectangle, ellipse, quad** (0x140461d80 → 0x14046a740). An empty path keeps
+  the drawn line as it is. Otherwise a new line with the drawn line's tool, colour, ARGB
+  and thicknessScale is built:
+  1. Dragging and rotating: c = centre of `bounds`, L = the drawn line's last point. The
+     scale is s = |c→end| / max(|c→L|, 1). The added angle is Δ = `QLineF(c, end).angleTo(QLineF(c, L))`
+     in radians. The rotation r + Δ (r = `rotation`) is reduced mod 2π and **snapped to the
+     nearest multiple of 45° when within 2° of it** (0x14046d220; the 45° and 2° are static
+     locals). T = translate(c)·rotate(snapped)·scale(s)·translate(−c). T₀ is the same with
+     rotation r and scale 1.
+  2. Outline points: `path.toFillPolygon()`. Every edge (wrapping round) longer than 20
+     is split into ceil(len/20) equal parts (0x14046d600 / 0x14046d9a0). This gives
+     polygon P, whose last point repeats the first (a closed stroke).
+  3. Attributes: the tail of the drawn line whose length just exceeds `path.length()` is
+     taken (walking back from its last point; that is the part that drew the shape). Each
+     output point j is T(Pⱼ), stored as float32. Its speed, width, direction and pressure
+     bytes are copied **unchanged** from the tail point nearest T₀(Pⱼ) (the shape before
+     the drag).
+- **What the page gets.** The result is an ordinary 0x05 CrdtLineItem: `u8 3`, tool,
+  colour, thicknessScale, startingLength 0, the 14-byte points
+  (`f32 x, f32 y, u16 speed×4, u16 width×4, u8 direction, u8 pressure`, all four copied as
+  stored, nothing recomputed for the new geometry), timestamp `0:1`, no moveId, ARGB only
+  for colour 9. No field marks a stroke as a shape. It then goes through the same RDP
+  thinning and `addLine` as any stroke [I: the tablet QML that hands `lastLine()` over is
+  not in this build]. That is why it looks different per tool: the Fineliner's RDP ignores
+  pressure, so a straight Fineliner line comes out as **2 points**. The Ballpoint's
+  pressure and width test keeps the line's pressure profile along it.
+- **Real pages.** On real pages, 2,667 live, never-moved strokes are exactly straight and
+  have whole-unit end points. All of them have startingLength 0 and timestamp `0:1`. Every
+  inner point lies on the segment, in order, matching the float32 lerp of the end points
+  (0 misses). They are Fineliner 1,729, Ballpoint 891, Marker 47; 1,735 have 2 points
+  (1,729 of them Fineliner). Of them, 1,319 are vertical, 658 horizontal and 690
+  slanted; no slanted one has a step within the tolerance (the smallest is 2 units on a
+  5.4-long line). Of the 932 longer lines, 896 vary in both pressure and width along the line,
+  as the drawn samples would. 147 strokes are closed (last point = first). Shapes:
+  38 five-point polygons (rectangles and quads after RDP; the four-sided ones' first edge
+  sits on a multiple of 45° in 28 of 38; the others are 2.08° or more off, plus one at
+  0.14°, which is a path recognised slightly off-axis with no rotation added). Circles of
+  101 points, 3.6° apart, all edges equal (a 100-gon path) or 65 after Fineliner thinning. A
+  Ballpoint polygon's edges are multiples of 20.226 (= L/ceil(L/20)) and 21.22.
+
+**Client deviation**: the client has no hold-to-straighten or shapes yet. To add them, a
+client would have to supply what the tablet supplies here: the hold detection (time
+and stillness, unknown) and the shape path for types 2–5 (unknown recogniser; the
+ellipse is a 100-gon). The line case needs neither and could follow the rules above
+exactly.
+
+Not traced yet: sync upload rules, `insertItemsAtCursorPosition` (paste in text mode),
+which tablet operation writes a moved stroke with one generation of ids, and the tablet-side
+hold detection and shape recogniser that drive `ShapesOverlay`.
 
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
 A real highlighter stroke uses ArgbCode with `0xffffed75`. Every block type present in
