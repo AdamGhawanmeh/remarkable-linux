@@ -161,14 +161,16 @@ def rotated(vertices, ox: float, oy: float, degrees: float) -> list:
 # plain record QML can hold and hand back: where its picture is, its corners (scaled as
 # the app's are), and the two timestamps a pasted copy keeps.
 
-def clip_image(doc_id: str, page_id: str, image, scale: float) -> dict:
+def clip_image(doc_id: str, page_id: str, image, scale: float, vertices=None) -> dict:
     """The clipboard record of a placed image, as cloneSelectedItems(layer, scale) makes
-    a clone: no id, no moveId, its corners scaled by `scale` (about 0, 0)."""
+    a clone: no id, no moveId, its corners (`vertices`, default its own) scaled by
+    `scale` (about 0, 0)."""
     value = image.value
     from viewer import rm_writer
     decoded = rm_writer.decode_image_value(value)
+    corners = image.vertices if vertices is None else vertices
     return {"type": "image", "documentId": doc_id, "pageId": page_id, "fileName": image.file_name,
-            "vertices": [[x * scale, y * scale, u, v] for x, y, u, v in image.vertices],
+            "vertices": [[x * scale, y * scale, u, v] for x, y, u, v in corners],
             "boundsTimestamp": list(decoded.bounds_timestamp), "refTimestamp": list(decoded.ref_timestamp)}
 
 
@@ -192,10 +194,46 @@ def clip_images(items) -> list[dict]:
     return out
 
 
+def clip_line(line) -> dict:
+    """The clipboard record of a stroke's clone (rm_select.clone: no moveId, in scene
+    coordinates): its value, whole."""
+    return {"type": "line", "value": line.encode().hex()}
+
+
+def clip_lines(items) -> list:
+    """The stroke values among clipboard items (as QML hands them back), checked."""
+    from viewer import rm_stroke
+    out = []
+    for item in items or []:
+        item = dict(item) if hasattr(item, "keys") else None
+        if not item or item.get("type") != "line":
+            continue
+        try:
+            out.append(rm_stroke.decode_line_value(bytes.fromhex(str(item["value"]))))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 def items_bounds(items) -> tuple[float, float, float, float] | None:
-    """(x, y, width, height) around clipboard items (getItemBoundingRect)."""
-    corners = [c for item in clip_images(items) for c in item["vertices"]]
-    return corner_bounds(corners) if corners else None
+    """(x, y, width, height) around clipboard items (getItemBoundingRect): the strokes'
+    boxes (Line::boundingRect) and the images' corners."""
+    from viewer import rm_select
+    box = rm_select.union([rm_select.line_box(line) for line in clip_lines(items)]
+                          + [rm_select.corners_box(item["vertices"]) for item in clip_images(items)])
+    return (box[0], box[1], box[2] - box[0], box[3] - box[1]) if box else None
+
+
+def placed_items(lines, images, scale: float, center: tuple[float, float]) -> list:
+    """Clipboard strokes and images as cloneAddAndSelectItems places them all together
+    (rm_select.pasted: scaled unless the scale is 1, the box around all of them centred
+    on `center`): [("line", value) ...] then [("image", (record, corners)) ...]."""
+    from viewer import rm_select, rm_writer
+    shapes = [rm_writer.ImageValue(b"", (0, 0), (0, 0), list(item["vertices"])) for item in images]
+    placed = rm_select.pasted(list(lines) + shapes, scale, center)
+    out = [("line", value) for value in placed[:len(lines)]]
+    out += [("image", (item, [tuple(v) for v in value.vertices])) for item, value in zip(images, placed[len(lines):])]
+    return out
 
 
 def paste_position(items, scene_bounds: tuple[float, float, float, float], pos: tuple[float, float],

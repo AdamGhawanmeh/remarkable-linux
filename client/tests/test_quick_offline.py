@@ -1147,7 +1147,7 @@ class EditingTests(unittest.TestCase):
         # It is selected (drawn in the selection box): once the selection ends, the page has it.
         self.assertTrue(self.wait_for(lambda: self.handler().property("visible")))
         QMetaObject.invokeMethod(self.qml("DocumentViewport"), "endItemSelection")
-        self.assertTrue(self.wait_for(lambda: view._selected is None))
+        self.assertTrue(self.wait_for(lambda: view._sel is None))
 
         def red_where_dropped() -> bool:
             image, spot = view._image, view._tiles.sceneToView(target)
@@ -1168,7 +1168,7 @@ class EditingTests(unittest.TestCase):
                     and o.metaObject().indexOfProperty("sceneSelectionRect") >= 0)
 
     def test_a_dropped_image_is_selected_then_moves_resizes_and_deletes(self):
-        from core.edits import ImageDelete, ImageInsert, ImageTransform
+        from core.edits import ImageDelete, ImageInsert, ItemsTransform
         view = self.open_document(self.THROWAWAY, self.PAGE1)
         viewport = self.qml("DocumentViewport")
         point = QPointF(view.width() / 2, 300)
@@ -1183,24 +1183,31 @@ class EditingTests(unittest.TestCase):
         self.assertAlmostEqual(rect.x(), min(xs), places=2)
         self.assertEqual((rect.width(), rect.height()), (200, 100))
         self.assertTrue(view._controller.property("selectionContainsImage"))
-        self.assertTrue(self.wait_for(lambda: view.selected_image() is not None))
-        # Dragging the box moves the image (SceneSelectionHandler.moveSelectedItems).
+        self.assertFalse(view._controller.property("selectionContainsStroke"))
+        self.assertTrue(self.wait_for(lambda: view.selection_preview() is not None))
+        # Dragging the box moves the selection (SceneSelectionHandler.moveSelectedItems):
+        # the pending transform only, as in the app; the page is not changed yet.
         QMetaObject.invokeMethod(handler, "moveSelectedItems", Q_ARG("QVariant", 30), Q_ARG("QVariant", 40))
-        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2))
-        move = self.pending()[1]
-        self.assertIsInstance(move, ImageTransform)
-        self.assertEqual(move.key, insert.key)
-        self.assertEqual(move.vertices[0][:2], (insert.vertices[0][0] + 30, insert.vertices[0][1] + 40))
         self.assertTrue(self.wait_for(lambda: handler.property("sceneSelectionRect").x() == rect.x() + 30))
+        self.assertEqual(view._controller.property("pendingEdit").dx(), 30)
         # A corner handle scales about the opposite corner.
         view._controller.scaleSelectedItems(view._controller.property("currentLayer"),
                                             QPointF(min(xs) + 30, rect.y() + 40), 2.0, 2.0)
-        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 3))
         self.assertTrue(self.wait_for(lambda: handler.property("sceneSelectionRect").width() == 400))
-        # Clicking elsewhere ends the selection; clicking the image selects it again.
+        self.assertEqual(len(self.pending()), 1)
+        # Clicking elsewhere ends the selection: every move and scale is one edit then.
         QMetaObject.invokeMethod(viewport, "endItemSelection")
         self.assertTrue(self.wait_for(lambda: not handler.property("visible")))
-        self.assertIsNone(view._selected)
+        self.assertIsNone(view._sel)
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2))
+        self.assertIsInstance(self.pending()[1], ItemsTransform)
+        self.assertTrue(self.wait_for(lambda: view._content.scene is not None
+                                      and view._content.scene.placed_images
+                                      and view._content.scene.placed_images[0].vertices[0][:2]
+                                      == (insert.vertices[0][0] + 30, insert.vertices[0][1] + 40)))
+        image = view._content.scene.placed_images[0]
+        self.assertEqual(image.vertices[2][0] - image.vertices[0][0], 400)
+        # Clicking the image selects it again.
         inside = QPointF(min(xs) + 30 + 50, rect.y() + 40 + 50)
         self.assertTrue(view._controller.selectImageAtPoint(inside, view._controller.property("currentLayer")))
         viewport.setProperty("selectionMode", True)
@@ -1212,7 +1219,7 @@ class EditingTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: not handler.property("visible")))
         self.assertTrue(self.wait_for(lambda: view._content.scene is not None
                                       and len(view._content.scene.placed_images) == 0))
-        self.assertEqual([type(e) for e in self.pending()], [ImageInsert, ImageTransform, ImageTransform, ImageDelete])
+        self.assertEqual([type(e) for e in self.pending()], [ImageInsert, ItemsTransform, ImageDelete])
         self.assertEqual(self.notices, [])
         self.assertEqual(real_warnings(self.app.warnings), [])
 
@@ -1291,7 +1298,8 @@ class EditingTests(unittest.TestCase):
                           max(v[1] for v in e.vertices) - min(v[1] for v in e.vertices))
         for got, want in zip(size(pasted), size(original)):
             self.assertAlmostEqual(got, want, places=6)
-        self.assertTrue(self.wait_for(lambda: view._selected == bytes.fromhex(pasted.key)))
+        self.assertTrue(self.wait_for(lambda: view._sel is not None
+                                      and view._sel.image_keys() == [bytes.fromhex(pasted.key)]))
         self.assertTrue(self.wait_for(lambda: len(view._content.scene.placed_images) == 2))
         self.assertEqual(real_warnings(self.app.warnings), [])
 
@@ -1980,6 +1988,144 @@ class FakeNetwork(QObject):
     def set(self, reachability) -> None:
         self._reachability = reachability
         self.reachabilityChanged.emit(reachability)
+
+
+class SelectionTests(unittest.TestCase):
+    """Strokes selected, moved, copied and pasted through the app's own DocumentViewport
+    and SceneSelectionHandler: the selection tool's rectangle (addSelectionRect), the
+    box's drag (a pending transform, committed once when the selection closes), its
+    Copy / Paste actions, and this client's lasso (the pen toolbar)."""
+
+    setUpClass = classmethod(EditingTests.setUpClass.__func__)
+    tearDownClass = classmethod(EditingTests.tearDownClass.__func__)
+    setUp, tearDown, pending = EditingTests.setUp, EditingTests.tearDown, EditingTests.pending
+    wait_for, qml, scene_views = EditingTests.wait_for, EditingTests.qml, EditingTests.scene_views
+    close_document, handler, action = EditingTests.close_document, EditingTests.handler, EditingTests.action
+    open_document, pens = PenTests.open_document, PenTests.pens
+
+    def strokes(self, view):
+        scene = view._content.scene if view._content is not None else None
+        return [s for s in scene.strokes] if scene is not None else []
+
+    def draw_two(self, view):
+        from viewer import rm_stroke
+        self.source.add_stroke(view._get("document").node, self.PAGE1,
+                               rm_stroke.draw([(200 + 9 * k, 500 + 4 * k) for k in range(10)], rm_stroke.FINELINER_V2),
+                               1_760_000_000_000)
+        view._load(quiet=True)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes(view)) == 2))
+
+    def focus(self):
+        self.window.requestActivate()
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "forceActiveFocus")
+
+    def test_a_rectangle_selects_strokes_the_box_moves_them_and_closing_commits_once(self):
+        from core.edits import ItemsTransform
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
+        self.draw_two(view)
+        viewport, handler, controller = self.qml("DocumentViewport"), self.handler(), view._controller
+        self.qml("DocumentView").setProperty("selectionMode", True)
+        before = {s.item_id: s.points[0] for s in self.strokes(view)}
+        # While the rectangle is dragged, the strokes it would take are outlined.
+        self.assertEqual(len(controller.getLineBoundingRectsToBeSelected(QRect(-1000, -1000, 3000, 3000))), 2)
+        controller.addSelectionRect(QRect(-1000, -1000, 3000, 3000), 0)          # InitalSelection
+        self.assertTrue(self.wait_for(lambda: handler.property("visible")), self.notices)
+        self.assertEqual(controller.property("selectionItemCount"), 2)
+        self.assertTrue(controller.property("selectionContainsStroke"))
+        self.assertEqual(len(controller.getLineBoundingRectsToBeSelected()), 2)
+        rect = handler.property("sceneSelectionRect")
+        # Shift takes one out again, and back in.
+        tablet = next(i for i in before if i == (1, 15))
+        p = before[tablet]
+        controller.addSelectionRect(QRect(round(p.x) - 1, round(p.y) - 1, 3, 3), 1)  # ToggleSelection
+        self.assertTrue(self.wait_for(lambda: controller.property("selectionItemCount") == 1))
+        controller.addSelectionRect(QRect(round(p.x) - 1, round(p.y) - 1, 3, 3), 1)
+        self.assertTrue(self.wait_for(lambda: controller.property("selectionItemCount") == 2))
+        # Dragging and turning change only the pending transform and the box.
+        QMetaObject.invokeMethod(handler, "moveSelectedItems", Q_ARG("QVariant", 30), Q_ARG("QVariant", 40))
+        self.assertTrue(self.wait_for(lambda: abs(handler.property("sceneSelectionRect").x() - rect.x() - 30) < 1))
+        controller.rotateSelectedItems(0, QPointF(0, 0), 0.0)
+        self.assertEqual(self.pending()[1:], [])
+        # Escape (exitEditMode -> endItemSelection) commits it as one edit.
+        self.focus()
+        QMetaObject.invokeMethod(self.qml("DocumentView"), "exitEditMode")
+        self.assertTrue(self.wait_for(lambda: not handler.property("visible")))
+        self.assertTrue(self.wait_for(lambda: isinstance(self.pending()[-1], ItemsTransform)), self.notices)
+        self.assertEqual(len(self.pending()), 2)
+        self.assertTrue(self.wait_for(lambda: sorted((s.points[0].x, s.points[0].y) for s in self.strokes(view))
+                                      == sorted((q.x + 30, q.y + 40) for q in before.values())))
+        self.assertTrue(all(s.move_id is not None for s in self.strokes(view)))
+        # One undo puts both back.
+        self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))
+        controller.undo()
+        self.assertTrue(self.wait_for(lambda: sorted((s.points[0].x, s.points[0].y) for s in self.strokes(view))
+                                      == sorted((q.x, q.y) for q in before.values())))
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_copy_paste_selects_the_copy_and_a_move_before_closing_is_the_same_undo_step(self):
+        from core.edits import ItemsTransform, StrokePaste
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
+        viewport, handler, controller = self.qml("DocumentViewport"), self.handler(), view._controller
+        self.qml("DocumentView").setProperty("selectionMode", True)
+        controller.addSelectionRect(QRect(-1000, -1000, 3000, 3000), 0)
+        self.assertTrue(self.wait_for(lambda: handler.property("visible")), self.notices)
+        self.focus()
+        copy, paste = self.action("Copy"), self.action("Paste")
+        self.assertTrue(self.wait_for(lambda: copy.property("enabled")))
+        QMetaObject.invokeMethod(copy, "trigger")
+        clipboard = self.app.singletons.clipboard
+        self.assertTrue(self.wait_for(lambda: clipboard.property("hasItems")))
+        self.assertTrue(self.wait_for(lambda: paste.property("enabled")))
+        QMetaObject.invokeMethod(paste, "trigger")
+        self.assertTrue(self.wait_for(lambda: any(isinstance(e, StrokePaste) for e in self.pending())), self.notices)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes(view)) == 2))
+        pasted = next(s for s in self.strokes(view) if s.item_id != (1, 15))
+        self.assertIsNone(pasted.move_id)
+        # The copy is selected; moving it before the selection closes...
+        self.assertTrue(self.wait_for(lambda: view._sel is not None and view._sel.items == [pasted.item_id]))
+        self.assertTrue(self.wait_for(lambda: handler.property("visible")))
+        controller.moveSelectedItems(0, QPointF(0, 120))
+        QMetaObject.invokeMethod(viewport, "endItemSelection")
+        self.assertTrue(self.wait_for(lambda: isinstance(self.pending()[-1], ItemsTransform)), self.notices)
+        self.assertTrue(self.wait_for(lambda: any(s.move_id == pasted.item_id for s in self.strokes(view))))
+        # ...is one undo step with the paste.
+        self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))
+        controller.undo()
+        self.assertTrue(self.wait_for(lambda: [s.item_id for s in self.strokes(view)] == [(1, 15)]))
+        self.assertTrue(self.wait_for(lambda: not controller.property("undoAvailable")))
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_the_lasso_selects_what_lies_wholly_inside_and_turns_selection_mode_on(self):
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
+        self.draw_two(view)
+        tools = self.pens(view).tools
+        tools.chooseLasso()
+        self.assertTrue(tools.property("active") and tools.property("lasso"))
+        mine = next(s for s in self.strokes(view) if s.item_id != (1, 15))
+        xs, ys = [p.x for p in mine.points], [p.y for p in mine.points]
+        around = [(min(xs) - 20, min(ys) - 20), (max(xs) + 20, min(ys) - 20), (max(xs) + 20, max(ys) + 20),
+                  (min(xs) - 20, max(ys) + 20)]
+        surface = self.pens(view).surface
+        to_item = lambda x, y: surface.mapFromItem(view, view._tiles.sceneToView(QPointF(x, y)))   # noqa: E731
+        self.assertTrue(surface.begin(to_item(*around[0]), (), False, False))
+        for x, y in around[1:] + around[:1]:
+            surface.add(to_item(x, y))
+        surface._end()
+        self.assertTrue(self.wait_for(lambda: self.handler().property("visible")), self.notices)
+        self.assertEqual(view._sel.items, [mine.item_id])
+        self.assertTrue(self.qml("DocumentView").property("selectionMode"))
+        self.assertFalse(tools.property("active"))
+        # Delete (the handler's shortcut and the app's action) takes it away.
+        view._controller.deleteSelectedItems(0)
+        QMetaObject.invokeMethod(self.qml("DocumentViewport"), "endItemSelection")
+        self.assertTrue(self.wait_for(lambda: [s.item_id for s in self.strokes(view)] == [(1, 15)]))
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
 
 
 class SyncCheckTests(unittest.TestCase):

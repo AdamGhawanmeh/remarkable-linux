@@ -54,6 +54,7 @@ from ... import pen as pens
 
 log = logging.getLogger("rm.ui.quick.pen")
 
+LASSO_COLOR = QColor("#3f86ff")  # the selection blue (Colors.selectionToolBlue)
 STILL_MS = 25                   # PenInputSurface's timer: a held mouse adds a sample this often
 TOOLBAR_Z = 50
 SURFACE_Z = 1000
@@ -85,6 +86,8 @@ class PenTools(QObject):
     changed = Signal()
     activeChanged = Signal()
     availableChanged = Signal()
+    lassoChanged = Signal()
+    lassoSelected = Signal()        # a lasso took something: the toolbar turns selection mode on
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -93,6 +96,7 @@ class PenTools(QObject):
         self._node = None                   # the document shown
         self._settings: dict[str, str] = {}
         self._tool = pens.DEFAULT_TOOL
+        self._lasso = False                 # the lasso in hand instead of a pen
 
     # -- the document --
     def set_document(self, node) -> None:
@@ -144,7 +148,13 @@ class PenTools(QObject):
             self._active = value
             self.activeChanged.emit()
 
+    def _set_lasso(self, value: bool) -> None:
+        if bool(value) != self._lasso:
+            self._lasso = bool(value)
+            self.lassoChanged.emit()
+
     active = Property(bool, _get_active, _set_active, notify=activeChanged)
+    lasso = Property(bool, lambda self: self._lasso, notify=lassoChanged)
     available = Property(bool, lambda self: self._available, notify=availableChanged)
     tool = Property(str, lambda self: self._tool.key, notify=changed)
     toolLabel = Property(str, lambda self: self._tool.label, notify=changed)
@@ -166,9 +176,10 @@ class PenTools(QObject):
         tool = pens.BY_KEY.get(str(key))
         if tool is None or not self._available:
             return
-        if tool is self._tool and self._active:
+        if tool is self._tool and self._active and not self._lasso:
             self._set_active(False)
             return
+        self._set_lasso(False)
         changed = tool is not self._tool
         self._tool = tool
         self._set_active(True)
@@ -190,8 +201,21 @@ class PenTools(QObject):
             self._keep(values)
 
     @Slot()
+    def chooseLasso(self) -> None:
+        """The lasso button: a freehand lasso selects what lies wholly inside it (the
+        tablet's selection tool, viewer.rm_select.Lasso); in hand again puts it down."""
+        if not self._available:
+            return
+        if self._lasso and self._active:
+            self.deactivate()
+            return
+        self._set_lasso(True)
+        self._set_active(True)
+
+    @Slot()
     def deactivate(self) -> None:
         self._set_active(False)
+        self._set_lasso(False)
 
 
 # -- the drawing surface --------------------------------------------------------------
@@ -200,12 +224,12 @@ class _Drawing:
     """A stroke or an eraser pass under way: its samples (scene coordinates) and, for
     a pen, the points the tool makes of them so far."""
 
-    def __init__(self, pen: pens.Pen, eraser: bool, scale: float, stylus: bool) -> None:
-        self.pen, self.eraser, self.scale, self.stylus = pen, eraser, scale, stylus
+    def __init__(self, pen: pens.Pen, eraser: bool, scale: float, stylus: bool, lasso: bool = False) -> None:
+        self.pen, self.eraser, self.scale, self.stylus, self.lasso = pen, eraser, scale, stylus, lasso
         self.size = pen.size
         self.samples: list[tuple] = []
-        self.builder = None if eraser else s.StrokeBuilder(pen.tool.tool, pen.line_color, pen.size, pen.argb,
-                                                           scale=scale)
+        self.builder = None if eraser or lasso else s.StrokeBuilder(pen.tool.tool, pen.line_color, pen.size, pen.argb,
+                                                                    scale=scale)
 
     def add(self, sample: tuple) -> None:
         self.samples.append(sample)
@@ -309,6 +333,10 @@ class PenSurface(QQuickPaintedItem):
             _notify(refusal)
             return True                     # taken: a pen press never starts typing
         pen = self.tools.pen()
+        if self.tools._lasso:
+            self._drawing = _Drawing(pen, False, self.view.pen_scale(), stylus, lasso=True)
+            self.add(pos, sample_rest)
+            return True
         self._drawing = _Drawing(pen, eraser or pen.tool.is_eraser, self.view.pen_scale(), stylus)
         if self._drawing.eraser and not pen.tool.is_eraser:
             eraser = pens.pen_of(self.tools._settings, pens.BY_KEY["eraser"])
@@ -336,6 +364,12 @@ class PenSurface(QQuickPaintedItem):
             return
         if not commit or not self._view_ok() or not drawing.samples:
             self.update()
+            return
+        if drawing.lasso:
+            self.update()
+            points = [(sample[0], sample[1]) for sample in drawing.samples]
+            if self.view.select_lasso(points):
+                self.tools.lassoSelected.emit()
             return
         try:
             line = drawing.line()
@@ -440,13 +474,33 @@ class PenSurface(QQuickPaintedItem):
             self._paint_one(painter, preview)
         d = self._drawing
         if d is not None:
-            if d.eraser:
+            if d.lasso:
+                self._paint_lasso(painter, d.samples)
+            elif d.eraser:
                 width = max(10.0 * d.size, 2.0)
                 self._paint_one(painter, ("eraser", d.samples, width))
             elif d.builder.points:
                 pen = d.pen
                 self._paint_one(painter, preview_scene(pen.tool.tool, pen.line_color, pen.size, pen.argb,
                                                        d.builder.points))
+
+    @staticmethod
+    def _paint_lasso(painter: QPainter, samples) -> None:
+        """The lasso so far: a dashed outline, closed back to where it started."""
+        if len(samples) < 2:
+            return
+        path = QPainterPath(QPointF(samples[0][0], samples[0][1]))
+        for sample in samples[1:]:
+            path.lineTo(sample[0], sample[1])
+        path.closeSubpath()
+        painter.save()
+        painter.setBrush(QColor(LASSO_COLOR.red(), LASSO_COLOR.green(), LASSO_COLOR.blue(), 30))
+        pen = QPen(LASSO_COLOR, 0, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        pen.setWidthF(2.0)
+        painter.setPen(pen)
+        painter.drawPath(path)
+        painter.restore()
 
     @staticmethod
     def _paint_one(painter: QPainter, preview) -> None:
@@ -547,6 +601,10 @@ Item {
         enabled: penTools.active
         onActivated: penTools.deactivate()
     }
+    Connections {
+        target: penTools
+        function onLassoSelected() { if (panel) panel.selectionMode = true; }
+    }
 
     Row {
         id: row
@@ -569,7 +627,7 @@ Item {
                     model: penTools.tools
                     delegate: Rectangle {
                         objectName: "penTool_" + modelData.key
-                        readonly property bool inHand: penTools.active && penTools.tool === modelData.key
+                        readonly property bool inHand: penTools.active && !penTools.lasso && penTools.tool === modelData.key
                         width: 40; height: 40; radius: 4
                         color: inHand ? bar.picked : (toolMouse.hovered ? bar.hover : "transparent")
                         border.color: !penTools.active && penTools.tool === modelData.key ? bar.frame : "transparent"
@@ -594,13 +652,36 @@ Item {
                         ToolTip.text: modelData.label
                     }
                 }
+                Rectangle {
+                    objectName: "penTool_lasso"
+                    readonly property bool inHand: penTools.active && penTools.lasso
+                    width: 40; height: 40; radius: 4
+                    color: inHand ? bar.picked : (lassoMouse.hovered ? bar.hover : "transparent")
+                    ArkControls.Icon {
+                        anchors.centerIn: parent
+                        source: "qrc:/ark/icons/selection_tool"
+                        size: 24
+                        color: "#000000"
+                    }
+                    TapHandler {
+                        objectName: "tap"
+                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                        onTapped: penTools.chooseLasso()
+                    }
+                    HoverHandler {
+                        id: lassoMouse
+                    }
+                    ToolTip.visible: lassoMouse.hovered
+                    ToolTip.delay: 600
+                    ToolTip.text: "Lasso select"
+                }
             }
         }
 
         Rectangle {
             id: options
             objectName: "penOptions"
-            visible: penTools.active
+            visible: penTools.active && !penTools.lasso
             width: 3 * 36 + 8
             height: optionColumn.height + 8
             radius: 6

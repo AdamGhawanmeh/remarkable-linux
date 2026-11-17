@@ -1078,6 +1078,43 @@ moved stroke is a new item.
   twin's moveId, i.e. the deleted pasted item. 2,033 more strokes have a thicknessScale
   that is not 1, 2 or 3 and no moveId (17 values such as 2.8358 and its half 1.4179, on 70
   pages), which is what a paste with a scale leaves [I]; with a moveId there are 397.
+- **Picking** [O] (per node, 0x1408c9250: the region is first translated by −the node's
+  anchor position when it has one). Only drawing tools and the legacy Eraser can be picked
+  (line item vtable +0x28 = 0x1405b7530 → 0x140b3e0e0: not EraseSection, ClearPage, ZoomTool,
+  SelectionTool, MaskedEraser). Two tests, chosen by an int the caller passes:
+  - **any point** (vtable +0x40, 0x1405b73a0): some point, rounded (x ± 0.5 clamped to the
+    int range, truncated), lies in the region. The desktop selection tool's rectangle,
+    `addSelectionRect(QRect, LineSelectionMode)` (0x140437a20 → worker lambda 0x140433da0),
+    passes this one; `ToggleSelection` (Shift) makes the result `was selected XOR hit`.
+    An image is hit when the region meets its corners' aligned box (0x140442e80).
+  - **all points** (vtable +0x38, 0x1405b7520): the line's aligned bounding rect meets the
+    region's, and every rounded point lies in it. The tablet's lasso (0x1409b3600, mode 0, no
+    toggle; callers 0x14041b2e9, 0x14042e279, 0x140434d4a, never reached from the desktop QML)
+    builds its region in 0x1409ae1c0: the lasso line's points (× 1.0, 0x140b3fd90) as a
+    polygon, `toPolygon()`, shifted by (−1,−1), (−1,1), (1,−1), (1,1), each
+    `QRegion(…, OddEvenFill)`, united. Images: 0x1409a82c0 → 0x140a64ee0 (tests the image's
+    mapped rect against the region; the rest not traced).
+- **The client** (`viewer.rm_select`, `ui.selection`, `core.edits.ItemsTransform` /
+  `StrokePaste`, `LibrarySource.transform_items` / `paste_strokes` / `delete_items`, bridge
+  `SceneController` selection slots, `SelectionImage`): follows this binary, so a commit
+  writes the 2n ids (originals deleted, clones added and deleted, transformed clones
+  appended; moveId = the first item). The app's own QML drives it unchanged: the selection
+  tool's rectangle, the box's drag / corner / rotation handles (only the pending transform
+  and the box change; the page is drawn without the selected items, `SelectionImage` draws
+  them through `pendingEdit`), `endItemSelection` (also Escape, a click outside, closing the
+  document, undo, a pen stroke) → `applyPendingEdit` → one `ItemsTransform` and one undo step,
+  merged into the paste's step when the selection is what was pasted. Copy, Cut, Paste,
+  Delete/Backspace are the app's actions. The pen toolbar adds a freehand lasso (the tablet's
+  rule above), which opens the same selection box. Checked on the cached library: all
+  755,080 live line and image items of 4,210 pages committed with a turn and a scale; every
+  page parses, every other block except the authors list is byte for byte the same, moveId,
+  timestamp, speed, direction and pressure as above. **Deviations**: (1) strokes of a
+  text-anchored group are transformed in their own group with the conjugated transform, but
+  the group is not re-anchored afterwards (0x140975b10 not traced), and the anchor position
+  comes from `renderer.stroke_offsets` (exact for moves; for scales and turns off by the
+  known error of that offset); (2) a lasso takes an image when all four corners are inside;
+  (3) a paste adds its strokes before its images instead of in clipboard order; (4) Shift-
+  toggling while a move is pending commits the move first, then toggles on the new items.
 
 **Straight lines and shapes ("hold at end of stroke")** [O; checked on the cached library,
 5,901 files]. There is no hold timer, movement threshold or shape recogniser in

@@ -51,10 +51,12 @@ from core.edits import EditError
 from core.models import FileType
 from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH
 from viewer.rm_parser import ParagraphStyle as StyleType
+from viewer import rm_select as rsel
 from viewer import rm_text
 from viewer.renderer import qt_measure
 
 from ... import editing
+from ... import selection as selecting
 from ... import textedit
 from ...editing import prepare_image
 from ...library import pdf_name
@@ -312,40 +314,42 @@ PageSearchResultOverlayItem = qml_class("PageSearchResultOverlayItem", QQuickPai
 
 class _SelectionImage:
     """What SceneSelectionHandler's SelectionPreview shows inside the selection box: the
-    selected image, fitted to the box, so it follows the box while it is dragged or
-    resized (the page is drawn without it meanwhile)."""
+    selected strokes and images, drawn through the pending transform and fitted to the
+    box, so they follow the box while it is dragged, resized or turned (the page is drawn
+    without them meanwhile; the app draws them so too, 0x1409b1e40)."""
 
     def __init__(self, parent: QQuickItem | None = None) -> None:
         QQuickPaintedItem.__init__(self, parent)
-        self._picture: QImage | None = None
-        self._matrix = None                 # image pixels -> scene
+        self._scene = None                  # (a page holding the selected items, its x origin)
+        self._preview = QTransform()        # the pending transform
         self._rect = QRectF()               # the scene area the box stands for
 
     @Slot(QObject, int, int, QRectF, QTransform)
     def updateImage(self, worker, page: int, layer: int, scene_rect: QRectF, preview: QTransform) -> None:
-        self._picture, self._matrix, self._rect = None, None, QRectF(scene_rect)
-        selected = worker.selected_image() if hasattr(worker, "selected_image") else None
-        if selected is not None:
-            self._picture, self._matrix = selected
+        self._scene = worker.selection_preview() if hasattr(worker, "selection_preview") else None
+        self._preview, self._rect = QTransform(preview), QRectF(scene_rect)
         self.update()
 
     @Slot()
     def reset(self) -> None:
-        self._picture, self._matrix = None, None
+        self._scene = None
         self.update()
 
     @Slot(result=QImage)
     def image(self) -> QImage:
-        return self._picture if self._picture is not None else QImage()
+        return QImage()
 
     def paint(self, painter: QPainter) -> None:
-        if self._picture is None or self._matrix is None or self._rect.width() <= 0 or self._rect.height() <= 0:
+        if self._scene is None or self._rect.width() <= 0 or self._rect.height() <= 0:
             return
+        from viewer.renderer import paint
+        scene, x_origin = self._scene
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.scale(self.width() / self._rect.width(), self.height() / self._rect.height())
         painter.translate(-self._rect.x(), -self._rect.y())
-        painter.setTransform(QTransform(*self._matrix), True)
-        painter.drawImage(QPointF(0, 0), self._picture)
+        painter.setTransform(self._preview, True)
+        painter.translate(-x_origin, 0)         # the renderer draws in page coordinates
+        paint(painter, scene)
 
 
 SelectionImage = qml_class("SelectionImage", QQuickPaintedItem, _SelectionImage)
@@ -537,6 +541,17 @@ class _Controller:
         edited here."""
         return self.view is not None and self.view.select_image_at(QPointF(pos), int(layer))
 
+    @Slot(QRect, int)
+    @Slot(QRectF, int)
+    def addSelectionRect(self, rect, mode: int) -> None:
+        """The selection tool's rectangle (scene coordinates, whole units), on the
+        current layer (0x140437a20): InitalSelection takes what it touches,
+        ToggleSelection (Shift) flips what it touches in or out."""
+        if self.view is not None:
+            r = rect.toRect() if isinstance(rect, QRectF) else QRect(rect)
+            self.view.select_rect((r.x(), r.y(), r.width(), r.height()), int(self._get("currentLayer") or 0),
+                                  int(mode) == 1)
+
     @Slot()
     def clearSelectedItems(self) -> None:
         if self.view is not None:
@@ -545,17 +560,17 @@ class _Controller:
     @Slot(int, QPointF)
     def moveSelectedItems(self, layer: int, offset: QPointF) -> None:
         if self.view is not None:
-            self.view.transform_selection(int(layer), lambda v: editing.moved(v, offset.x(), offset.y()))
+            self.view.transform_selection(int(layer), rsel.translation(offset.x(), offset.y()))
 
     @Slot(int, QPointF, float, float)
     def scaleSelectedItems(self, layer: int, origin: QPointF, x_scale: float, y_scale: float) -> None:
         if self.view is not None:
-            self.view.transform_selection(int(layer), lambda v: editing.scaled(v, origin.x(), origin.y(), x_scale, y_scale))
+            self.view.transform_selection(int(layer), rsel.scaling(origin.x(), origin.y(), x_scale, y_scale))
 
     @Slot(int, QPointF, float)
     def rotateSelectedItems(self, layer: int, origin: QPointF, rotation: float) -> None:
         if self.view is not None:
-            self.view.transform_selection(int(layer), lambda v: editing.rotated(v, origin.x(), origin.y(), rotation))
+            self.view.transform_selection(int(layer), rsel.rotation(origin.x(), origin.y(), rotation))
 
     @Slot(int)
     def deleteSelectedItems(self, layer: int) -> None:
@@ -612,10 +627,17 @@ class _Controller:
 
     @Slot(result="QVariantList")
     @Slot(QRect, result="QVariantList")
-    def getLineBoundingRectsToBeSelected(self, area: QRect | None = None) -> list:
-        """The outlines DocumentViewport draws around each selected stroke: none, as
-        strokes cannot be selected yet (an image's outline is the selection box)."""
-        return []
+    @Slot(QRectF, result="QVariantList")
+    def getLineBoundingRectsToBeSelected(self, area=None) -> list:
+        """The outlines DocumentViewport draws around each stroke: those the rectangle
+        `area` (scene coordinates) would take while it is dragged, or, without one, the
+        selected strokes where the pending transform puts them."""
+        if self.view is None:
+            return []
+        if area is not None:
+            r = area.toRect() if isinstance(area, QRectF) else QRect(area)
+            area = (r.x(), r.y(), r.width(), r.height())
+        return [QRect(*rect) for rect in self.view.line_rects(area)]
 
     # -- typed text (DocumentViewport in text mode) --
     @Slot()
@@ -743,11 +765,16 @@ class _Controller:
 
     @Slot(int)
     def applyPendingEdit(self, layer: int) -> None:
-        """Each move is saved when it ends: nothing is left pending."""
+        """Commit every move, scale and turn of the selection as one edit (0x140438540:
+        nothing for the identity); DocumentViewport calls it when the selection closes."""
+        if self.view is not None:
+            self.view.commit_selection(int(layer))
 
     @Slot()
     def cancelPendingEdit(self) -> None:
-        pass
+        """Only clears the selection (0x14094bcb0): what was pending is dropped."""
+        if self.view is not None:
+            self.view.clear_selection()
 
     @Slot(int, result=bool)
     def isLayerVisible(self, index: int) -> bool:
@@ -784,8 +811,11 @@ class _SceneView:
         self._controller.insert_image = self._insert_image
         self._controller.view = self
         self._values["worker"] = self       # SelectionImage asks it for the selected image
-        self._selected: bytes | None = None     # images-table key of the selected image
-        self._reselect = False              # open the selection box again once the page reloads
+        self._sel: selecting.Selection | None = None    # what is selected, and its pending transform
+        self._reselect = None               # (ids, image keys, merge step): select once the page reloads
+        self._hidden: list = []             # items committed and not yet shown at their new place
+        self._picked: tuple | None = None   # (content, layer, the layer's selectable items)
+        self._after_load = None             # run once the page is loaded again
         self._tiles = SceneTileManager(self)
         self._values["controller"] = self._controller
         self._values["tileManager"] = self._tiles
@@ -835,7 +865,7 @@ class _SceneView:
 
     def _property_changed(self, name: str) -> None:
         if name in ("pageId", "document") and self.isComponentComplete():
-            self._set_selected(None)
+            self._set_selection(None)
             self.stop_text()
             self._load()
             if name == "document":
@@ -909,9 +939,13 @@ class _SceneView:
         self._set("pageStatus", PAGE_READY)
         self._set("awaitingInitialTileSet", False)
         self._set("status", 2)  # Active
-        if self._reselect:
-            self._reselect = False
-            self._reopen_selection()
+        self._hidden = []
+        after, self._after_load = self._after_load, None
+        if after is not None:
+            after()
+        if self._reselect is not None:
+            reselect, self._reselect = self._reselect, None
+            self._reopen_selection(*reselect)
         self._render()
         # Last: when this gives the document its page count, the viewport reopens the
         # page through its new id, replacing this view.
@@ -984,27 +1018,259 @@ class _SceneView:
             return bytes.fromhex(source.insert_image(node, page_id, data, extension, corners, now_ms).key)
         self._run_insertion(page_id, insert)
 
+    def _on_edited(self, result) -> None:
+        """An edit was made (or refused): draw the page again, with what it concerns
+        selected (`select`: an image key, or (item ids, image keys, merge step): what
+        was pasted, as the app selects what it adds), or without a selection."""
+        error, select = result
+        if error is not None:
+            _notify(str(error))
+        if isinstance(select, bytes):
+            select = ([], [select], None)
+        if select is not None:
+            self._reselect = select
+        self._load(quiet=True)
+
+    # -- the selection --
+    def _editable(self) -> bool:
+        source, node = _source(), getattr(self._get("document"), "node", None)
+        return (source is not None and node is not None and self._content is not None
+                and not self._content.has_pdf_page and source.can_edit(node))
+
+    def _layer_items(self, layer: int) -> list:
+        """The items of a layer a selection can take (ui.selection.selectable), with the
+        offsets the page draws anchored strokes at; worked out once per page shown."""
+        content = self._content
+        scene = content.scene if content is not None else None
+        if self._picked is not None and self._picked[0] is content and self._picked[1] == layer:
+            return self._picked[2]
+        offsets = None
+        if scene is not None and any(s.anchor is not None for s in scene.strokes):
+            from viewer.renderer import layout_text, stroke_offsets
+            offsets = stroke_offsets(scene, layout_text(scene, qt_measure))
+        items = selecting.selectable(scene, layer, offsets)
+        self._picked = (content, layer, items)
+        return items
+
+    def _set_selection(self, selection) -> None:
+        changed = (selection is None) != (self._sel is None) or (
+            selection is not None and self._sel is not None and selection.items != self._sel.items)
+        self._sel = selection
+        self._controller._set("selectionContainsImage", selection is not None and selection.has_image)
+        self._controller._set("selectionContainsStroke", selection is not None and selection.has_stroke)
+        self._controller._set("selectionItemCount", len(selection.items) if selection is not None else 0)
+        self._controller._set("pendingEdit", QTransform(*(selection.pending if selection is not None
+                                                          else rsel.IDENTITY)))
+        if changed and self._content is not None:
+            self._render()
+
+    def _select(self, layer: int, ids, merge=None) -> bool:
+        """Select the items `ids` of a layer (dropping those the layer does not hold) and
+        open the selection box on them (after the QML that asked has switched to
+        selecting, as the app answers from its worker). False when none is left."""
+        items = self._layer_items(layer)
+        picked = {p.item: p for p in items}
+        ids = [tuple(i) for i in ids if tuple(i) in picked]
+        if not ids:
+            if self._sel is not None:
+                self._set_selection(None)
+                self._controller.selectionCleared.emit()
+            return False
+        self._set_selection(selecting.Selection(layer, ids, merge=merge, picked=picked))
+        QTimer.singleShot(0, self._open_box)
+        return True
+
+    def _open_box(self) -> None:
+        """areaSelected on the selection where the pending transform puts it."""
+        sel = self._sel
+        box = sel.box() if sel is not None else None
+        if box is None:
+            return
+        rect = QRectF(box[0], box[1], box[2] - box[0], box[3] - box[1])
+        self._controller.last_area = (rect.x(), rect.y())
+        self._controller.areaSelected.emit(sel.layer, rect)
+
+    def select_image_at(self, pos: QPointF, layer: int) -> bool:
+        if not self._editable():
+            return False
+        image = editing.image_at(self._content.scene, layer, pos.x(), pos.y())
+        return image is not None and self._select(layer, [image.item_id])
+
+    def select_rect(self, rect: tuple[int, int, int, int], layer: int, toggle: bool) -> None:
+        """addSelectionRect: what the rectangle takes (ui.selection.pick_rect)."""
+        if not self._editable():
+            return
+        hit = selecting.pick_rect(self._layer_items(layer), rect)
+        sel = self._sel
+        if toggle and sel is not None and sel.layer == layer:
+            if not rsel.is_identity(sel.pending):
+                # What is selected was moved and not committed: commit, then toggle on the
+                # page as it is then (the moved items under their new ids).
+                self.commit_selection(layer, then=lambda moved: self._toggle_after(layer, rect, sel, moved))
+                return
+            ids = selecting.toggled(sel.items, hit)
+        else:
+            ids = hit
+        if not self._select(layer, ids) and sel is None:
+            self._controller.selectionCleared.emit()
+
+    def _toggle_after(self, layer: int, rect, before, moved: dict) -> None:
+        current = [moved.get(i, i) for i in before.items]
+        self._select(layer, selecting.toggled(current, selecting.pick_rect(self._layer_items(layer), rect)))
+
+    def select_lasso(self, points: list[tuple[float, float]], layer: int | None = None) -> bool:
+        """A lasso drawn through scene `points` (the tablet's selection tool): what lies
+        wholly inside is selected (ui.selection.pick_lasso)."""
+        if not self._editable():
+            return False
+        layer = int(self._controller._get("currentLayer") or 0) if layer is None else layer
+        if self._sel is not None:
+            self.commit_selection(self._sel.layer)
+        return self._select(layer, selecting.pick_lasso(self._layer_items(layer), points))
+
+    def _reopen_selection(self, ids, keys, merge) -> None:
+        """Select, once the page is loaded again, the items an edit made: `ids`, and the
+        items showing the image `keys`."""
+        layer = int(self._controller._get("currentLayer") or 0)
+        ids = list(ids)
+        for key in keys:
+            found = editing.find_image(self._content.scene if self._content else None, key)
+            if found is not None:
+                layer = found[0]
+                ids.append(found[1].item_id)
+        self._select(layer, ids, merge)
+
+    def clear_selection(self) -> None:
+        self._set_selection(None)
+
+    def selection_preview(self):
+        """(a page holding the selected items, its x origin) for SelectionImage."""
+        sel, content = self._sel, self._content
+        if sel is None or content is None or content.scene is None:
+            return None
+        return selecting.preview_scene(content.scene, sel.chosen()), content.scene.x_origin
+
+    def line_rects(self, area) -> list[tuple[int, int, int, int]]:
+        if not self._editable():
+            return []
+        layer = int(self._controller._get("currentLayer") or 0)
+        if area is not None:
+            items = self._layer_items(layer)
+            hit = set(selecting.pick_rect(items, area))
+            return selecting.line_rects([p for p in items if p.item in hit])
+        sel = self._sel
+        return selecting.line_rects(sel.chosen(), sel.pending) if sel is not None else []
+
+    def _selection_target(self, layer: int):
+        """(source, document, page id, selection) for an edit of the selection, or None
+        (nothing selected, another layer, or not editable)."""
+        sel = self._sel
+        if sel is None or sel.layer != layer or not self._editable():
+            return None
+        return _source(), self._get("document").node, self._page_id, sel
+
+    def transform_selection(self, layer: int, m) -> None:
+        """Move, scale or turn the selection: the pending transform is multiplied, and the
+        box opens again where the selection is now; the page is not changed until the
+        selection closes (commit_selection), as in the app."""
+        sel = self._sel
+        if sel is None or sel.layer != layer:
+            return
+        sel.apply(m)
+        self._controller._set("pendingEdit", QTransform(*sel.pending))
+        self._open_box()
+
+    def commit_selection(self, layer: int, then=None) -> None:
+        """applyPendingEdit: the selection's transform as one edit of the page
+        (LibrarySource.transform_items), then the page drawn again. `then(moved)` runs
+        once the page is loaded again ({old id: new id})."""
+        target = self._selection_target(layer)
+        if target is None or rsel.is_identity(target[3].pending):
+            return
+        source, node, page_id, sel = target
+        items, pending, offsets, merge = list(sel.items), sel.pending, sel.offsets(), sel.merge
+        sel.pending, sel.merge = rsel.IDENTITY, None
+        self._hidden = items                # not drawn at the old place meanwhile
+        now_ms = _now_ms()
+
+        def job():
+            error, moved = None, {}
+            try:
+                _, moved = source.transform_items(node, page_id, items, pending, now_ms, offsets, merge)
+            except (EditError, rsel.SelectError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("moving the selection on page %s", page_id)
+                error = f"The selection could not be moved: {type(err).__name__}"
+            if then is not None:
+                emit_from_worker(self, lambda: self._after_commit(error, moved, then))
+            else:
+                emit_from_worker(self, lambda: self._edited.emit((error, None)))
+        self._pool.start(_Job(job))
+
+    def _after_commit(self, error, moved, then) -> None:
+        if error is not None:
+            _notify(str(error))
+        self._reselect = None
+        self._after_load = lambda: then(moved)
+        self._load(quiet=True)
+
+    def copy_selection(self, layer: int, scale: float) -> list:
+        """Clipboard records of the selected items (cloneSelectedItems, 0x14043a320):
+        clones in scene coordinates, transformed by the pending transform and `scale`."""
+        target = self._selection_target(layer)
+        if target is None:
+            return []
+        source, node, page_id, sel = target
+        m = rsel.multiply(sel.pending, (scale, 0.0, 0.0, scale, 0.0, 0.0)) if scale != 1 else sel.pending
+        try:
+            values = source.item_values(node, page_id, sel.items)
+        except EditError as err:
+            _notify(str(err))
+            return []
+        out = []
+        for p in sel.chosen():
+            value = values.get(p.item)
+            if value is None:
+                continue
+            local = rsel.multiply(rsel.translation(*p.offset), m) if p.offset != (0.0, 0.0) else m
+            if p.stroke is not None:
+                out.append(editing.clip_line(rsel.clone(value, local)))
+            else:
+                out.append(editing.clip_image(node.id, page_id, p.image, 1.0,
+                                              rsel.transform_vertices(p.image.vertices, m)))
+        return out
+
     def paste_items(self, layer: int, items, scale: float, pos: QPointF) -> None:
-        """Copied items pasted, centred on a scene position (cloneAddAndSelectItems,
-        0x14043a060): each image is loaded from where it was copied and stored again as
-        a new file under a new key (0x1409b1a90 -> 0x14094c420), and its copy keeps the
-        copied item's timestamps; one whose image cannot be loaded is dropped, as the
-        app drops it."""
-        images = editing.clip_images(items)
-        target = self._insertion_target("Images") if images else None
+        """Copied items pasted, the box around them centred on a scene position
+        (cloneAddAndSelectItems, 0x14043a060 -> 0x1409af310): strokes appended to the
+        layer (moveId 0:0, timestamp kept); each image loaded from where it was copied
+        and stored again as a new file under a new key (0x1409b1a90 -> 0x14094c420),
+        its copy keeping the copied item's timestamps (one whose image cannot be loaded
+        is dropped, as the app drops it). One action for undo; the pasted items are then
+        the selection, and moving them before it closes is part of the same undo step."""
+        lines, images = editing.clip_lines(items), editing.clip_images(items)
+        target = self._insertion_target("Pasted items") if (lines or images) else None
         if target is None:
             return
         source, node, page_id = target
-        center, now_ms = (pos.x(), pos.y()), int(time.time() * 1000)
+        placed = editing.placed_items(lines, images, scale, (pos.x(), pos.y()))
+        now_ms = _now_ms()
 
         def insert():
-            select = None
+            ids, keys = [], []
             with source.edit_action(node, page_id) as action:      # undone at once, as the app's add-items
-                for item in images:
-                    select = paste_one(item, action) or select
-            return select
+                strokes = [v for kind, v in placed if kind == "line"]
+                if strokes:
+                    ids = source.paste_strokes(node, page_id, strokes, now_ms, action)[1]
+                for kind, value in placed:
+                    if kind == "image":
+                        key = paste_one(*value, action)
+                        if key is not None:
+                            keys.append(key)
+            return ids, keys, source.undo_top(node, page_id)
 
-        def paste_one(item, action) -> bytes | None:
+        def paste_one(item, corners, action) -> bytes | None:
             try:
                 picture = QImage.fromData(source.image_file(item["documentId"], item["pageId"], item["fileName"]))
             except EditError as err:
@@ -1014,142 +1280,29 @@ class _SceneView:
                 log.warning("dropping pasted image item, failed to load source image ref")
                 return None
             data, extension, _ = editing.encode_image(picture)
-            corners = editing.pasted_corners(item, scale, center)
             edit = source.insert_image(node, page_id, data, extension, corners, now_ms, item["timestamps"], action)
             return bytes.fromhex(edit.key)
         self._run_insertion(page_id, insert)
 
-    def _on_edited(self, result) -> None:
-        """An edit was made (or refused): draw the page again, with the image it
-        concerns selected (`select`: its key; the image just dropped, as the app selects
-        it), or without a selection."""
-        error, select = result
-        if error is not None:
-            _notify(str(error))
-        if select is not None:
-            self._selected, self._reselect = select, True
-        self._load(quiet=True)
-
-    # -- the selection --
-    def _editable(self) -> bool:
-        source, node = _source(), getattr(self._get("document"), "node", None)
-        return (source is not None and node is not None and self._content is not None
-                and not self._content.has_pdf_page and source.can_edit(node))
-
-    def _set_selected(self, key: bytes | None) -> None:
-        changed = key != self._selected
-        self._selected = key
-        self._controller._set("selectionContainsImage", key is not None)
-        self._controller._set("selectionItemCount", 1 if key is not None else 0)
-        if changed and self._content is not None:
-            self._render()
-
-    def select_image_at(self, pos: QPointF, layer: int) -> bool:
-        if not self._editable():
-            return False
-        image = editing.image_at(self._content.scene, layer, pos.x(), pos.y())
-        if image is None:
-            return False
-        self._set_selected(image.image_ref)
-        # After the QML that asked has switched to selecting (it does so once this
-        # returns), as the app answers from its worker.
-        QTimer.singleShot(0, self._reopen_selection)
-        return True
-
-    def _reopen_selection(self) -> None:
-        """Open the selection box on the selected image where it is now, or close it
-        when the image is gone."""
-        found = editing.find_image(self._content.scene if self._content else None, self._selected) \
-            if self._selected is not None else None
-        if found is None:
-            if self._selected is not None:
-                self._set_selected(None)
-                self._controller.selectionCleared.emit()
-            return
-        layer, image = found
-        self._set_selected(image.image_ref)
-        x, y, w, h = editing.corner_bounds(image.vertices)
-        self._controller.last_area = (x, y)
-        self._controller.areaSelected.emit(layer, QRectF(x, y, w, h))
-
-    def clear_selection(self) -> None:
-        self._set_selected(None)
-
-    def selected_image(self):
-        """(picture, image pixels -> scene matrix) of the selected image, for SelectionImage."""
-        from viewer.renderer import image_matrix
-        found = editing.find_image(self._content.scene if self._content else None, self._selected) \
-            if self._selected is not None else None
-        if found is None or not found[1].data:
-            return None
-        image = found[1]
-        picture = getattr(image, "_qimage", None) or QImage.fromData(image.data)
-        image._qimage = picture
-        matrix = image_matrix(self._content.scene, image, picture.width(), picture.height())
-        if picture.isNull() or matrix is None:
-            return None
-        a, b, c, d, e, f = matrix                   # to page coordinates (x 0 at the left edge)...
-        return picture, (a, b, c, d, e - self._content.scene.x_origin, f)       # ...to scene coordinates
-
-    def _selection_change(self, layer: int):
-        """(source, document, page id, the selected image) for an edit of the selection,
-        or None (nothing selected, another layer, or not editable)."""
-        if self._selected is None or not self._editable():
-            return None
-        found = editing.find_image(self._content.scene, self._selected)
-        if found is None or found[0] != layer:
-            return None
-        return _source(), self._get("document").node, self._page_id, found[1]
-
-    def transform_selection(self, layer: int, change) -> None:
-        """Move, scale or turn the selected image (`change`: its corners -> new corners),
-        saved as a pending edit of the library, then the page is drawn again with the
-        selection box on the image's new place."""
-        target = self._selection_change(layer)
-        if target is None:
-            return
-        source, node, page_id, image = target
-        key, corners, now_ms = image.image_ref, change(list(image.vertices)), int(time.time() * 1000)
-
-        def job():
-            error = None
-            try:
-                source.transform_image(node, page_id, key, corners, now_ms)
-            except (EditError, *EXPECTED_ERRORS) as err:
-                error = str(err)
-            except Exception as err:
-                log.exception("changing an image on page %s", page_id)
-                error = f"The image could not be changed: {type(err).__name__}"
-            emit_from_worker(self, lambda: self._edited.emit((error, key)))
-        self._pool.start(_Job(job))
-
-    def copy_selection(self, layer: int, scale: float) -> list:
-        """The selected image as a clipboard item (cloneSelectedItems)."""
-        if self._selected is None or self._content is None:
-            return []
-        found = editing.find_image(self._content.scene, self._selected)
-        if found is None or found[0] != layer:
-            return []
-        return [editing.clip_image(self._get("document").node.id, self._page_id, found[1], scale)]
-
     def delete_selection(self, layer: int) -> None:
-        target = self._selection_change(layer)
+        target = self._selection_target(layer)
         if target is None:
             return
-        source, node, page_id, image = target
-        key, now_ms = image.image_ref, int(time.time() * 1000)
-        self._set_selected(None)
+        source, node, page_id, sel = target
+        items, now_ms = list(sel.items), _now_ms()
+        self._hidden = items
+        self._set_selection(None)
         self._controller.selectionCleared.emit()
 
         def job():
             error = None
             try:
-                source.delete_image(node, page_id, key, now_ms)
+                source.delete_items(node, page_id, items, now_ms)
             except (EditError, *EXPECTED_ERRORS) as err:
                 error = str(err)
             except Exception as err:
-                log.exception("deleting an image on page %s", page_id)
-                error = f"The image could not be deleted: {type(err).__name__}"
+                log.exception("deleting the selection on page %s", page_id)
+                error = f"The selection could not be deleted: {type(err).__name__}"
             emit_from_worker(self, lambda: self._edited.emit((error, None)))
         self._pool.start(_Job(job))
 
@@ -1187,9 +1340,9 @@ class _SceneView:
         if source is None or node is None or not page_id:
             self._pen_shown(seq)
             return
-        if self._selected is not None:
-            self._set_selected(None)
-            self._controller.selectionCleared.emit()
+        if self._sel is not None:
+            self._controller.selectionCleared.emit()    # DocumentViewport commits and closes it
+            self._set_selection(None)
         now_ms = _now_ms()
 
         def job():
@@ -1233,10 +1386,10 @@ class _SceneView:
         if self.text_session is not None:
             self._keep_text(then=lambda: self._text_history(redo))
             return
+        if self._sel is not None:
+            self._controller.selectionCleared.emit()    # committed and closed before the undo
+            self._set_selection(None)
         (self._controller.aboutToRedo if redo else self._controller.aboutToUndo).emit()
-        if self._selected is not None:
-            self._set_selected(None)
-            self._controller.selectionCleared.emit()
         page_id, now_ms = self._page_id, int(time.time() * 1000)
 
         def job():
@@ -1521,8 +1674,10 @@ class _SceneView:
         if self.text_session is not None:
             from dataclasses import replace
             content = replace(content, scene=self.text_session.shown_scene())
-        if self._selected is not None and content.scene is not None:
-            content = _without_image(content, self._selected)    # SelectionImage shows it
+        hidden = list(self._sel.items) if self._sel is not None else []
+        if (hidden or self._hidden) and content.scene is not None:
+            from dataclasses import replace
+            content = replace(content, scene=selecting.without(content.scene, hidden + self._hidden))   # SelectionImage shows them
         self._rendering = True
 
         def job():
@@ -1590,14 +1745,14 @@ class _SceneView:
     def processKey(self, key: int, modifiers: int, auto_repeat: bool, text: str) -> dict:
         """The SceneKeyHandlerAction for a key (SceneKeyHandler::process). Out of text
         mode only page up/down do something (the viewport scrolls), and Backspace
-        deletes a selected image."""
+        deletes the selection."""
         if self._get("textModeEnabled"):
             return textedit.key_action(int(key), int(modifiers), bool(auto_repeat), str(text or ""))
         actions = SceneKeyHandlerAction.Type
         kind = {int(Qt.Key.Key_PageUp.value): actions["PageUp"], int(Qt.Key.Key_PageDown.value): actions["PageDown"]}
-        if int(key) in (int(Qt.Key.Key_Backspace.value), int(Qt.Key.Key_Delete.value)) and self._selected is not None:
+        if int(key) in (int(Qt.Key.Key_Backspace.value), int(Qt.Key.Key_Delete.value)) and self._sel is not None:
             # Delete comes as the selection handler's shortcut; Backspace reaches here.
-            self.delete_selection(self._controller._get("currentLayer"))
+            self.delete_selection(self._sel.layer)
         return {"type": int(kind.get(int(key), actions["None"]))}
 
     def keyPressEvent(self, event) -> None:
@@ -1619,14 +1774,6 @@ class _SceneView:
 
 
 SceneView = qml_class("SceneView", QQuickPaintedItem, _SceneView)
-
-
-def _without_image(content: PageContent, key: bytes) -> PageContent:
-    """The page with the image `key` left out (it is being moved)."""
-    from dataclasses import replace
-    scene = content.scene
-    layers = [replace(layer, images=[i for i in layer.images if i.image_ref != key]) for layer in scene.layers]
-    return replace(content, scene=replace(scene, layers=layers))
 
 
 # -- models ---------------------------------------------------------------------------

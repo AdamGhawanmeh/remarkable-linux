@@ -23,12 +23,12 @@ from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, PageAdd,
-                        PageCopy, PageDelete, PageHistory, PageMove, Staged, StrokeAdd, StrokeChange, StrokeDelete,
-                        StrokeErase, StrokePart, ToolSettings, document_files, swapped)
+from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
+                        PageAdd, PageCopy, PageDelete, PageHistory, PageMove, Staged, StrokeAdd, StrokeChange,
+                        StrokeDelete, StrokeErase, StrokePart, StrokePaste, ToolSettings, document_files, swapped)
 from core.sync import SyncClient, SyncError, sha256_hex
 from core.config import atomic_write_json, read_json
-from viewer import rm_stroke, rm_writer
+from viewer import rm_select, rm_stroke, rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
@@ -316,6 +316,32 @@ def _stroke_values(page: bytes | None) -> dict[tuple[int, int], str]:
     except (RmParseError, ValueError) as err:
         log.warning("strokes of a page not readable for undo: %s", err)
         return {}
+
+
+def _merged(first: tuple, second: list) -> tuple:
+    """A paste's undo step and the move of what it pasted as one step (0x1408f3920):
+    what the move put back of the pasted items is not put back, and what the paste added
+    and the move did not take is still taken; the pasted images taken by the move are
+    simply the moved ones."""
+    pasted = {p.ref: p for c in first if isinstance(c, StrokeChange) for p in c.remove}
+    first_images = {c.key: c for c in first if isinstance(c, Change)}
+    moved_refs = {p.ref for c in second if isinstance(c, StrokeChange) for p in c.readd}
+    out: list = []
+    remove: list = [p for ref, p in pasted.items() if ref not in moved_refs]
+    readd: list = []
+    images: dict[str, Change] = {k: c for k, c in first_images.items()}
+    for change in second:
+        if isinstance(change, StrokeChange):
+            remove += change.remove
+            readd += [p for p in change.readd if p.ref not in pasted]
+        elif isinstance(change, Change) and change.key in images and images[change.key].readd is None:
+            images[change.key] = Change(change.key, None, change.remove)
+        elif isinstance(change, Change):
+            images[change.key] = change
+    out += [c for c in first if not isinstance(c, (StrokeChange, Change))]
+    if remove or readd:
+        out.append(StrokeChange(tuple(remove), tuple(readd)))
+    return tuple(out + list(images.values()))
 
 
 class LibrarySource:
@@ -754,6 +780,112 @@ class LibrarySource:
         edit = StrokeDelete.new(doc.id, page_id, items, now_ms)
         self._add_edit(doc, edit)
         return edit
+
+    # -- the selection: moving, deleting, pasting strokes and images --
+
+    def undo_top(self, doc: Document, page_id: str):
+        """The step on top of a page's undo stack (to merge a selection's move into the
+        paste that made it, as the app's stack does, 0x1408f3920), or None."""
+        with self._history_lock:
+            history = self._history(doc.id, page_id)
+            return history.undo[-1] if history.undo else None
+
+    def _items(self, doc: Document, page_id: str):
+        try:
+            done = self.staged(doc).replay(page_id)
+            return done, {i.item: i for i in rm_select.page_items(done.page)}
+        except (RmParseError, ValueError) as err:
+            raise EditError(f"the page cannot be edited: {err}") from err
+
+    def item_values(self, doc: Document, page_id: str, items) -> dict:
+        """The values (rm_stroke.LineValue, rm_writer.ImageValue) of live items of a page
+        as shown here, by id: what copying clones."""
+        _, live = self._items(self.sync.tree.get(doc.id) or doc, page_id)
+        return {tuple(i): (live[tuple(i)].line if live[tuple(i)].is_line else live[tuple(i)].image)
+                for i in items if tuple(i) in live}
+
+    def transform_items(self, doc: Document, page_id: str, items, matrix, now_ms: int, offsets=None,
+                        merge=None):
+        """Commit a selection's move, scale and turn (`matrix`, rm_select's order) of the
+        page's live items `items` (ids), one ItemsTransform, one action for undo (the app's
+        SceneDeleteAppendItems: undo puts the originals back, redo the transformed). When
+        `merge` is the step on top of the undo stack (the paste that made the selection),
+        the two become one step. `offsets`: where the page draws items of groups anchored
+        to text (item id -> anchor position), whose node's transform is conjugated with
+        it. (edit, {old id: new id}); (None, {}) for the identity or nothing left to move."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before, live = self._items(doc, page_id)
+            chosen = [tuple(i) for i in items if tuple(i) in live]
+            if not chosen or rm_select.is_identity(rm_select.matrix(matrix)):
+                return None, {}
+            anchors = {live[i].parent: tuple(offsets[i]) for i in chosen if offsets and i in offsets}
+            edit = ItemsTransform.new(doc.id, page_id, [before.ref(i) for i in chosen], matrix, now_ms,
+                                      [(a, c, x, y) for (a, c), (x, y) in anchors.items()])
+            self._add_edit(doc, edit)
+            after, now = self._items(doc, page_id)
+            removed, readded, images, moved = [], [], [], {}
+            for n, item in enumerate(chosen):
+                new = after.made.get(f"{edit.uid}/{n}")
+                if new is None or new not in now:
+                    continue
+                moved[item] = new
+                ref = ("edit", f"{edit.uid}/{n}")
+                if live[item].is_line:
+                    removed.append(StrokePart(ref, now[new].line.encode().hex()))
+                    readded.append(StrokePart(before.ref(item), live[item].line.encode().hex()))
+                else:
+                    images.append(Change(live[item].image.ref.hex(), before.ref(item), ref))
+            changes = ([StrokeChange(tuple(removed), tuple(readded))] if removed else []) + images
+            if merge is not None and history.undo and history.undo[-1] is merge:
+                history.undo[-1] = _merged(merge, changes)
+                history.redo.clear()
+            else:
+                history.push(changes)
+            history.seen = self._seen(doc.id, page_id)
+            return edit, moved
+
+    def paste_strokes(self, doc: Document, page_id: str, lines, now_ms: int, action: list | None = None):
+        """Paste line values (placed already: rm_select.pasted) on top of the page's
+        current layer, one StrokePaste, part of `action` or one action for undo (the
+        app's add-items). (edit, the ids they took)."""
+        doc = self._editable(doc, page_id)
+        edit = StrokePaste.new(doc.id, page_id, lines, now_ms)
+        with self.edit_action(doc, page_id, action) as changes:
+            self._add_edit(doc, edit)
+            after, now = self._items(doc, page_id)
+            ids = [after.made.get(f"{edit.uid}/{n}") for n in range(len(edit.values))]
+            changes.append(StrokeChange(remove=tuple(StrokePart(("edit", f"{edit.uid}/{n}"), now[i].line.encode().hex())
+                                                     for n, i in enumerate(ids) if i in now)))
+        return edit, [i for i in ids if i is not None]
+
+    def delete_items(self, doc: Document, page_id: str, items, now_ms: int) -> bool:
+        """Delete selected strokes and images of a page (the app's deleteSelectedItems),
+        one action for undo. False when none of them is on the page any more."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            before, live = self._items(doc, page_id)
+            chosen = [tuple(i) for i in items if tuple(i) in live]
+            if not chosen:
+                return False
+            lines = [i for i in chosen if live[i].is_line]
+            edits: list[Edit] = []
+            changes: list = []
+            if lines:
+                edits.append(StrokeDelete.new(doc.id, page_id, [before.ref(i) for i in lines], now_ms))
+                changes.append(StrokeChange(readd=tuple(StrokePart(before.ref(i), live[i].line.encode().hex())
+                                                        for i in lines)))
+            for i in chosen:
+                if not live[i].is_line:
+                    key = live[i].image.ref
+                    edits.append(ImageDelete.new(doc.id, page_id, key, now_ms))
+                    changes.append(Change(key.hex(), before.ref(i), None))
+            history = self._history(doc.id, page_id)
+            self._add_edits(doc, [(e, None) for e in edits])
+            history.push(changes)
+            history.seen = self._seen(doc.id, page_id)
+            return True
 
     # -- pen settings --
 

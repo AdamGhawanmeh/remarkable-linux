@@ -78,6 +78,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from viewer import rm_select
 from viewer import rm_stroke
 from viewer import rm_writer
 from viewer import rm_text
@@ -394,7 +395,85 @@ class StrokeRestore:
                        raw.get("origin"), raw.get("uid") or "")
 
 
-STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore)
+@dataclass(frozen=True)
+class ItemsTransform:
+    """Selected strokes and images moved, scaled or turned, as the app commits a
+    selection when it closes (rm_select.transform_items: per node, the items deleted,
+    their clones added and deleted again, the transformed clones added, each named
+    after the item it first was by moveId). `matrix` is the product of every move,
+    scale and turn of the selection (m11, m12, m21, m22, dx, dy, QTransform's order);
+    `anchors` the anchor position of each text-anchored group holding selected items
+    ((node author, node counter, x, y)), with which the transform is conjugated there.
+    The item that takes the place of items[n] is named ("edit", "<uid>/<n>"); an item
+    gone meanwhile is passed over."""
+
+    doc_id: str
+    page_id: str
+    items: tuple[ItemRef, ...]
+    matrix: tuple[float, ...]
+    created_ms: int
+    anchors: tuple[tuple[int, int, float, float], ...] = ()
+    uid: str = ""
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, items, matrix, created_ms: int, anchors=(),
+            uid: str | None = None) -> "ItemsTransform":
+        refs = tuple(_ref(item) for item in items)
+        if not refs:
+            raise EditError("a transform of no items")
+        try:
+            m = rm_select.matrix(matrix)
+        except rm_select.SelectError as err:
+            raise EditError(str(err)) from err
+        nodes = tuple((int(a), int(c), _number(x, "anchor position"), _number(y, "anchor position"))
+                      for a, c, x, y in anchors)
+        return cls(str(doc_id), str(page_id), refs, m, int(created_ms), nodes,
+                   uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "ItemsTransform":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["items"], raw["matrix"], raw["created_ms"],
+                       raw.get("anchors") or (), raw.get("uid") or "")
+
+
+@dataclass(frozen=True)
+class StrokePaste:
+    """Copied strokes pasted on a page (rm_select.append_items): their values (hex), as
+    the paste places them (scaled, centred where pasted, moveId 0:0, timestamp kept),
+    appended to the page's current layer in this order, each named ("edit", "<uid>/<n>")."""
+
+    doc_id: str
+    page_id: str
+    values: tuple[str, ...]
+    created_ms: int
+    uid: str = ""
+
+    def lines(self) -> list[rm_stroke.LineValue]:
+        return [rm_stroke.decode_line_value(bytes.fromhex(v)) for v in self.values]
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, values, created_ms: int, uid: str | None = None) -> "StrokePaste":
+        out = []
+        for value in values:
+            data = value.encode() if isinstance(value, rm_stroke.LineValue) else (
+                bytes(value) if isinstance(value, (bytes, bytearray)) else bytes.fromhex(str(value)))
+            try:
+                line = rm_stroke.decode_line_value(data)
+            except (RmParseError, ValueError) as err:
+                raise EditError(f"not the value of a stroke: {err}") from err
+            if line.tool in rm_select.NOT_ADDED or not line.points:
+                raise EditError(f"a stroke of tool {line.tool} cannot be pasted")
+            out.append(data.hex())
+        if not out:
+            raise EditError("a paste of no strokes")
+        return cls(str(doc_id), str(page_id), tuple(out), int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "StrokePaste":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["values"], raw["created_ms"], raw.get("uid") or "")
+
+
+STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore, StrokePaste, ItemsTransform)
 
 
 # ------------------------------------------------------------------ the pen settings of a document
@@ -645,12 +724,14 @@ PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete)
 DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
 
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
-        | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | ToolSettings)
+        | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | StrokePaste | ItemsTransform
+        | ToolSettings)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
                           "page-move": PageMove, "page-delete": PageDelete, "text": TextEdit,
                           "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete,
-                          "stroke-restore": StrokeRestore, "tool-settings": ToolSettings}
+                          "stroke-restore": StrokeRestore, "stroke-paste": StrokePaste,
+                          "items-transform": ItemsTransform, "tool-settings": ToolSettings}
 
 
 class PendingEdits:
@@ -886,6 +967,30 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 continue
             if edit.uid:
                 made[edit.uid] = new_id
+            continue
+        if isinstance(edit, StrokePaste):
+            try:
+                page, ids = rm_select.append_items(page, author=author, values=edit.lines())
+            except (rm_select.SelectError, rm_stroke.StrokeError) as err:
+                raise EditError(f"the paste does not fit the page: {err}") from err
+            made.update((f"{edit.uid}/{n}", item) for n, item in enumerate(ids))
+            continue
+        if isinstance(edit, ItemsTransform):
+            if page is None:
+                continue
+            done = Replay(page, made, removed, typed)
+            items = [done.resolve(ref) for ref in edit.items]
+            anchors = {(a, c): (x, y) for a, c, x, y in edit.anchors}
+            try:
+                page, moved, old = rm_select.transform_items(page, author=author, items=[i for i in items if i],
+                                                             m=edit.matrix, anchors=anchors)
+            except (rm_select.SelectError, rm_stroke.StrokeError) as err:
+                raise EditError(f"the transform does not fit the page: {err}") from err
+            for n, item in enumerate(items):
+                if item in moved:
+                    made[f"{edit.uid}/{n}"] = moved[item]
+                    if isinstance(old.get(item), rm_writer.ImageValue):
+                        removed[item] = old[item]
             continue
         if isinstance(edit, ToolSettings):
             continue

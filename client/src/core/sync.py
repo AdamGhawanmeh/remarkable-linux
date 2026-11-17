@@ -61,11 +61,11 @@ from typing import Any, Callable, Iterable
 
 from .auth import AuthClient, HttpResponse
 from .config import atomic_write_json, cache_dir, ensure_private_dir, read_json
-from viewer import rm_stroke
+from viewer import rm_select, rm_stroke
 from viewer.rm_parser import Color, Tool
 
-from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, PageAdd, PageCopy, PageDelete,
-                    PageMove, PendingEdits, STROKE_EDITS, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
+from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, ItemsTransform, PageAdd,
+                    PageCopy, PageDelete, PageMove, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
                     TextEdit, ToolSettings,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
@@ -447,6 +447,13 @@ def describe_edit(e) -> str:
         line = e.line()
         return (f"  put back a stroke on page {e.page_id} (undo/redo): {_name(Tool, line.tool)}, "
                 f"{line.count} points")
+    if isinstance(e, StrokePaste):
+        return f"  paste {len(e.values)} stroke{'s' if len(e.values) != 1 else ''} on page {e.page_id}"
+    if isinstance(e, ItemsTransform):
+        m = e.matrix
+        what = "move" if rm_select.is_translation(m) else "move/scale/turn"
+        return (f"  {what} {len(e.items)} selected item{'s' if len(e.items) != 1 else ''} on page {e.page_id}\n"
+                f"    by [{', '.join(f'{v:g}' for v in m)}] (m11 m12 m21 m22 dx dy)")
     if isinstance(e, ToolSettings):
         return "  pen settings: " + ", ".join(f"{k} = {v}" for k, v in e.values)
     if isinstance(e, ImageDelete):
