@@ -530,6 +530,42 @@ def current_layer(blocks: list[Block]) -> tuple[int, int]:
 PAPER = (1404, 1872)
 
 
+def page_loads(page: bytes | None) -> int | None:
+    """The `loads` counter of a page's PageStats (0x0A field 1), or None."""
+    if page is None:
+        return None
+    for block in split(page)[1]:
+        if block.type == BLOCK_PAGE_STATS:
+            for index, kind, value in read_values(block.payload):
+                if index == 1 and kind == TAG_BYTE4:
+                    return struct.unpack("<I", value)[0] if isinstance(value, bytes) else int(value)
+            return None
+    return None
+
+
+def saved(page: bytes, base: bytes | None) -> bytes:
+    """`page` as the app saves an edit session of `base` (its file as loaded): PageStats
+    `loads` is base's + 1 (the scene writer 0x140a094e0 writes loads + 1 and never stores
+    it back, so it counts load -> save generations, not saves; ARCHITECTURE.md 5.5). A page
+    with no file yet (base None) was made with loads 0 and written with 1 already
+    (blank_page). Every other byte stays."""
+    loaded = page_loads(base)
+    if loaded is None or page is base or page == base:
+        return page
+    header, blocks = split(page)
+    for n, block in enumerate(blocks):
+        if block.type != BLOCK_PAGE_STATS:
+            continue
+        values = read_values(block.payload)
+        if write_values(values) != block.payload:
+            return page
+        out = [(i, k, struct.pack("<I", (loaded + 1) & 0xFFFFFFFF) if i == 1 and k == TAG_BYTE4 else v)
+               for i, k, v in values]
+        blocks[n] = Block(block.type, block.min_version, block.version, write_values(out))
+        return join(header, blocks)
+    return page
+
+
 def blank_page(author: bytes) -> bytes:
     """A page with one empty layer, as the tablet stores a page nobody has drawn on:
     the built-in root node (0:1), Layer 1 (0:11, named at 0:12), the group item (0:13)

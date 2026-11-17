@@ -55,6 +55,12 @@ from ... import pen as pens
 log = logging.getLogger("rm.ui.quick.pen")
 
 LASSO_COLOR = QColor("#3f86ff")  # the selection blue (Colors.selectionToolBlue)
+# Hold to straighten: the pen held this still this long fixes the stroke as a straight
+# line, whose end then follows the pen until it is lifted (ShapesOverlay's Line). The
+# tablet's QML decides when a hold has happened and is not in reMarkable.exe, so these
+# two values are this client's own (ARCHITECTURE.md 5.1, "Straight lines and shapes").
+HOLD_MS = 500
+HOLD_SLOP_PX = 4.0
 STILL_MS = 25                   # PenInputSurface's timer: a held mouse adds a sample this often
 TOOLBAR_Z = 50
 SURFACE_Z = 1000
@@ -228,6 +234,7 @@ class _Drawing:
         self.pen, self.eraser, self.scale, self.stylus, self.lasso = pen, eraser, scale, stylus, lasso
         self.size = pen.size
         self.samples: list[tuple] = []
+        self.end: tuple[float, float] | None = None     # held: the straight line's end (scene)
         self.builder = None if eraser or lasso else s.StrokeBuilder(pen.tool.tool, pen.line_color, pen.size, pen.argb,
                                                                     scale=scale)
 
@@ -236,9 +243,22 @@ class _Drawing:
         if self.builder is not None:
             self.builder.add(*sample)
 
+    @property
+    def can_straighten(self) -> bool:
+        return self.builder is not None and len(self.builder.points) >= 3
+
+    def straight(self):
+        """The line as drawn, made straight to `end` (unthinned), or None."""
+        if self.end is None or not self.can_straighten:
+            return None
+        return s.straighten(self.builder.line(), self.end, self.scale)
+
     def line(self):
         if self.eraser:
             return s.eraser_line(self.samples, self.size, scale=self.scale)
+        straight = self.straight()
+        if straight is not None:
+            return s.simplify(straight)         # thinned like any stroke before addLine
         return s.simplify(self.builder.line()) if self.builder.points else None
 
 
@@ -266,6 +286,9 @@ class PenSurface(QQuickPaintedItem):
         self._seq = 0
         self._still = QTimer(self, interval=STILL_MS)
         self._still.timeout.connect(self._held)
+        self._hold = QTimer(self, singleShot=True, interval=HOLD_MS)
+        self._hold.timeout.connect(self._fix_straight)
+        self._hold_at: QPointF | None = None    # where the pen last came to rest (item coordinates)
         viewport.widthChanged.connect(self._fit)
         viewport.heightChanged.connect(self._fit)
         pen_tools.activeChanged.connect(self._mode)
@@ -348,18 +371,47 @@ class PenSurface(QQuickPaintedItem):
         if self._drawing is None:
             return
         p = self._scene(pos)
+        if self._drawing.end is not None:
+            self._drawing.end = (p.x(), p.y())      # held: the pen drags the line's end
+            self.update()
+            return
         self._drawing.add((p.x(), p.y(), *rest))
+        self._watch_hold(pos)
+        self.update()
+
+    def _watch_hold(self, pos: QPointF) -> None:
+        """Restart the hold timer when the pen has moved more than HOLD_SLOP_PX since it
+        last came to rest (a pen stroke only)."""
+        d = self._drawing
+        if d is None or d.builder is None:
+            return
+        if self._hold_at is None:
+            self._hold_at = QPointF(pos)            # the press: a pause before drawing is no hold
+        elif math.hypot(pos.x() - self._hold_at.x(), pos.y() - self._hold_at.y()) > HOLD_SLOP_PX:
+            self._hold_at = QPointF(pos)
+            self._hold.start()
+
+    def _fix_straight(self) -> None:
+        """The pen was held still: the stroke becomes a straight line from its first
+        point to the pen, which then moves only the line's end."""
+        d = self._drawing
+        if d is None or d.builder is None or not d.can_straighten or not d.samples:
+            return
+        self._still.stop()
+        d.end = (d.samples[-1][0], d.samples[-1][1])
         self.update()
 
     def _held(self) -> None:
         """The pressed mouse held still: its last sample once more."""
-        if self._drawing is not None and self._drawing.samples:
+        if self._drawing is not None and self._drawing.samples and self._drawing.end is None:
             self._drawing.add(self._drawing.samples[-1])
             self.update()
 
     def _end(self, commit: bool = True) -> None:
         drawing, self._drawing = self._drawing, None
         self._still.stop()
+        self._hold.stop()
+        self._hold_at = None
         if drawing is None:
             return
         if not commit or not self._view_ok() or not drawing.samples:
@@ -435,7 +487,8 @@ class PenSurface(QQuickPaintedItem):
     def mouseMoveEvent(self, event) -> None:
         if self._drawing is not None and not self._drawing.stylus:
             self.add(event.position())
-            self._still.start()
+            if self._drawing is not None and self._drawing.end is None:
+                self._still.start()
 
     def mouseReleaseEvent(self, event) -> None:
         if self._drawing is not None and not self._drawing.stylus:
@@ -481,8 +534,9 @@ class PenSurface(QQuickPaintedItem):
                 self._paint_one(painter, ("eraser", d.samples, width))
             elif d.builder.points:
                 pen = d.pen
-                self._paint_one(painter, preview_scene(pen.tool.tool, pen.line_color, pen.size, pen.argb,
-                                                       d.builder.points))
+                straight = d.straight()
+                points = straight.unpacked() if straight is not None else d.builder.points
+                self._paint_one(painter, preview_scene(pen.tool.tool, pen.line_color, pen.size, pen.argb, points))
 
     @staticmethod
     def _paint_lasso(painter: QPainter, samples) -> None:

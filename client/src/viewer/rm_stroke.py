@@ -465,6 +465,45 @@ def simplify(line: LineValue) -> LineValue | None:
     return replace(line, points=pack_points(points))
 
 
+# ------------------------------------------------------------------ hold to straighten
+
+def _crt_round(value: float) -> float:
+    """CRT round: half away from zero."""
+    return float(math.floor(value + 0.5)) if value >= 0 else float(math.ceil(value - 0.5))
+
+
+def straighten(line: LineValue, end: tuple[float, float], scale: float = 1.0) -> LineValue | None:
+    """The drawn `line` made a straight line to `end` (scene coordinates), as
+    sceneview::ShapesOverlay makes a Line (type 1, 0x140461c10 -> 0x14046be20): the
+    same points, each keeping its speed, width, direction and pressure bytes; only x
+    and y change. A = the first point, B = `end`, tol = min(|AB| / 3, 10) / scale
+    (`scale`: screen pixels per scene unit). A and B are rounded to whole scene units;
+    the line is made horizontal when |B.y - A.y| < tol, vertical when |B.x - A.x| < tol,
+    and otherwise keeps its slope (no angle steps). Point i goes to
+    A + (B - A) * s_i / s_total, s the length drawn up to it, in double precision,
+    stored as float32. None for fewer than 3 points ("Insufficient points in line")."""
+    points = line.unpacked()
+    if len(points) < 3:
+        return None
+    ax, ay = float(points[0].x), float(points[0].y)
+    bx, by = float(end[0]), float(end[1])
+    tol = min(math.hypot(bx - ax, by - ay) / 3.0, 10.0) / (scale if scale > 0 else 1.0)
+    ax, ay, bx, by = _crt_round(ax), _crt_round(ay), _crt_round(bx), _crt_round(by)
+    if abs(by - ay) < tol:
+        by = ay
+    if abs(bx - ax) < tol:
+        bx = ax
+    along = [0.0]
+    for p, q in zip(points, points[1:]):
+        along.append(along[-1] + math.hypot(float(q.x) - float(p.x), float(q.y) - float(p.y)))
+    total = along[-1]
+    out = []
+    for n, p in enumerate(points):
+        t = along[n] / total if total > 0 else (n / (len(points) - 1))
+        out.append(p._replace(x=f32(ax + (bx - ax) * t), y=f32(ay + (by - ay) * t)))
+    return replace(line, points=pack_points(out))
+
+
 def draw(samples: Iterable[tuple], tool: int, color: int = 0, thickness: float = MEDIUM, argb: int | None = None,
          **how) -> LineValue | None:
     """The line the app would put on a page for pen `samples`, each (x, y) from a
@@ -1153,4 +1192,5 @@ __all__ = ["BALLPOINT_V2", "CALLIGRAPHY", "COLOR_ARGB", "DEFAULT_TIMESTAMP", "ER
            "StrokeBuilder", "StrokeError", "StrokeItem", "THICK", "THIN", "append_stroke", "append_strokes", "can_join",
            "decode_line_value", "delete_strokes", "draw", "erase", "erase_line", "eraser_line", "eraser_outline",
            "find_strokes", "has_text", "restore_stroke",
-           "line_bounds", "make_point", "new_line", "pack_points", "simplify", "simplify_points", "strokes", "unpack_points"]
+           "line_bounds", "make_point", "new_line", "pack_points", "simplify", "simplify_points", "straighten", "strokes",
+           "unpack_points"]

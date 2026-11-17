@@ -1867,6 +1867,39 @@ class PenTests(unittest.TestCase):
         self.assertEqual(self.notices, [])
         self.assertEqual(real_warnings(self.app.warnings), [])
 
+    def test_holding_the_pen_still_straightens_the_stroke_and_the_end_follows_it(self):
+        from PySide6.QtTest import QTest
+        from ui.quick.bridge.pen import HOLD_MS
+        from viewer import rm_stroke
+        view = self.open_document(self.THROWAWAY, self.PAGE1)
+        before = self.strokes()
+        self.click(self.toolbar_item(view, "penTool_fineliner"))
+        wobbly = [(-300.0 + 12 * n, 600.0 + (7 if n % 2 else -5)) for n in range(20)]
+        at = [self.window_point(view, x, y) for x, y in wobbly]
+        QTest.mousePress(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at[0])
+        for p in at[1:]:
+            QTest.mouseMove(self.window, p)
+            wait(5)
+        surface = self.pens(view).surface
+        self.assertIsNone(surface._drawing.end)
+        wait(HOLD_MS + 250)                                         # held still: fixed as a straight line
+        self.assertIsNotNone(surface._drawing.end)
+        end = self.window_point(view, 100.0, 604.0)                  # dragged on: only the end moves
+        QTest.mouseMove(self.window, end)
+        wait(20)
+        QTest.mouseRelease(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, end)
+        self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(before) + 1), self.notices)
+        line = self.strokes()[-1].line
+        points = line.unpacked()
+        # A Fineliner straight line thins to its two ends; 4 units off level snaps it flat.
+        self.assertEqual(line.tool, rm_stroke.FINELINER_V2)
+        self.assertEqual(len(points), 2)
+        self.assertEqual(points[0].y, points[1].y)
+        self.assertEqual((points[0].x, points[0].y), (round(points[0].x), round(points[0].y)))
+        self.assertAlmostEqual(points[0].x, -300.0, delta=3)
+        self.assertAlmostEqual(points[1].x, 100.0, delta=3)
+        self.assertEqual(self.notices, [])
+
     def test_a_stylus_draws_with_its_pressure_and_switches_tools_on_the_toolbar(self):
         from PySide6.QtCore import QEvent
         view = self.open_document(self.THROWAWAY, self.PAGE1)

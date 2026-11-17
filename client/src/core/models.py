@@ -249,12 +249,18 @@ class Content:
                 ))
         elif isinstance(raw.get("pages"), list):
             # formatVersion 1: ordered page UUIDs; redirectionPageMap holds the
-            # PDF page per page, -1 for inserted pages.
-            redirects = raw.get("redirectionPageMap") or []
-            for i, pid in enumerate(raw["pages"]):
-                r = redirects[i] if i < len(redirects) else None
-                pages.append(Page(id=str(pid),
-                                  redirect=r if isinstance(r, int) and r >= 0 else None))
+            # PDF page per page, -1 for inserted pages. Read as reMarkable.exe 3.29
+            # upgrades it (fillContentFromDocument 0x1406cd640, ARCHITECTURE.md 5.4).
+            ids = raw["pages"]
+            redirects = _redirection_map(raw)
+            for i, pid in enumerate(ids):
+                if redirects is None:
+                    r = None                    # no usable map: no redir register
+                elif len(redirects) == len(ids):
+                    r = redirects[i]
+                else:
+                    r = i                       # "Inconsistent pagemap vs redirection map count"
+                pages.append(Page(id=str(pid), redirect=r if r is not None and r >= 0 else None))
         tags = []
         for tag in raw.get("tags") or []:
             tags.append(tag.get("name", "") if isinstance(tag, dict) else str(tag))
@@ -274,6 +280,29 @@ class Content:
     @property
     def page_ids(self) -> list[str]:
         return [p.id for p in self.pages if not p.deleted]
+
+
+def _redirection_map(raw: dict) -> list[int] | None:
+    """A formatVersion 1 redirectionPageMap as the app takes it, or None when it drops it
+    (0x1406cf100, 0x1406cf9f0): used only with originalPageCount as well; dropped
+    when originalPageCount < 1, and dropped whole when any value is < -1 or
+    >= originalPageCount ("Invalid page found in redirection map ... - rejecting")."""
+    if "redirectionPageMap" not in raw or "originalPageCount" not in raw:
+        return None
+    values, original = raw.get("redirectionPageMap"), raw.get("originalPageCount")
+    if not isinstance(values, list) or isinstance(original, bool) or not isinstance(original, (int, float)):
+        return None
+    original = int(original)
+    if original < 1:
+        return None
+    out = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+            return None
+        if not -1 <= int(value) < original:
+            return None
+        out.append(int(value))
+    return out
 
 
 @dataclass

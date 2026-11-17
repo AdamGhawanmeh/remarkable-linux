@@ -912,6 +912,7 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
     meanwhile, on the tablet or here: the delete wins). Images-table entries no item
     shows any more are dropped at the end, as the app drops them when it saves
     (pruneImageTable): an image deleted then put back keeps its entry where it was."""
+    base = page
     made: dict[str, tuple[int, int]] = {}
     removed: dict[tuple[int, int], rm_writer.ImageValue] = {}
     deleted: set[bytes] = set()
@@ -1029,6 +1030,10 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
             note(edit.uid, key)
     if deleted and page is not None:
         page, _ = rm_writer.prune_images(page, deleted)
+    if page is not None and base is not None:
+        # One save of the page's editing session: PageStats loads + 1 over its file as
+        # loaded, however many edits the session made (the app's writer, 0x140a094e0).
+        page = rm_writer.saved(page, base)
     return Replay(page, made, removed, typed)
 
 

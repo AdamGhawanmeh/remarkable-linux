@@ -97,9 +97,16 @@ class ModelTests(unittest.TestCase):
             {"id": PAGE2, "idx": {"value": "bb"}},                         # inserted page
             {"id": PAGE3, "idx": {"value": "bc"}, "redir": {"value": 1}}]}})
         self.assertEqual([p.redirect for p in c.pages], [0, None, 1])
-        v1 = Content.parse({"formatVersion": 1, "pages": [PAGE1, PAGE2, PAGE3],
-                            "redirectionPageMap": [0, -1]})
-        self.assertEqual([p.redirect for p in v1.pages], [0, None, None])
+        def v1(pages=(PAGE1, PAGE2, PAGE3), **fields):
+            return [p.redirect for p in Content.parse({"formatVersion": 1, "pages": list(pages), **fields}).pages]
+        # As reMarkable.exe 3.29 upgrades formatVersion 1 (0x1406cd640, ARCHITECTURE.md 5.4):
+        self.assertEqual(v1(redirectionPageMap=[2, -1, 0], originalPageCount=3), [2, None, 0])
+        self.assertEqual(v1(redirectionPageMap=[0, -1]), [None, None, None])     # no originalPageCount: unused
+        self.assertEqual(v1(redirectionPageMap=[5, -1], originalPageCount=6), [0, 1, 2])  # length differs: page i
+        self.assertEqual(v1(redirectionPageMap=[0, 3, 1], originalPageCount=3), [None, None, None])  # out of range
+        self.assertEqual(v1(redirectionPageMap=[0, -2, 1], originalPageCount=3), [None, None, None])
+        self.assertEqual(v1(redirectionPageMap=[0, 1, 2], originalPageCount=0), [None, None, None])
+        self.assertEqual(v1(), [None, None, None])
         self.assertEqual(Metadata.parse({"lastOpenedPage": 4}).last_opened_page, 4)
         self.assertEqual(Metadata.parse({"lastOpenedPage": "x"}).last_opened_page, 0)
 

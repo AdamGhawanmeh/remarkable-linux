@@ -1193,11 +1193,14 @@ is a different feature: highlighter snapped to text (`snapHighlighterToText`).
   101 points, 3.6° apart, all edges equal (a 100-gon path) or 65 after Fineliner thinning. A
   Ballpoint polygon's edges are multiples of 20.226 (= L/ceil(L/20)) and 21.22.
 
-**Client deviation**: the client has no hold-to-straighten or shapes yet. To add them, a
-client would have to supply what the tablet supplies here: the hold detection (time
-and stillness, unknown) and the shape path for types 2–5 (unknown recogniser; the
-ellipse is a 100-gon). The line case needs neither and could follow the rules above
-exactly.
+**The client** (`rm_stroke.straighten`; hold detection in `bridge/pen.py` PenSurface) makes
+the Line case by the rules above: when a pen stroke has been held within 4 screen pixels
+for 500 ms (the client's own values: the tablet's are not in this binary; the timer is not
+armed until the pen has moved after the press), the stroke is fixed as a straight line
+from its first point, the pen then drags only its end, and on release the straightened
+line goes through the usual RDP thinning and is kept as one StrokeAdd. Points are placed
+along the segment by the length drawn up to them, as 0x14046be20 does, not projected.
+**Deviation**: shapes (types 2–5) are not made, as their recogniser is not in this binary.
 
 Not traced yet: sync upload rules, `insertItemsAtCursorPosition` (paste in text mode),
 which tablet operation writes a moved stroke with one generation of ids, and the tablet-side
@@ -1380,10 +1383,10 @@ The app upgrades version 1 when it loads a document (`fillContentFromDocument`,
 5. `cPages` is written, `formatVersion` becomes 2 and `pageCount` the number of pages.
    `originalPageCount`, `redirectionPageMap` and `pages` are removed.
 
-*Client deviation (edge cases only, not changed):* `core.models.Content.parse` takes
-`redirectionPageMap[i]` per page, or no background past the map's end. The app uses `i` for
-every page when the lengths differ, and drops every background when one value is out of
-range. No real file reaches either case (all 61 maps are valid identity maps).
+*Client:* `core.models.Content.parse` follows steps 2–4: the map only with
+`originalPageCount`, dropped whole when that is < 1 or any value is < −1 or ≥ it, `i` for every
+page when the lengths differ, no background without a usable map. All 64 formatVersion 1
+`.content` files of the cached library read the same as before the change.
 
 **`.rm` v6 on PDF/EPUB pages** [O on real data]. A page only has a `.rm` once something was
 put on it: 87 of 2325 live PDF-backed pages, 53 of 58 inserted pages, 1 of 125 EPUB pages,
@@ -1549,10 +1552,11 @@ Corpus check:
   per version (1→3, 2→4→5). Equal pairs (1, 1 and 2, 2) exist: two saves from one
   loaded scene, as the rule predicts.
 
-**Deviations in this client.** `rm_text.edit_text` updates `textChars` and `textLines`.
-The stroke and image writers leave `loads` as it was. The app would write `loads + 1` in
-the first save after loading the page. To match it, add 1 once per page per editing
-session (one replay of a page's pending edits onto its base), not once per stroke.
+**In this client.** `rm_text.edit_text` updates `textChars` and `textLines`. `core.edits.replay`
+(one replay of a page's pending edits onto its file as last synced = one load→save session)
+ends with `rm_writer.saved`: `loads` = the base file's + 1, once, however many edits the
+session made; a page with no file yet keeps the 1 `blank_page` writes, and a replay that
+changes nothing changes nothing.
 
 ## 6. Implications for the Linux client
 

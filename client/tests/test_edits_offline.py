@@ -210,9 +210,12 @@ class DocumentFilesTests(Base):
         self.assertEqual((image.file_name, image.image_ref.hex(), image.vertices), (edit.file_name, edit.key, box()))
         self.assertEqual(len(parse(files[rm]).strokes), 1)
         # The page as it was, plus the image: the old blocks are all still there, byte for byte.
-        old = [b.encode() for b in rm_writer.split(drawn_page())[1]][1:]
-        new = [b.encode() for b in rm_writer.split(files[rm])[1]]
+        # PageStats aside: its `loads` is one more, as the app's writer saves a loaded page.
+        stats = rm_writer.BLOCK_PAGE_STATS
+        old = [b.encode() for b in rm_writer.split(drawn_page())[1] if b.type != stats][1:]
+        new = [b.encode() for b in rm_writer.split(files[rm])[1] if b.type != stats]
         self.assertTrue(set(old) <= set(new))
+        self.assertEqual(rm_writer.page_loads(files[rm]), rm_writer.page_loads(drawn_page()) + 1)
         self.assertEqual(len(new), len(old) + 3)                    # authors (ours added), table, item
         self.assertEqual(rm_writer.decode_authors(rm_writer.split(files[rm])[1][0].payload),
                          [(TABLET, 1), (self.sync.author(), 2)])

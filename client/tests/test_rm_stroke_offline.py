@@ -698,8 +698,11 @@ class StrokeEditTests(Base):
         once = page_with_edits(drawn_page(), [first, second], author)
         again = replay(once, [first, second], author)
         self.assertEqual((again.page, again.made), (once, {first.uid: (2, 16), second.uid: (2, 17)}))
-        partly = replay(page_with_edits(drawn_page(), [first], author), [first, second], author)
-        self.assertEqual((partly.page, partly.made), (once, again.made))
+        uploaded = page_with_edits(drawn_page(), [first], author)
+        partly = replay(uploaded, [first, second], author)
+        # The same page, saved in a new session of the uploaded file: loads one more again.
+        self.assertEqual((partly.page, partly.made), (w.saved(once, uploaded), again.made))
+        self.assertEqual(w.page_loads(partly.page), w.page_loads(drawn_page()) + 2)
 
     def test_the_same_line_drawn_twice_is_two_strokes(self):
         author = self.sync.author()
@@ -714,7 +717,9 @@ class StrokeEditTests(Base):
         files = self.files([StrokeAdd.new(THROWAWAY, PAGE1, self.line(), NOW)])
         rm, content, metadata = f"{THROWAWAY}/{PAGE1}.rm", f"{THROWAWAY}.content", f"{THROWAWAY}.metadata"
         self.assertEqual(sorted(files), sorted([rm, content, metadata]))
-        self.assertEqual(files[rm], s.append_stroke(drawn_page(), author=self.sync.author(), line=self.line()))
+        drawn = s.append_stroke(drawn_page(), author=self.sync.author(), line=self.line())
+        self.assertEqual(files[rm], w.saved(drawn, drawn_page()))         # + PageStats loads + 1
+        self.assertEqual(w.page_loads(files[rm]), w.page_loads(drawn_page()) + 1)
         self.assertEqual(json_changes(json.loads(self.source.blob(self.doc, content)), json.loads(files[content])),
                          [(f"cPages.pages[id={PAGE1}].modifed", None, str(NOW))])
         self.assertEqual(json_changes(self.doc.metadata.raw, json.loads(files[metadata])),
@@ -1018,3 +1023,77 @@ class CachedLibraryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StraightenTests(unittest.TestCase):
+    """Hold to straighten: ShapesOverlay's Line (0x140461c10 -> 0x14046be20)."""
+
+    def drawn(self, tool=s.BALLPOINT_V2, samples=None):
+        samples = samples or [(10.3 + 6 * k, 20.6 + 2.0 * k + (k % 3), 0.3 + 0.05 * k) for k in range(12)]
+        pen = s.StrokeBuilder(tool, 0, s.MEDIUM)
+        for sample in samples:
+            pen.add(*sample)
+        return pen.line()
+
+    def test_fewer_than_three_points_make_nothing(self):
+        self.assertIsNone(s.straighten(self.drawn(samples=[(0, 0), (5, 5)]), (50, 50)))
+
+    def test_points_go_along_the_segment_by_length_drawn_keeping_their_numbers(self):
+        line = self.drawn()
+        out = s.straighten(line, (300.4, 251.7))
+        a, b = out.unpacked()[0], out.unpacked()[-1]
+        self.assertEqual((a.x, a.y, b.x, b.y), (10.0, 21.0, 300.0, 252.0))      # rounded to whole units
+        drawn = line.unpacked()
+        along = [0.0]
+        for p, q in zip(drawn, drawn[1:]):
+            along.append(along[-1] + math.hypot(q.x - p.x, q.y - p.y))
+        for n, (p, q) in enumerate(zip(drawn, out.unpacked())):
+            t = along[n] / along[-1]
+            self.assertEqual((q.x, q.y), (s.f32(10 + 290 * t), s.f32(21 + 231 * t)))
+            self.assertEqual((q.speed, q.width, q.direction, q.pressure), (p.speed, p.width, p.direction, p.pressure))
+        self.assertEqual((out.tool, out.thickness_scale, out.timestamp, out.count), (line.tool, 2.0, (0, 1), line.count))
+
+    def test_snaps_horizontal_and_vertical_within_the_tolerance_only(self):
+        line = self.drawn()
+        # |AB| / 3 caps at 10: a 9-unit step on a long line is flattened...
+        flat = s.straighten(line, (400.0, 30.0)).unpacked()
+        self.assertEqual({p.y for p in flat}, {21.0})
+        upright = s.straighten(line, (19.0, 500.0)).unpacked()
+        self.assertEqual({p.x for p in upright}, {10.0})
+        # ...a 10-unit step is not (no angle steps either)...
+        self.assertNotEqual(len({p.y for p in s.straighten(line, (400.0, 31.0)).unpacked()}), 1)
+        # ...and the tolerance is in screen units: zoomed in 2x it halves.
+        self.assertNotEqual(len({p.y for p in s.straighten(line, (400.0, 27.0), scale=2.0).unpacked()}), 1)
+        self.assertEqual({p.y for p in s.straighten(line, (400.0, 25.0), scale=2.0).unpacked()}, {21.0})
+        # On a short line the tolerance is a third of its length.
+        short = s.straighten(line, (22.0, 24.0)).unpacked()                # |AB| ~ 12.4 -> 4.1
+        self.assertEqual({p.y for p in short}, {21.0})
+
+    def test_thinning_after_it_as_for_any_stroke(self):
+        # The Fineliner ignores pressure: a straight one thins to its two ends.
+        fine = s.simplify(s.straighten(self.drawn(s.FINELINER_V2), (300.0, 21.0)))
+        self.assertEqual(fine.count, 2)
+        # The Ballpoint keeps its pressure profile along the line.
+        ball = s.simplify(s.straighten(self.drawn(s.BALLPOINT_V2), (300.0, 21.0)))
+        self.assertGreater(ball.count, 2)
+        self.assertEqual({p.y for p in ball.unpacked()}, {21.0})
+
+
+class PageStatsLoadsTests(unittest.TestCase):
+    """PageStats loads + 1 once per editing session of a page (ARCHITECTURE.md 5.5)."""
+
+    def test_one_more_however_many_edits_the_session_made(self):
+        from core.edits import StrokeAdd, replay
+        author = w.author_uuid("loads-test")
+        base = drawn_page()
+        loads = w.page_loads(base)
+        lines = [s.draw([(x, 0.0), (x + 20.0, 30.0)], s.FINELINER_V2) for x in (0.0, 50.0, 100.0)]
+        edits = [StrokeAdd.new(THROWAWAY, PAGE1, line, NOW) for line in lines]
+        self.assertEqual(w.page_loads(replay(base, edits[:1], author).page), loads + 1)
+        self.assertEqual(w.page_loads(replay(base, edits, author).page), loads + 1)
+        self.assertIs(replay(base, [], author).page, base)                           # no edit, no save
+        self.assertEqual(w.page_loads(replay(None, edits, author).page), 1)           # a new page: 0 -> 1
+        # Only field 1 changes.
+        stats = lambda page: [b.payload for b in w.split(page)[1] if b.type == w.BLOCK_PAGE_STATS][0]  # noqa: E731
+        before, after = w.read_values(stats(base)), w.read_values(stats(replay(base, edits, author).page))
+        self.assertEqual([v for v in before if v[0] != 1], [v for v in after if v[0] != 1])
