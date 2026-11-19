@@ -57,6 +57,10 @@ TOOLS: tuple[PenTool, ...] = (
     # Every cached document with highlighter settings has size "1" and a highlighter colour.
     PenTool("highlighter", "Highlighter", s.HIGHLIGHTER_V2, "Highlighterv2", "highlighter", 1, "yellow"),
     PenTool("calligraphy", "Calligraphy pen", s.CALLIGRAPHY, "Calligraphy", "calligraphy_pen"),
+    # The Shader (Line::Tool ShadingMarker, the toolbar's ninth pen). No cached document
+    # holds a stroke or a setting of it, and the tablet's toolbar (its colours) is not in
+    # reMarkable.exe: it offers the pen colours, grey first, which is this client's choice.
+    PenTool("shader", "Shader", s.SHADING_MARKER, "ShadingMarker", "shader", 2, "grey"),
     PenTool("eraser", "Eraser", s.ERASER, "Eraser", "eraser"),
 )
 BY_KEY = {t.key: t for t in TOOLS}

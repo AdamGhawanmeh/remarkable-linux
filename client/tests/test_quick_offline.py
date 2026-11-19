@@ -1738,7 +1738,7 @@ class PenTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: self.pens(view).toolbar.property("visible")))
         self.assertEqual([t["key"] for t in tools.property("tools")],
                          ["fineliner", "ballpoint", "marker", "pencil", "mechanical_pencil", "paintbrush",
-                          "highlighter", "calligraphy", "eraser"])
+                          "highlighter", "calligraphy", "shader", "eraser"])
         self.assertFalse(tools.property("active"))
         self.assertEqual(real_warnings(self.app.warnings), [])
 
@@ -1792,7 +1792,7 @@ class PenTests(unittest.TestCase):
         before = len(self.strokes())
         self.assertFalse(options.isVisible())
         for key in ("fineliner", "ballpoint", "marker", "pencil", "mechanical_pencil", "paintbrush", "highlighter",
-                    "calligraphy", "eraser"):
+                    "calligraphy", "shader", "eraser"):
             button = self.toolbar_item(view, f"penTool_{key}")
             centre = button.mapToScene(QPointF(button.width() / 2, button.height() / 2)).toPoint()
             QTest.mouseMove(self.window, centre)
@@ -1868,7 +1868,7 @@ class PenTests(unittest.TestCase):
         self.redo_key()
         self.assertTrue(self.wait_for(lambda: len(self.strokes()) == len(erased)), self.notices)
         self.assertEqual(sorted(s.line.points for s in self.strokes()), sorted(s.line.points for s in erased))
-        self.assertFalse(controller.property("redoAvailable"))
+        self.assertTrue(self.wait_for(lambda: not controller.property("redoAvailable")))   # set once the page is shown again
         # Undo all the way: the page as the tablet left it; the tablet's stroke untouched.
         for _ in range(3):
             self.assertTrue(self.wait_for(lambda: controller.property("undoAvailable")))

@@ -127,11 +127,13 @@ def _draw_pdf_page(painter: QPainter, content: PageContent) -> None:
     painter.restore()
 
 
-def render_content(content: PageContent, scale: float, crop: str = "page") -> QImage:
+def render_content(content: PageContent, scale: float, crop: str = "page", background: bool = True) -> QImage:
     """Render one page to an image at `scale` (page pixels → image pixels).
 
     crop "page" grows with the content (faithful, scrollable); "clip" is exactly the
-    page frame (thumbnails).
+    page frame (thumbnails). `background` False leaves out the template, or the PDF
+    page, as the app's "Hide template" does (SceneController.backgroundVisible): ink,
+    images and typed text are drawn all the same, and the page keeps its frame.
     """
     x, y, w, h = content.bounds(crop)
     image = QImage(max(1, round(w * scale)), max(1, round(h * scale)),
@@ -141,9 +143,9 @@ def render_content(content: PageContent, scale: float, crop: str = "page") -> QI
     try:
         painter.scale(scale, scale)
         painter.translate(-x, -y)
-        if content.template is not None and not content.has_pdf_page:
+        if background and content.template is not None and not content.has_pdf_page:
             paint_template(painter, content.template, (x, y, w, h))
-        if content.has_pdf_page:
+        if background and content.has_pdf_page:
             _draw_pdf_page(painter, content)
         if content.scene is not None:
             paint(painter, content.scene, background=PAPER)

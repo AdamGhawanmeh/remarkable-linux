@@ -35,8 +35,12 @@ What the app does around typing, and this does too:
   Bold and italic (setTextStyle, 0x140954a40): on a selection, all of it styled, or
   unstyled when all of it has the style; without one, the style of what is typed next.
 
-Not done as the app does: a line break (Shift+Enter: the app's character for it is
-not decoded) does nothing; the checkbox and numbered-list typing shortcuts (their
+  Shift+Enter (the LineBreak action, 0x140443380) types U+2028, QChar::LineSeparator,
+  through the keystroke path: a character of the paragraph, so the line breaks and
+  the paragraph (and its style, its list marker) goes on.
+  A click on a checkbox (toggleCheckboxByIndex, 0x140988a80) checks or unchecks it.
+
+Not done as the app does: the checkbox and numbered-list typing shortcuts (their
 strings live in the app's settings, not decoded) are not made; clicking below the text
 moves the cursor to its end rather than adding empty lines down to the click.
 """
@@ -50,7 +54,7 @@ from typing import Callable
 from core.edits import (BODY_TEXT, CharRef, Replay, StyleChange, TextChange, TextEdit, TextPart,
                         apply_text_edit)
 from viewer import rm_text, rm_writer as w
-from viewer.renderer import BASELINE_AT, TextLine, caret_x, index_at, layout_text, line_of
+from viewer.renderer import BASELINE_AT, LINE_SEPARATOR, TextLine, caret_x, index_at, layout_text, line_of
 from viewer.rm_parser import (FORMAT_BOLD_START, FORMAT_ITALIC_START, STYLE_LIST, STYLE_TEXT, PageScene,
                               ParagraphStyle, StyleEntry, _style_from_legacy, text_block)
 
@@ -648,6 +652,24 @@ class TextSession:
                 self._set_style(index, stored, changes)
         self._step(changes)
 
+    def toggle_checkbox(self, position: int) -> bool:
+        """A click on the checkbox of the paragraph that starts at text index `position`
+        (SceneController::toggleCheckboxByIndex 0x140449870 -> 0x140988a80): its
+        style turned by 0x1408b5710, a checkbox checked (or partly, 3) becomes unchecked
+        and any other checkbox checked, as one undo step; the cursor stays where it is.
+        False when no checkbox paragraph starts there."""
+        if not 0 <= position <= self.text.length or self.paragraph_range(position)[0] != position:
+            return False
+        base, properties = held(self.stored_style(position))
+        if not (is_list(base, properties) and properties >> 4 & 0xF == 1):
+            return False
+        self._stop_typing()
+        state = 0 if properties >> 8 & 7 in (1, 3) else 1
+        changes: list = []
+        self._set_style(position, store(base, (properties & ~0x700) | state << 8), changes)
+        self._step(changes)
+        return bool(changes)
+
     def set_style(self, style: ParagraphStyle) -> None:
         self._stop_typing()
         changes: list = []
@@ -844,7 +866,7 @@ class TextSession:
         elif kind == UNINDENT:
             self.indent(-1)
         elif kind == LINE_BREAK:
-            pass
+            self.type_text(LINE_SEPARATOR)
         else:
             return False
         return True

@@ -457,6 +457,9 @@ class PageScene:
     block_counts: dict[int, int] = field(default_factory=dict)
     # Blocks present but not interpreted (e.g. glyph highlights), by block type.
     skipped_blocks: dict[int, int] = field(default_factory=dict)
+    # SceneInfo (0x0D) field 2, a last-write-wins bool: whether the template (or the
+    # PDF page) is shown, as the tablet's "Hide template" leaves it. True when absent.
+    background_visible: bool = True
 
     @property
     def strokes(self) -> list[Stroke]:
@@ -976,6 +979,7 @@ def _parse_v6(data: bytes) -> PageScene:
     r = _Reader(data, HEADER_LENGTH)
     names: dict[tuple, str] = {}
     visible: dict[tuple, bool] = {}
+    background_visible = True
     layer_order: list[tuple] = []           # child node ids under the root, in order
     lines: list[tuple[tuple, Stroke]] = []  # (parent node, stroke) in file order
     deleted: set[tuple] = set()
@@ -1030,6 +1034,10 @@ def _parse_v6(data: bytes) -> PageScene:
                     lines.append((parent, stroke))
             elif block_type == BLOCK_ROOT_TEXT:
                 text = _decode_root_text(payload, authors)
+            elif block_type == 0x0D:                # SceneInfo: field 2 background visible
+                f = _read_fields(payload)
+                if 2 in f and f[2].type == TAG_LENGTH4:
+                    background_visible = _lww_bool(f[2].raw)
             elif block_type == BLOCK_IMAGE_ITEM:
                 # Same item header as other scene items; the value is kept raw.
                 f = _read_fields(payload)
@@ -1117,7 +1125,8 @@ def _parse_v6(data: bytes) -> PageScene:
         else:
             result.insert(0, Layer(name="Root", images=[image], node_id=ROOT_NODE))
     return PageScene(version=6, layers=result, x_origin=PAGE_WIDTH / 2, text=text,
-                     images=images, block_counts=counts, skipped_blocks=skipped)
+                     images=images, block_counts=counts, skipped_blocks=skipped,
+                     background_visible=background_visible)
 
 
 IMAGE_ITEM_TYPE = 7      # the value's leading byte, as 2 is a group and 3 a line

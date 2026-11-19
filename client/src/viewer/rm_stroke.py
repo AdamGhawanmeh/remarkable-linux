@@ -239,6 +239,19 @@ _SPEED_FADES_PRESSURE = frozenset({PAINTBRUSH, PENCIL, MARKER, PAINTBRUSH_V2, BA
 _SPEED_FACTOR = 1.0                                             # 0x14121d6b0
 
 
+def rotation_of(m11: float, m12: float, m21: float, m22: float) -> float | None:
+    """The rotation (degrees) PenInputLineHandler::setTransform (0x140aca100) reads off
+    the transform it is given, for the calligraphy nib: a matrix with no shear part
+    (m12 = m21 = 0) is 0 when both scales are positive, else 180; one with no scale
+    part (m11 = m22 = 0) is 90 when m12 > 0 and m21 < 0, else 270; anything else is
+    "unknown rotation" (None: the handler keeps the rotation it had)."""
+    if m12 == 0 and m21 == 0:
+        return 0.0 if m11 > 0 and m22 > 0 else 180.0
+    if m11 == 0 and m22 == 0:
+        return 90.0 if m12 > 0 and m21 < 0 else 270.0
+    return None
+
+
 class StrokeBuilder:
     """A line being drawn: every pen sample added becomes one point, as
     PenInputLineHandler makes it (state 0x140b40c30, addPoint 0x140b40df0).
@@ -553,10 +566,11 @@ def strokes(page: bytes | None, parent: tuple[int, int] | None = None) -> list[S
 def has_text(blocks: list[w.Block]) -> bool:
     """Whether the page has a text box (RootText, 0x07). Strokes are drawn and erased on
     such a page as on any other: a new one goes on the current layer itself, unanchored;
-    the eraser takes only the layer's own line items (0x05) and leaves the text as it
-    is. (The app puts strokes drawn on a page with text into anchored groups, which
-    follow the text when it reflows: 472 of 472 strokes on the cached pages with real
-    text, ARCHITECTURE.md 5.1. Those are not made here.)"""
+    the eraser takes the layer's line items and those of the groups below it, those
+    anchored to the text where the page draws them (erase, `anchors`), and leaves the
+    text as it is. (The app puts strokes drawn on a page with text into anchored
+    groups, which follow the text when it reflows: 472 of 472 strokes on the cached
+    pages with real text, ARCHITECTURE.md 5.1. New ones are not made here.)"""
     return any(b.type == w.BLOCK_ROOT_TEXT for b in blocks)
 
 
@@ -1079,14 +1093,63 @@ class Erased:
         return tuple(i for ids in self.pieces for i in ids)
 
 
-def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, int] | None = None) -> Erased:
+def group_nodes(blocks: list[w.Block], node: tuple[int, int]) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """(group node, its parent node) for the groups below `node`, at any depth, through
+    live group items: each node before the ones below it, in the order its parent holds
+    them (the scene's group visitor, 0x1408d1670)."""
+    out: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    seen = {tuple(node)}
+
+    def visit(parent: tuple[int, int]) -> None:
+        done: set[int] = set()
+        for _, block in w.sequence(blocks, parent):
+            if block.type != w.BLOCK_GROUP_ITEM or id(block) in done:
+                continue
+            done.add(id(block))
+            item = w.decode_item(block.payload)
+            if item.value is None:
+                continue
+            child = next((v for i, k, v in w.read_values(item.value[1:]) if (i, k) == (2, w.TAG_ID)), None)
+            if child is None or child in seen:
+                continue
+            seen.add(child)
+            out.append((child, parent))
+            visit(child)
+
+    visit(tuple(node))
+    return out
+
+
+def anchored_nodes(blocks: list[w.Block]) -> set[tuple[int, int]]:
+    """The tree nodes of a page that carry a text anchor (SceneTreeNode field 7)."""
+    out = set()
+    for block in blocks:
+        if block.type == w.BLOCK_TREE_NODE:
+            fields = {i: (k, v) for i, k, v in w.read_values(block.payload)}
+            if 7 in fields and 1 in fields and fields[1][0] == w.TAG_ID:
+                out.add(fields[1][1])
+    return out
+
+
+def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, int] | None = None,
+          anchors: dict | None = None) -> Erased:
     """`page` with the eraser line `eraser` (tool Eraser, or EraseSection for a lasso)
-    taken over `layer` (default: the current layer), as the app erases (0x140994f30):
-    every stroke of the layer it touches is deleted (as delete_strokes does), in the
-    order the layer holds them; then what is left of each is put right after it as new strokes,
-    with the page's next ids (0x140993ba0 -> 0x1408c8920). A piece has the stroke's
-    tool, colour and size, timestamp 0:1 and no moveId; a shader's piece names the
-    stroke it comes from (sourceId). Untouched when the eraser meets nothing."""
+    taken over `layer` (default: the current layer), as the app erases (0x140996ae0 ->
+    0x140994f30): the layer's own strokes, then those of every group below it at any
+    depth (group_nodes), in the order each node holds them. Every stroke it touches is
+    deleted (as delete_strokes does); then what is left of each is put right after it,
+    in its own node, as new strokes with the page's next ids (0x140993ba0 ->
+    0x1408c8920). A piece has the stroke's tool, colour and size, timestamp 0:1 and no
+    moveId; a shader's piece names the stroke it comes from (sourceId).
+
+    A group anchored to typed text stores its strokes relative to its anchor position:
+    `anchors` gives that position (scene = stored + position) by node, and it is added
+    to the stroke's points for the cut test only (0x140a63920 takes it as dx, dy), so
+    the pieces keep the group's own coordinates. A node below an anchored group takes
+    the nearest anchored group's position. An anchored group whose position is not
+    given is left alone (it cannot be told where it is drawn). The group's anchor is
+    not touched; the app's clustering and re-anchoring afterwards (0x140979810) is not
+    done. Untouched when the eraser meets nothing."""
     if eraser.tool not in (ERASER, ERASE_SECTION):
         raise StrokeError(f"tool {eraser.tool} does not erase")
     if eraser.count >= MAX_STORED_POINTS:
@@ -1096,25 +1159,39 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
     outline = eraser_outline(eraser)
     if not outline.points:
         return Erased(page, (), ())
+    anchors = {tuple(k): (float(v[0]), float(v[1])) for k, v in (anchors or {}).items()}
+    anchored = anchored_nodes(blocks)
+    # Where each node's strokes are drawn: the nearest anchored node's position.
+    offset: dict[tuple[int, int], tuple[float, float] | None] = {layer: (0.0, 0.0)}
+    nodes = [layer]
+    for node, parent in group_nodes(blocks, layer):
+        nodes.append(node)
+        offset[node] = anchors.get(node) if node in anchored else offset.get(parent)
     hit: list[tuple[w.ItemHeader, LineValue, list[LineValue]]] = []
     seen: set[int] = set()
-    for _, block in w.sequence(blocks, layer):
-        if block.type != w.BLOCK_LINE_ITEM or id(block) in seen:
+    for node in nodes:
+        where = offset.get(node)
+        if where is None:
             continue
-        seen.add(id(block))
-        item = w.decode_item(block.payload)
-        if item.value is None or block.version < 2:
-            continue
-        line = decode_line_value(item.value)
-        pieces = erase_line(outline, line)
-        if pieces is not None:
-            hit.append((item, line, pieces))
+        for _, block in w.sequence(blocks, node):
+            if block.type != w.BLOCK_LINE_ITEM or id(block) in seen:
+                continue
+            seen.add(id(block))
+            item = w.decode_item(block.payload)
+            if item.value is None or block.version < 2:
+                continue
+            line = decode_line_value(item.value)
+            pieces = erase_line(outline, line, *where)
+            if pieces is not None:
+                hit.append((item, line, pieces))
     if not hit:
         return Erased(page, (), ())
     me = w._author_index(blocks, author) if any(pieces for _, _, pieces in hit) else None
-    chain = _Chain(blocks, layer)
+    chains: dict[tuple[int, int], _Chain] = {}
     for item, _, _ in hit:
-        chain.delete(item.item)
+        if item.parent not in chains:
+            chains[item.parent] = _Chain(blocks, item.parent)
+        chains[item.parent].delete(item.item)
     clock = w.highest_counter(blocks)
     made = []
     for item, line, pieces in hit:
@@ -1123,11 +1200,13 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
             if line.tool == SHADING_MARKER:
                 piece = replace(piece, source_id=line.source_id if line.source_id not in (None, ZERO_ID) else item.item)
             clock += 1
-            chain.insert_after(left, (me, clock), piece.encode())
+            chains[item.parent].insert_after(left, (me, clock), piece.encode())
             left = (me, clock)
             ids.append(left)
         made.append(tuple(ids))
-    return Erased(w.join(header, chain.write(blocks)), tuple(item.item for item, _, _ in hit), tuple(made))
+    for chain in chains.values():
+        blocks = chain.write(blocks)
+    return Erased(w.join(header, blocks), tuple(item.item for item, _, _ in hit), tuple(made))
 
 
 def restore_stroke(page: bytes, *, author: bytes, item: tuple[int, int], line: LineValue,
@@ -1170,10 +1249,11 @@ def eraser_line(samples: Iterable[tuple], thickness: float = MEDIUM, tool: int =
 
 
 __all__ = ["BALLPOINT_V2", "CALLIGRAPHY", "COLOR_ARGB", "DEFAULT_TIMESTAMP", "ERASER", "ERASE_SECTION", "Erased",
-           "FINELINER_V2", "HIGHLIGHTER_V2", "LineValue", "MARKER_V2", "MEDIUM", "MOUSE_PRESSURE", "NOT_DRAWN",
+           "FINELINER_V2", "HIGHLIGHTER_V2", "LineValue", "anchored_nodes", "group_nodes", "MARKER_V2", "MEDIUM", "MOUSE_PRESSURE", "NOT_DRAWN",
            "Outline", "PAINTBRUSH_V2", "PENCIL_V2", "PENS", "Point", "SHADING_MARKER", "SHARP_PENCIL_V2",
            "StrokeBuilder", "StrokeError", "StrokeItem", "THICK", "THIN", "append_stroke", "append_strokes", "can_join",
            "decode_line_value", "delete_strokes", "draw", "erase", "erase_line", "eraser_line", "eraser_outline",
            "find_strokes", "has_text", "restore_stroke",
-           "line_bounds", "make_point", "new_line", "pack_points", "simplify", "simplify_points", "straighten", "strokes",
+           "line_bounds", "make_point", "new_line", "pack_points", "rotation_of", "simplify", "simplify_points",
+           "straighten", "strokes",
            "unpack_points"]

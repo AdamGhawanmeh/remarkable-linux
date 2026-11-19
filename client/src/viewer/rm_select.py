@@ -367,6 +367,25 @@ def _stamped(value, original: tuple[int, int]):
                         value.indices, move_id)
 
 
+def _fresh_sources(values: list, me: int, clock: int) -> tuple[list, int]:
+    """`values` (line or image values) with each distinct shader sourceId replaced by a
+    fresh id, as the node does before it adds items (0x1408c2ae0 -> 0x1408cb8d0): in the
+    order of the values, the first line with a given sourceId (one whose counter is not
+    0) takes the next id of the page's clock, and every line with that sourceId gets it.
+    These ids come before those of the items added. (values, the clock after)."""
+    fresh: dict[tuple[int, int], tuple[int, int]] = {}
+    out = []
+    for value in values:
+        source = getattr(value, "source_id", None)
+        if isinstance(value, rs.LineValue) and source is not None and source[1] & 0xFFFFFFFFFFFF:
+            if source not in fresh:
+                clock += 1
+                fresh[source] = (me, clock)
+            value = replace(value, source_id=fresh[source])
+        out.append(value)
+    return out, clock
+
+
 def _decode(block_type: int, value: bytes):
     return rs.decode_line_value(value) if block_type == w.BLOCK_LINE_ITEM else w.decode_image_value(value)
 
@@ -376,7 +395,8 @@ def transform_items(page: bytes, *, author: bytes, items: Iterable[tuple[int, in
     """(`page` with the live line and image items `items` transformed by `m` as the
     app commits a selection, {original id: new id}, {original id: its value}). Per node,
     in the node's order: the items are deleted, their clones (moveId stamped) added and
-    deleted again, and the transformed clones added (2n ids). `anchors` gives a node
+    deleted again, and the transformed clones added (2n ids; before each of the two
+    adds the shader pieces' sourceIds are renamed, _fresh_sources). `anchors` gives a node
     anchored to text its anchor position: there `m` is conjugated with it. Items that
     are not live line or image items of the page (gone meanwhile) are passed over;
     the page is returned as it was for the identity or nothing to do."""
@@ -413,12 +433,16 @@ def transform_items(page: bytes, *, author: bytes, items: Iterable[tuple[int, in
             values.append((item_id, kind, _stamped(value, item_id)))
             node.delete(item_id)
         clones = []
+        renamed, clock = _fresh_sources([v for _, _, v in values], me, clock)
+        values = [(i, k, v) for (i, k, _), v in zip(values, renamed)]
         for item_id, kind, value in values:
             clock += 1
             node.append((me, clock), value.encode(), _kind(kind))
             clones.append((me, clock))
         for clone in clones:
             node.delete(clone)
+        renamed, clock = _fresh_sources([v for _, _, v in values], me, clock)     # the node's transform, 0x1408c35a9
+        values = [(i, k, v) for (i, k, _), v in zip(values, renamed)]
         for item_id, kind, value in values:
             clock += 1
             moved = transform_line(value, local) if kind == w.BLOCK_LINE_ITEM else transform_image_value(value, local)
@@ -431,7 +455,8 @@ def transform_items(page: bytes, *, author: bytes, items: Iterable[tuple[int, in
 def append_items(page: bytes | None, *, author: bytes, values: Sequence[rs.LineValue],
                  layer: tuple[int, int] | None = None) -> tuple[bytes, list[tuple[int, int]]]:
     """(`page` with line values pasted on top of `layer`, the ids they took): each the
-    next id, appended, moveId 0:0, as the paste adds them (0x1408c2ae0). The legacy
+    next id, appended, moveId 0:0, as the paste adds them (0x1408c2ae0; a shader
+    piece's sourceId is renamed first, _fresh_sources). The legacy
     Eraser's white strokes may be pasted too; the tools a layer refuses may not."""
     lines = []
     for value in values:
@@ -448,6 +473,7 @@ def append_items(page: bytes | None, *, author: bytes, values: Sequence[rs.LineV
     clock = w.highest_counter(blocks)
     node = _Node(blocks, layer)
     ids = []
+    lines, clock = _fresh_sources(lines, me, clock)
     for line in lines:
         clock += 1
         node.append((me, clock), line.encode(), _kind(w.BLOCK_LINE_ITEM))

@@ -307,7 +307,13 @@ class StrokeErase:
     the Eraser, whose line is as wide as its first point; or 8, EraseSection, whose
     line is the outline of what goes). Every stroke it touches is deleted, and what is
     left of each put in its place as new strokes (rm_stroke.erase). The pieces it
-    makes are named ("edit", "<uid>/<n>"), n counting them in the order made."""
+    makes are named ("edit", "<uid>/<n>"), n counting them in the order made.
+
+    Groups below the layer are erased too; `anchors` gives the anchor position of each
+    group anchored to typed text as the page drew it when the eraser went over it
+    ((node author, node counter, x, y)), so that the same strokes are hit when the
+    edit is made again. A group anchored to text with no position here is left alone
+    (edits kept before this was recorded erase the layer and its plain groups)."""
 
     doc_id: str
     page_id: str
@@ -316,24 +322,32 @@ class StrokeErase:
     points: str
     created_ms: int
     uid: str = ""
+    anchors: tuple[tuple[int, int, float, float], ...] = ()
 
     def line(self) -> rm_stroke.LineValue:
         return rm_stroke.new_line(self.tool, 2, self.thickness, bytes.fromhex(self.points))
 
+    def anchor_map(self) -> dict[tuple[int, int], tuple[float, float]]:
+        return {(a, c): (x, y) for a, c, x, y in self.anchors}
+
     @classmethod
     def new(cls, doc_id: str, page_id: str, eraser: rm_stroke.LineValue, created_ms: int,
-            uid: str | None = None) -> "StrokeErase":
+            uid: str | None = None, anchors=()) -> "StrokeErase":
         if eraser.tool not in (rm_stroke.ERASER, rm_stroke.ERASE_SECTION):
             raise EditError(f"tool {eraser.tool} does not erase")
         if eraser.count >= rm_stroke.MAX_STORED_POINTS:
             raise EditError("the eraser line is too large")
+        nodes = tuple(sorted((int(a), int(c), _number(x, "anchor position"), _number(y, "anchor position"))
+                             for a, c, x, y in anchors))
         return cls(str(doc_id), str(page_id), int(eraser.tool), _number(eraser.thickness_scale, "eraser size"),
-                   _points(eraser.points), int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+                   _points(eraser.points), int(created_ms), uuid.uuid4().hex if uid is None else str(uid), nodes)
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "StrokeErase":
+        nodes = tuple((int(a), int(c), _number(x, "anchor position"), _number(y, "anchor position"))
+                      for a, c, x, y in raw.get("anchors") or ())
         return cls(str(raw["doc_id"]), str(raw["page_id"]), int(raw["tool"]), _number(raw["thickness"], "eraser size"),
-                   _points(raw["points"]), int(raw["created_ms"]), str(raw.get("uid") or ""))
+                   _points(raw["points"]), int(raw["created_ms"]), str(raw.get("uid") or ""), nodes)
 
 
 @dataclass(frozen=True)
@@ -944,7 +958,7 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
             continue
         if isinstance(edit, StrokeErase):
             if page is not None:
-                erased = rm_stroke.erase(page, author=author, eraser=edit.line())
+                erased = rm_stroke.erase(page, author=author, eraser=edit.line(), anchors=edit.anchor_map())
                 page = erased.page
                 for n, piece in enumerate(erased.made):
                     made[f"{edit.uid}/{n}"] = piece

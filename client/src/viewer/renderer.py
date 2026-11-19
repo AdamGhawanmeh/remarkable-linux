@@ -177,6 +177,10 @@ STYLE_FONTS: dict[ParagraphStyle, tuple[float, bool]] = {
     ParagraphStyle.SUBHEADING_2: (1.15, True),
 }
 BASELINE_AT = 0.75     # baseline position within a line box (fraction of its height)
+# The line break Shift+Enter types (SceneController::keyAction 0x140443380, action
+# LineBreak: the keystroke path with QString(QChar(0x2028))): a character of the
+# paragraph's text, stored like any other, that ends the line but not the paragraph.
+LINE_SEPARATOR = "\u2028"
 INDENT = 48.0
 
 
@@ -255,9 +259,13 @@ def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[Tex
                 if i:
                     words.append((" ", font, at))
                     at += 1
-                if part:
-                    words.append((part, font, at))
-                    at += _units(part)
+                for j, piece in enumerate(part.split(LINE_SEPARATOR)):
+                    if j:
+                        words.append((LINE_SEPARATOR, font, at))
+                        at += 1
+                    if piece:
+                        words.append((piece, font, at))
+                        at += _units(piece)
         end = base + _units(para.text)
         current: list[tuple[str, TextFont, int]] = []
         width = 0.0
@@ -280,6 +288,11 @@ def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[Tex
             current, width, first, start = [], 0.0, False, next_start
 
         for text, font, i in words:
+            if text == LINE_SEPARATOR:
+                # A line break typed with Shift+Enter: the line ends here, the
+                # paragraph goes on (QTextDocument's QChar::LineSeparator).
+                flush(i + 1)
+                continue
             w = measure(text, font)
             if text != " " and current and width + w > max_w:
                 flush(i)
@@ -292,6 +305,33 @@ def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[Tex
         flush(end)
         base = end + 1
     return lines
+
+
+CHECKBOX_MARKERS = ("☐", "☑")
+
+
+def checkbox_boxes(scene: PageScene, lines: list[TextLine],
+                   measure: Measure = estimate_width) -> list[tuple[int, tuple[float, float, float, float]]]:
+    """The checkboxes drawn on a page: (text index where the checkbox's paragraph
+    starts, its box (x, y, width, height) in page coordinates). The index is what the
+    app's checkbox links carry ("rmcheckbox://index=<n>": the scene's checkbox table
+    is keyed by character position and shifted as the text changes, 0x140989280); the
+    box is the marker drawn left of the paragraph, with the gap to the text."""
+    block = scene.text
+    if block is None:
+        return []
+    starts, at = [], 0
+    for para in block.paragraphs:
+        starts.append(at)
+        at += _units(para.text) + 1
+    out = []
+    for line in lines:
+        if line.marker not in CHECKBOX_MARKERS or line.marker_font is None or line.paragraph >= len(starts):
+            continue
+        width = measure(line.marker, line.marker_font)
+        size = line.marker_font.size
+        out.append((starts[line.paragraph], (line.x - 8 - width, line.baseline - size, width + 8, size * 1.25)))
+    return out
 
 
 def caret_x(line: TextLine, index: int, measure: Measure = estimate_width) -> float:
@@ -699,5 +739,5 @@ def render_image(scene: PageScene, *, scale: float = 1.0, background: str = "#ff
 
 
 __all__ = ["PALETTE_ARGB", "Run", "StrokeStyle", "TextFont", "TextLine", "image_matrix", "image_size",
-           "layout_text", "caret_x", "line_of", "index_at", "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
+           "CHECKBOX_MARKERS", "LINE_SEPARATOR", "checkbox_boxes", "layout_text", "caret_x", "line_of", "index_at", "paint", "render_bounds", "render_image", "render_svg", "stroke_runs", "svg_scene",
            "stroke_style", "PAGE_WIDTH", "PAGE_HEIGHT"]

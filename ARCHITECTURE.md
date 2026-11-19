@@ -709,6 +709,29 @@ base_style/style_properties (0x140a92b30). The cursor is drawn by the view, not 
 new ids after the original neighbour, ids translated across the stack (as the app's undo
 "translated" log).
 
+**Line breaks and checkboxes** [O].
+- Shift+Enter is the `LineBreak` key action (19). `SceneController::keyAction`
+  (0x140443380) sends it down the keystroke path with a static `QString(QChar(0x2028))`
+  (log "key-stroke:"): U+2028, QTextDocument's line separator, is typed into the
+  paragraph as an ordinary character (stored UTF-8 in the RootText run; no newline, no
+  style entry, textLines unchanged). The 32 cached text pages hold no such character
+  (only `\n`), as nobody typed one. The client types it (`textedit`, LINE_BREAK) and its
+  layout ends the line there (`renderer.LINE_SEPARATOR`).
+- A checkbox is a link: `linkAt` (0x1408a7ac0) looks at the PDF's links first, then the
+  scene's checkbox table (scene+0x378, made at 0x140981de0; records of 0x38 bytes: key,
+  block number, QRectF, ParagraphStyle), returning `SceneLink {rect, url}` with url
+  `QString("%1://index=%2").arg("rmcheckbox").arg(key)` (0x140987930). The key is a
+  character position: the table is shifted on every contents change (0x140989280) by the
+  characters added or removed. `SceneLinkHandler` emits `toggleCheckbox(key)`, which
+  DocumentView passes to `toggleCheckboxByIndex` when editing is allowed (0x140449870 ->
+  scene worker 0x140988a80): the record's style is toggled by 0x1408b5710 (a list with
+  kind 1, checkbox: state bits 8..10 = 1 or 3 -> 0, anything else -> 1), set on the
+  paragraph and pushed as one action on the undo stack. Stored: the legacy byte 6 <-> 7
+  for an unindented box (the one cached checked box is `7`, no base/properties), 8 <-> 9
+  with base 3 / properties for indented ones. The client keys its links by where the
+  paragraph starts (`renderer.checkbox_boxes`), toggles through the text session (one
+  undo step) and opens one for the click when text mode is off.
+
 **Pen strokes** [O] (`viewer.rm_stroke`; every rule below holds on all 812,546 line blocks of
 a real library, 746,526 of them live). A stroke is one CrdtLineItem block, type 0x05, always
 `min_version 2, version 2` (0x06, CrdtTextItem, never occurs and is not a stroke). Payload, in
@@ -763,10 +786,9 @@ on the layer, so a layer stroke beside a RootText block is a page the tablet wri
 reads. `rm_stroke` draws on such pages as on any other: the stroke goes on the current
 layer, unanchored (it will not follow the text when the text reflows on the tablet, as
 the tablet's own anchored strokes do; no cached page has an unanchored stroke beside real
-text), and the eraser takes the layer's own line items only, leaving the text block byte
-for byte as it was (checked on all 30 pages: draw, erase, put back). Anchored strokes
-store coordinates relative to their text line, so the eraser does not reach the tablet's
-anchored strokes yet.
+text). The eraser takes the layer's line items and those of every group below it,
+the tablet's anchored strokes included where the page draws them (see "Text-anchored
+stroke groups", Eraser), leaving the text block byte for byte as it was.
 
 A text box nothing was typed in is not made: the text session holds its `create` back
 until something is typed, and a `create` with no text edit after it on its page (kept by
@@ -900,6 +922,18 @@ code is in the binary, mouse path included:
   Black; highlighter size 1, HighlighterYellow (as every cached document has). A settings-only
   change uploads `.content` alone; whether the app also bumps `.metadata` lastModified then
   is not traced.
+- The Shader (ShadingMarker, 23) is the toolbar's tenth tool here (icon `shader`). No
+  cached document has a shader stroke or setting, and the tablet's toolbar (its colour
+  list) is not in reMarkable.exe: the client offers the pen colours with Gray first
+  (its own choice), size 2; settings are `LastShadingMarkerSize`/`Color` like any pen.
+- The calligraphy nib's two inputs: the hand is `Settings.rightHandMode`, copied into the
+  handler when a stroke begins (`+0x2e0` -> `+0x410`, 0x140ac8103); the rotation is read
+  off the transform the handler is given (`PenInputLineHandler::setTransform`
+  0x140aca100): m12 = m21 = 0 -> 0 when m11, m22 > 0, else 180; m11 = m22 = 0 -> 90 when
+  m12 > 0 and m21 < 0, else 270; anything else logs "unknown rotation" and keeps the old
+  value (`rm_stroke.rotation_of`). The client's view only translates and scales the page
+  (landscape documents are shown as stored, as in reMarkable.exe), so its rotation is 0;
+  `SceneView.pen_rotation` reads it off the view transform all the same.
 
 **Text-anchored stroke groups** [O, checked on the 710 anchored nodes of a real library,
 all on pages with a RootText block]. `scene::AnchorManager` (ctor 0x1409690f0, log category
@@ -969,9 +1003,17 @@ position as a QPointF (never stored).
   threshold, the largest cluster stays, the others are deleted and anchored afresh
   (clones in scene coordinates, moveId = the old item); a group left empty loses its
   anchor and is detached by a second SceneTreeMove (new id, node N, is_update 0, parent
-  `0:0`; real pages have these, with the group item still live). A client eraser needs
-  only the first part to erase the tablet's anchored strokes: compute the anchor position
-  as above, test in scene coordinates, write the pieces into the same group.
+  `0:0`; real pages have these, with the group item still live). The client
+  (`rm_stroke.erase`, `anchors`) does the first part: the layer's items, then each
+  group node below it (`group_nodes`, depth first in sequence order), an anchored node's
+  strokes tested at the anchor position the page draws them at (`renderer.stroke_offsets`,
+  so what is erased is what is seen; a node below an anchored group takes its position),
+  the pieces put after the erased item in the same group, in its own coordinates; all
+  hits deleted first, then the pieces given ids in hit order. The positions are kept in
+  the `StrokeErase` edit (node, x, y) so the edit is made again identically; an anchored
+  group with no position given is left alone. Not done: the clustering and re-anchoring
+  afterwards and the detaching of an emptied group (its tree node, anchor and group item
+  stay byte for byte, the group just holds fewer strokes).
 
 **Moving, scaling and rotating a selection** [O; the stroke math checked on a real library:
 4,226 cached v6 pages, 31,999 live strokes with a moveId]. There is no transform on nodes; a
@@ -1012,7 +1054,10 @@ moved stroke is a new item.
   neither does the timestamp (not touched). On a page with typed text the re-anchoring
   that follows takes its own (new groups, anchor stamps, above). Only a Shader's pieces cost more: before each of the two adds every distinct
   sourceId among the items is replaced by a fresh id (0x1408cb8d0), one counter value per
-  distinct source each time. The previews of a gesture cost nothing.
+  distinct source each time, taken before the items' own ids (0x1408cb8d0 runs inside the
+  node's add, 0x1408c2ae0, and the node transform, 0x1408c35a9; the paste's add,
+  0x1409af310, goes through 0x1408c2ae0 too, so pasted shader pieces are renamed the same
+  way; the eraser's insert and undo/redo do not). `rm_select._fresh_sources` does it. The previews of a gesture cost nothing.
   Real pages (tablet-written, pages without text, 356 commits of 3 or more strokes whose
   ids are consecutive, which 563 of 601 are): the n ids before the n live ones are a
   deleted run in the cleanly readable cases (exactly n deleted ids before in 31, 2n in 30,
@@ -1440,6 +1485,14 @@ PDF / EPUB-backed):
   zeros, like notebooks. 46 PDF pages and the one annotated EPUB page have no field 6 at all (older writers), so
   it is optional. The client only writes SceneInfo when it creates a page (`rm_writer.blank_page`:
   zeros); it never rewrites an existing one.
+- **Field 2 is "Hide template"** [corpus]: of 4,256 cached v6 pages, 4,253 have it at
+  `0:0`, true; 3 carry a later timestamp (1:15, 1:18, 1:170) and are true again: the
+  tablet saves the toggle in the page. The desktop QML's View > Hide template and the
+  Layers foldout's Template (notebooks) / Background (PDF) row call
+  `setBackgroundVisible`. The client reads the field (`PageScene.background_visible`),
+  starts each page shown from it and redraws without the template or PDF page while it is
+  hidden; it does not write the field (not traced which id the write takes or whether it
+  is an undo step).
 - **Coordinates: same system, wider extent.** x is centred on the page (0 = middle),
   y = 0 at the top, in screen pixels. The PDF page fills [−W/2, W/2] × [0, H] with W, H =
   PDF size × 226/72 (§5.2). On the 46 annotated pages whose PDF is cached, 25 have ink

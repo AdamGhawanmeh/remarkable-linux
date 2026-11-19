@@ -76,6 +76,16 @@ def set_source(provider: Callable[[], object], notify: Callable[[str], None] | N
         _notify = notify
 
 
+def right_handed() -> bool:
+    """Settings.rightHandMode (the app's "Right-handed" setting; True when unknown)."""
+    from . import _current
+    settings = getattr(_current, "settings", None)
+    try:
+        return bool(settings.rightHandMode) if settings is not None else True
+    except RuntimeError:            # the settings object is gone (the app is closing)
+        return True
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -230,13 +240,19 @@ class _Drawing:
     """A stroke or an eraser pass under way: its samples (scene coordinates) and, for
     a pen, the points the tool makes of them so far."""
 
-    def __init__(self, pen: pens.Pen, eraser: bool, scale: float, stylus: bool, lasso: bool = False) -> None:
+    def __init__(self, pen: pens.Pen, eraser: bool, scale: float, stylus: bool, lasso: bool = False, *,
+                 right_handed: bool = True, rotation: float = 0.0) -> None:
         self.pen, self.eraser, self.scale, self.stylus, self.lasso = pen, eraser, scale, stylus, lasso
         self.size = pen.size
         self.samples: list[tuple] = []
         self.end: tuple[float, float] | None = None     # held: the straight line's end (scene)
-        self.builder = None if eraser or lasso else s.StrokeBuilder(pen.tool.tool, pen.line_color, pen.size, pen.argb,
-                                                                    scale=scale)
+        # The calligraphy nib turns with the hand the app is set for (Settings.rightHandMode,
+        # copied into the handler when a stroke begins, 0x140ac8103) and with the page's
+        # rotation on screen (setTransform, 0x140aca100).
+        self.right_handed, self.rotation = bool(right_handed), float(rotation)
+        self.builder = None if eraser or lasso else s.StrokeBuilder(
+            pen.tool.tool, pen.line_color, pen.size, pen.argb, scale=scale, right_handed=self.right_handed,
+            rotation=self.rotation)
 
     def add(self, sample: tuple) -> None:
         self.samples.append(sample)
@@ -360,7 +376,8 @@ class PenSurface(QQuickPaintedItem):
             self._drawing = _Drawing(pen, False, self.view.pen_scale(), stylus, lasso=True)
             self.add(pos, sample_rest)
             return True
-        self._drawing = _Drawing(pen, eraser or pen.tool.is_eraser, self.view.pen_scale(), stylus)
+        self._drawing = _Drawing(pen, eraser or pen.tool.is_eraser, self.view.pen_scale(), stylus,
+                                 right_handed=right_handed(), rotation=self.view.pen_rotation())
         if self._drawing.eraser and not pen.tool.is_eraser:
             eraser = pens.pen_of(self.tools._settings, pens.BY_KEY["eraser"])
             self._drawing.size = eraser.size

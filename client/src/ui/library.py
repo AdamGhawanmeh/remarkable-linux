@@ -318,6 +318,31 @@ def _stroke_values(page: bytes | None) -> dict[tuple[int, int], str]:
         return {}
 
 
+def _node_anchors(page: bytes, offsets) -> dict[tuple[int, int], tuple[float, float]]:
+    """The anchor position of each group of `page` anchored to typed text, from where
+    the page draws its strokes (`offsets`: stroke id -> position): the group a stroke
+    is in, or the nearest anchored group above it."""
+    if not offsets:
+        return {}
+    blocks = rm_writer.split(page)[1]
+    anchored = rm_stroke.anchored_nodes(blocks)
+    if not anchored:
+        return {}
+    parent_of = {}
+    for layer in rm_writer.layers(blocks):
+        parent_of.update(rm_stroke.group_nodes(blocks, layer))
+    out = {}
+    for stroke in rm_stroke.strokes(page):
+        where = offsets.get(stroke.item)
+        node, seen = stroke.parent, set()
+        while where is not None and node not in anchored and node in parent_of and node not in seen:
+            seen.add(node)
+            node = parent_of[node]
+        if where is not None and node in anchored:
+            out.setdefault(node, (float(where[0]), float(where[1])))
+    return out
+
+
 def _merged(first: tuple, second: list) -> tuple:
     """A paste's undo step and the move of what it pasted as one step (0x1408f3920):
     what the move put back of the pasted items is not put back, and what the paste added
@@ -745,11 +770,16 @@ class LibrarySource:
             history.seen = self._seen(doc.id, page_id)
         return edit
 
-    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int) -> StrokeErase | None:
+    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int, offsets=None) -> StrokeErase | None:
         """Keep an eraser taken over a page: `eraser`, the eraser's own line
         (viewer.rm_stroke.eraser_line), one action for undo (the app's eraser action:
         the strokes it deleted put back, the pieces it left taken away). None, with
-        nothing kept, when it touches no stroke. Refused like add_stroke."""
+        nothing kept, when it touches no stroke. Refused like add_stroke.
+
+        `offsets`: where the page draws the strokes of groups anchored to typed text
+        (stroke id -> anchor position, as renderer.stroke_offsets gives them): the
+        eraser reaches those strokes where they are drawn, and their pieces stay in
+        their group (rm_stroke.erase)."""
         with self._history_lock:
             doc = self._editable(doc, page_id)
             history = self._history(doc.id, page_id)
@@ -757,12 +787,14 @@ class LibrarySource:
             if before.page is None:
                 return None
             try:
-                erased = rm_stroke.erase(before.page, author=self.sync.author(), eraser=eraser)
+                anchors = _node_anchors(before.page, offsets)
+                erased = rm_stroke.erase(before.page, author=self.sync.author(), eraser=eraser, anchors=anchors)
             except (RmParseError, ValueError) as err:
                 raise EditError(f"the page cannot be erased on: {err}") from err
             if not erased.deleted:
                 return None
-            edit = StrokeErase.new(doc.id, page_id, eraser, now_ms)
+            edit = StrokeErase.new(doc.id, page_id, eraser, now_ms,
+                                   anchors=[(a, c, x, y) for (a, c), (x, y) in anchors.items()])
             self._add_edit(doc, edit)
             old = _stroke_values(before.page)
             after = self.staged(doc).replay(page_id)

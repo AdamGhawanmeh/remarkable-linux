@@ -56,6 +56,7 @@ from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH
 from viewer.rm_parser import ParagraphStyle as StyleType
 from viewer import rm_select as rsel
 from viewer import rm_text
+from viewer.rm_stroke import rotation_of as s_rotation_of
 from viewer.renderer import qt_measure
 
 from ... import editing
@@ -186,6 +187,18 @@ def to_scene(rect: QRectF) -> QRectF:
     return rect.translated(-HALF_WIDTH, 0)
 
 
+def anchor_offsets(scene) -> dict:
+    """Where a page draws the strokes of its groups anchored to typed text: stroke id
+    -> anchor position (renderer.stroke_offsets, laid out with the app's fonts), {}
+    when it has none."""
+    if scene is None or not any(s.anchor is not None for s in scene.strokes):
+        return {}
+    from viewer.renderer import layout_text, stroke_offsets
+    by_object = stroke_offsets(scene, layout_text(scene, qt_measure))
+    return {tuple(s.item_id): by_object[id(s)] for s in scene.strokes
+            if s.item_id is not None and id(s) in by_object}
+
+
 def no_pages_reason(node) -> str:
     """Why a document has nothing to show (PageErrorOverlay's diagnostic line)."""
     if node.file_type is FileType.EPUB and pdf_name(node) is None:
@@ -266,6 +279,9 @@ Recognizer = qml_class("Recognizer")
 DocumentLockManager = qml_class("DocumentLockManager")
 
 
+CHECKBOX_URL = "rmcheckbox://index="
+
+
 class _LinkHandler:
     """Follows a link found by SceneController.linkAt: a URL, or a page of the
     document (its target PDF page, mapped to the document's page)."""
@@ -273,6 +289,15 @@ class _LinkHandler:
     @Slot("QVariantMap")
     def activate(self, link: dict) -> None:
         if not link or not link.get("valid"):
+            return
+        url = str(link.get("url") or "")
+        if url.startswith(CHECKBOX_URL):
+            # A checkbox of the typed text (the app's link "rmcheckbox://index=<n>",
+            # 0x140987930): toggled by DocumentView through toggleCheckboxByIndex(n).
+            try:
+                self.toggleCheckbox.emit(int(url[len(CHECKBOX_URL):]))
+            except ValueError:
+                pass
             return
         if link.get("url"):
             self.openUrl.emit(link["url"])
@@ -501,7 +526,7 @@ SceneTileManager = qml_class("SceneTileManager", QObject, _TileManager,
 class _Controller:
     _DEFAULTS = {"defaultPortraitBounds": PORTRAIT, "paperPortraitBounds": PORTRAIT, "paperNoteBounds": PORTRAIT,
                  "boundingRect": PORTRAIT, "primaryContentRect": PORTRAIT,
-                 "explicitPaperSize": QSize(PAGE_WIDTH, PAGE_HEIGHT)}
+                 "explicitPaperSize": QSize(PAGE_WIDTH, PAGE_HEIGHT), "backgroundVisible": True}
 
     def __init__(self, parent: QObject | None = None) -> None:
         QObject.__init__(self, parent)
@@ -524,13 +549,38 @@ class _Controller:
             # scroll bounds and LayersFoldout re-reads the layers on this signal.
             getattr(self, self._NOTIFY["boundingRect"]).emit()
 
+    @Slot(bool)
+    def setBackgroundVisible(self, visible: bool) -> None:
+        """Hide template / Show template (and the Layers foldout's Template or
+        Background row): the page is drawn again at once without, or with, its
+        template or PDF page. The tablet keeps this per page in the .rm (SceneInfo
+        field 2, a last-write-wins bool); here it lasts while the page is shown, from
+        the value the page has (see SceneView._on_loaded)."""
+        if self._set("backgroundVisible", bool(visible)) and self.view is not None:
+            self.view._render()
+
     @Slot(QPointF, result="QVariantMap")
     def linkAt(self, pos: QPointF) -> dict:
-        """The link under a scene position (DocumentViewport reads .valid and .index)."""
+        """The link under a scene position (DocumentViewport reads .valid and .index):
+        a link of the PDF page, else the checkbox of a typed-text paragraph (the app
+        looks in the same order, 0x1408a7ac0), whose url is "rmcheckbox://index=<n>",
+        n the text index the paragraph starts at."""
         for link in self.links:
             if link["rect"].contains(QPointF(pos)):
                 return {k: v for k, v in link.items() if k != "rect"}
+        if self.view is not None:
+            for n, (start, rect) in enumerate(self.view.checkbox_links()):
+                if rect.contains(QPointF(pos)):
+                    return {"valid": True, "index": len(self.links) + n, "url": f"{CHECKBOX_URL}{start}", "page": -1}
         return {"valid": False, "index": -1}
+
+    @Slot(int)
+    def toggleCheckboxByIndex(self, index: int) -> None:
+        """Check or uncheck the checkbox of the paragraph starting at text index
+        `index` (SceneLinkHandler.toggleCheckbox, when the document may be edited): a
+        style edit of the page's text, one undo step, drawn at once."""
+        if self.view is not None and int(index) >= 0:
+            self.view.toggle_checkbox(int(index))
 
     @Slot(QUrl, QPointF)
     def insertImageFileAsSceneItem(self, url: QUrl, pos: QPointF) -> None:
@@ -939,6 +989,13 @@ class _SceneView:
         # view jumped.
         self._tiles._set("sceneBoundingRect", bounds)
         self._controller.set_page(frame, bounds, layers, links)
+        if shown != getattr(self, "_background_page", None):
+            # A page newly shown starts with its template as the page has it (the
+            # tablet's Hide template, SceneInfo field 2); a reload after an edit keeps
+            # what was chosen here.
+            self._background_page = shown
+            self._controller._set("backgroundVisible",
+                                  content.scene.background_visible if content.scene is not None else True)
         # The layer edits go to: Layer 1, the one the app uses until another is chosen.
         node_ids = [layer.node_id for layer in layers]
         self._controller._set("currentLayer", node_ids.index((0, 11)) if (0, 11) in node_ids else max(len(layers) - 1, 0))
@@ -1326,6 +1383,14 @@ class _SceneView:
         """How many screen pixels a scene unit covers (the pen handler's scale)."""
         return float(self._tiles._get("scale"))
 
+    def pen_rotation(self) -> float:
+        """The page's rotation on screen, as the pen handler reads it off its transform
+        (rm_stroke.rotation_of). This view only moves and scales the page (landscape
+        documents are shown as stored, as in reMarkable.exe), so it is 0."""
+        m = self.scene_to_view()
+        rotation = s_rotation_of(m.m11(), m.m12(), m.m21(), m.m22())
+        return 0.0 if rotation is None else rotation
+
     def pen_refusal(self) -> str:
         """Why nothing may be drawn on or erased from the page shown ("": it may)."""
         source, node = _source(), getattr(self._get("document"), "node", None)
@@ -1349,12 +1414,13 @@ class _SceneView:
             self._controller.selectionCleared.emit()    # DocumentViewport commits and closes it
             self._set_selection(None)
         now_ms = _now_ms()
+        scene = self._content.scene if self._content is not None else None
 
         def job():
             error, changed = None, True
             try:
                 if kind == "erase":
-                    changed = source.erase_strokes(node, page_id, line, now_ms) is not None
+                    changed = source.erase_strokes(node, page_id, line, now_ms, anchor_offsets(scene)) is not None
                 else:
                     source.add_stroke(node, page_id, line, now_ms)
             except (EditError, *EXPECTED_ERRORS) as err:
@@ -1434,6 +1500,46 @@ class _SceneView:
             _notify(refusal)
             return None
         return source, node, self._page_id
+
+    def checkbox_links(self) -> list[tuple[int, QRectF]]:
+        """The checkboxes of the page as shown (with what is being typed): (text index
+        of the paragraph, box in scene coordinates); laid out once per text shown."""
+        from viewer.renderer import checkbox_boxes, layout_text
+        session = self.text_session
+        lines = session.lines() if session is not None else None
+        scene = None if session is not None else (self._content.scene if self._content is not None else None)
+        token = lines if session is not None else scene     # the session lays its text out again on a change
+        cached = getattr(self, "_checkboxes", None)
+        if cached is not None and cached[0] is token:
+            return cached[1]
+        if session is not None:
+            scene = session.shown_scene()
+        if scene is None or scene.text is None:
+            self._checkboxes = (token, [])
+            return []
+        if lines is None:
+            lines = layout_text(scene, qt_measure)
+        boxes = [(start, to_scene(QRectF(*box))) for start, box in checkbox_boxes(scene, lines, qt_measure)]
+        self._checkboxes = (token, boxes)
+        return boxes
+
+    def toggle_checkbox(self, position: int) -> None:
+        """Toggle the checkbox of the paragraph starting at text index `position`, in
+        the text session (opened for it when there is none, and closed again after,
+        keeping the edit, when text mode is off)."""
+        def toggle(t: textedit.TextSession) -> None:
+            if not t.toggle_checkbox(position):
+                log.info("no checkbox starts at text index %d", position)
+
+        if self.text_session is not None or self._text_opening:
+            self.text_do(toggle)
+            return
+        if self._text_target() is None:
+            return
+        self._text_then.append(toggle)
+        if not self._get("textModeEnabled"):
+            self._text_then.append(lambda t: QTimer.singleShot(0, self.stop_text))
+        self.start_text(StyleType.TITLE)
 
     def start_text(self, style: StyleType, pos: QPointF | None = None) -> None:
         """Text mode on the page shown (createRootDocument, focusRootDocument): its text
@@ -1684,10 +1790,11 @@ class _SceneView:
             from dataclasses import replace
             content = replace(content, scene=selecting.without(content.scene, hidden + self._hidden))   # SelectionImage shows them
         self._rendering = True
+        background = bool(self._controller._get("backgroundVisible"))
 
         def job():
             try:
-                image = render_content(content, scale, "page")
+                image = render_content(content, scale, "page", background)
             except EXPECTED_ERRORS as err:
                 log.warning("cannot render page: %s", err)
                 image = None
