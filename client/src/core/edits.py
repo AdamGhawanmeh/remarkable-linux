@@ -86,7 +86,7 @@ from viewer.rm_parser import ParagraphStyle, RmParseError
 
 from .config import atomic_write_json, ensure_private_dir, read_json
 from .models import Document, json_bytes
-from .pagemap import PageMap, PageMapError
+from .pagemap import PageMap, PageMapError, is_legacy, upgrade
 
 log = logging.getLogger("rm.edits")
 
@@ -1342,6 +1342,23 @@ def _later(old: Any, new_ms: int) -> str:
 
 # ------------------------------------------------------------------ a document with its edits
 
+def current_content(doc: Document, read: Callable[[str], bytes], author: bytes) -> dict:
+    """The document's .content as the app holds it once loaded: a formatVersion 1 one
+    (`pages` + `redirectionPageMap`, 63 cached PDFs and EPUBs) upgraded to cPages as the
+    app upgrades it on load (core.pagemap.upgrade), with the .pagedata lines as its
+    templates. The app writes it so the first time it saves the document (a page's
+    `modifed`, a page added): the cloud copy stays formatVersion 1 until then."""
+    content = json.loads(read(f"{doc.id}.content"))
+    if not isinstance(content, dict):
+        raise ValueError("the .content is not a JSON object")
+    if not is_legacy(content):
+        return content
+    name, templates = f"{doc.id}.pagedata", None
+    if name in doc.files:
+        templates = [line.strip() for line in read(name).decode("utf-8", errors="replace").splitlines()]
+    return upgrade(content, author, templates)
+
+
 def page_files(doc: Document, page_id: str) -> list[str]:
     """The files of `doc` that belong to page `page_id` (the app's page paths:
     resourceDirectoryPath, pageLinesPath, pageMetadataPath, pageHighlightsPath,
@@ -1383,7 +1400,7 @@ class Staged:
                 continue
             if pagemap is None:
                 try:
-                    pagemap = PageMap(json.loads(read(f"{doc.id}.content")), author)
+                    pagemap = PageMap(current_content(doc, read, author), author)
                 except (ValueError, PageMapError) as err:
                     raise EditError(f"the page list cannot be changed: {err}") from err
             self.page_list_edits.append(edit)
@@ -1571,7 +1588,10 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
     if not changed and not staged.changes_page_list and not staged.tool_settings:
         return out if out else {}
     original = json.loads(read(content_name))
-    content = staged.content if staged.changes_page_list else json.loads(read(content_name))
+    try:
+        content = staged.content if staged.changes_page_list else current_content(doc, read, author)
+    except (ValueError, PageMapError) as err:
+        raise EditError(f"the page list cannot be written: {err}") from err
     listed = (content.get("cPages") or {}).get("pages") if isinstance(content.get("cPages"), dict) else None
     for entry in listed if isinstance(listed, list) else []:
         if isinstance(entry, dict) and entry.get("id") in changed:

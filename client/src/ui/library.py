@@ -344,6 +344,10 @@ def _merged(first: tuple, second: list) -> tuple:
     return tuple(out + list(images.values()))
 
 
+# The kinds of documents whose pages may be edited (LibrarySource.edit_refusal).
+EDITABLE_TYPES = (FileType.NOTEBOOK, FileType.PDF, FileType.EPUB)
+
+
 class LibrarySource:
     """The library as the UI sees it: a tree plus page/PDF data, via SyncClient.
 
@@ -418,35 +422,35 @@ class LibrarySource:
         with self._lock:
             self._copies = self._read_copies() | {str(copy_id)}
             atomic_write_json(self._copies_file, {"version": 1, "ids": sorted(self._copies)})
-        log.info("copy %s of editable notebook %s may be edited too", copy_id, source_id)
+        log.info("copy %s of editable document %s may be edited too", copy_id, source_id)
         return True
 
     def edit_refusal(self, doc: Document | None) -> str:
-        """Why `doc` may not be edited here ("": it may): only a notebook, not in the
-        trash, whose name is one of `editable` and the only notebook of that name, or a
-        copy made here of one that may be edited (by its id), so an edit can never land
-        on a document it was not meant for."""
+        """Why `doc` may not be edited here ("": it may): only a notebook, PDF or ebook,
+        not in the trash, whose name is one of `editable` and the only document of that
+        name, or a copy made here of one that may be edited (by its id), so an edit can
+        never land on a document it was not meant for. A PDF or ebook needs its page
+        list (the tablet makes it the first time it opens one: until then this client
+        shows pages it cannot name to the cloud, unlisted_page_id)."""
         if not self.editable:
             return "Editing is not turned on"
         tree = self.sync.tree
         if not isinstance(doc, Document) or tree.get(doc.id) is None:
             return "This document is not in the library"
-        if doc.id in self._copies:
-            if doc.file_type is not FileType.NOTEBOOK:
-                return "Only notebooks can be edited"
-            if tree.is_trashed(doc.id):
-                return "A document in the trash cannot be edited"
-            return ""
-        if doc.name not in self.editable:
-            return f"Editing is only turned on for the notebook named {' or '.join(map(repr, self.editable))}"
-        if doc.file_type is not FileType.NOTEBOOK:
-            return "Only notebooks can be edited"
+        if doc.id not in self._copies:
+            if doc.name not in self.editable:
+                return f"Editing is only turned on for the document named {' or '.join(map(repr, self.editable))}"
+            same = [n for n in tree.nodes.values() if isinstance(n, Document) and n.name == doc.name
+                    and n.file_type in EDITABLE_TYPES and not tree.is_trashed(n.id)]
+            if doc.file_type in EDITABLE_TYPES and not tree.is_trashed(doc.id) and len(same) != 1:
+                return (f"{len(same)} documents are named {doc.name!r}: editing needs the name to be "
+                        "of one document only")
+        if doc.file_type not in EDITABLE_TYPES:
+            return "Only notebooks, PDFs and ebooks can be edited"
         if tree.is_trashed(doc.id):
             return "A document in the trash cannot be edited"
-        same = [n for n in tree.nodes.values() if isinstance(n, Document) and n.name == doc.name
-                and n.file_type is FileType.NOTEBOOK and not tree.is_trashed(n.id)]
-        if len(same) != 1:
-            return f"{len(same)} notebooks are named {doc.name!r}: editing needs the name to be of one notebook only"
+        if doc.file_type is not FileType.NOTEBOOK and not has_page_list(tree.get(doc.id)):
+            return "This document has no page list yet: open it once on your reMarkable, then sync"
         return ""
 
     def can_edit(self, doc: Document | None) -> bool:

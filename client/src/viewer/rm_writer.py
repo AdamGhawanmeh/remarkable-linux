@@ -163,7 +163,12 @@ BLOCK_MIGRATION, BLOCK_TREE_MOVE, BLOCK_TREE_NODE = 0x00, 0x01, 0x02
 BLOCK_GROUP_ITEM, BLOCK_LINE_ITEM, BLOCK_ROOT_TEXT, BLOCK_TOMBSTONE = 0x04, 0x05, 0x07, 0x08
 BLOCK_AUTHORS, BLOCK_PAGE_STATS, BLOCK_SCENE_INFO = 0x09, 0x0A, 0x0D
 BLOCK_IMAGES_TABLE, BLOCK_IMAGE_ITEM = 0x0E, 0x0F
-ITEM_BLOCKS = (BLOCK_GROUP_ITEM, BLOCK_LINE_ITEM, BLOCK_TOMBSTONE, BLOCK_IMAGE_ITEM)
+# CrdtGlyphItem (a PDF text highlight) and CrdtTextItem: items of a layer like strokes
+# (the same item header: parent, id, left, right, deletedLength, value), whose values
+# this client does not read. None of the 4,226 cached pages has one. They take their
+# place in their layer's sequence, and are kept byte for byte.
+BLOCK_GLYPH_ITEM, BLOCK_TEXT_ITEM = 0x03, 0x06
+ITEM_BLOCKS = (BLOCK_GLYPH_ITEM, BLOCK_GROUP_ITEM, BLOCK_LINE_ITEM, BLOCK_TEXT_ITEM, BLOCK_TOMBSTONE, BLOCK_IMAGE_ITEM)
 # (min_version, version) of every block type, the same in every real page.
 BLOCK_VERSIONS = {BLOCK_MIGRATION: (1, 1), BLOCK_TREE_MOVE: (1, 1), BLOCK_TREE_NODE: (1, 2),
                   BLOCK_GROUP_ITEM: (1, 1), BLOCK_LINE_ITEM: (2, 2), BLOCK_ROOT_TEXT: (1, 1),
@@ -426,9 +431,44 @@ def _root_text_ids(payload: bytes) -> list[tuple[int, int]]:
     return out
 
 
+def _any_ids(data: bytes) -> list[tuple[int, int]]:
+    """The ids of a value this client does not know the layout of (a glyph range, a
+    text item, an Array block, a block type it has never seen): those tagged as ids at
+    its top level, and in each sub-block shaped as an LWW value is (tagged values from
+    end to end, the first an id: its timestamp). Other sub-blocks (strings, points,
+    rectangles) are left alone, so that their bytes are not taken for ids, and so is a
+    value that is not tagged values at all.
+
+    Ids that hide in such bytes cannot clash with the ids an edit makes here: those are
+    (this client's author index, a counter past the highest one read), and an index
+    only ever names ids its author made. The page's authors block lists every index in
+    use; one new to the page has made no id anywhere in it, and this client's own ids
+    are all in the blocks it wrote, which it reads in full."""
+    out: list[tuple[int, int]] = []
+    values = _tagged(data)
+    for _, kind, value in values or []:
+        if kind == TAG_ID:
+            out.append(value)
+        elif kind == TAG_LENGTH4:
+            inner = _tagged(value)
+            if inner and inner[0][:2] == (1, TAG_ID):
+                out += _any_ids(value)
+    return out
+
+
+def _tagged(data: bytes) -> list[tuple[int, int, object]] | None:
+    """`data` as tagged values, or None when it is not that from end to end."""
+    try:
+        return read_values(data)
+    except (RmParseError, ValueError, IndexError, struct.error):
+        return None
+
+
 def block_ids(block: Block) -> list[tuple[int, int]]:
-    """Every CrdtId a block holds (for a run of deleted ids, also its last). Raises
-    RmParseError for a block it does not fully understand."""
+    """Every CrdtId a block holds (for a run of deleted ids, also its last). The
+    blocks this client edits are read in full (RmParseError for one it does not fully
+    understand); the others (glyph ranges, text items, unknown blocks: kept byte for
+    byte by every edit) as far as their bytes are tagged values (_any_ids)."""
     t, payload = block.type, block.payload
     if t in (BLOCK_AUTHORS, BLOCK_PAGE_STATS):
         return []
@@ -454,11 +494,12 @@ def block_ids(block: Block) -> list[tuple[int, int]]:
             out.append((item.item[0], item.item[1] + item.deleted_length - 1))
         if item.value is not None:
             kind = item.value[0] if item.value else None
-            if kind not in _ITEM_VALUES:
-                raise RmParseError(f"item value of type {kind} is not understood")
-            out += _ids(item.value[1:], _ITEM_VALUES[kind])
+            if t in (BLOCK_GLYPH_ITEM, BLOCK_TEXT_ITEM) or kind not in _ITEM_VALUES:
+                out += _any_ids(item.value[1:])
+            else:
+                out += _ids(item.value[1:], _ITEM_VALUES[kind])
         return out
-    raise RmParseError(f"block type {t:#x} is not understood")
+    return _any_ids(payload)
 
 
 def highest_counter(blocks: list[Block]) -> int:
@@ -610,19 +651,43 @@ def _author_index(blocks: list[Block], author: bytes) -> int:
     return index
 
 
+def item_key(block: Block) -> tuple:
+    """Where an item block is stored: items are sorted by parent, then id."""
+    item = decode_item(block.payload)
+    return id_key(item.parent), id_key(item.item)
+
+
 def _insert_item(blocks: list[Block], block: Block) -> None:
     """Put an item block where the app stores it: after the other blocks, the items
-    sorted by parent then id."""
-    first = next((n for n, b in enumerate(blocks) if b.type in ITEM_BLOCKS), len(blocks))
-    if any(b.type not in ITEM_BLOCKS for b in blocks[first:]):
-        raise RmParseError("the page's items are not at its end")
+    sorted by parent then id. A block of another kind found among the items (none is
+    on a real page) stays where it is."""
+    blocks[:] = insert_items(blocks, [block])
 
-    def key(b: Block) -> tuple:
-        item = decode_item(b.payload)
-        return id_key(item.parent), id_key(item.item)
 
-    at = next((n for n in range(first, len(blocks)) if key(blocks[n]) > key(block)), len(blocks))
-    blocks.insert(at, block)
+def insert_items(blocks: list[Block], new: list[Block]) -> list[Block]:
+    """`blocks` with the item blocks `new` where the app stores them: after the other
+    blocks, the items sorted by parent then id (each before the first item stored after
+    it, else after the last item). Every block there was stays, in its order."""
+    if not new:
+        return list(blocks)
+    items = [n for n, b in enumerate(blocks) if b.type in ITEM_BLOCKS]
+    keys = {n: item_key(blocks[n]) for n in items}
+    before: dict[int, list[Block]] = {}
+    end = []
+    for block in sorted(new, key=item_key):
+        key = item_key(block)
+        at = next((n for n in items if keys[n] > key), None)
+        (before.setdefault(at, []) if at is not None else end).append(block)
+    out: list[Block] = []
+    last = items[-1] if items else len(blocks) - 1
+    for n, block in enumerate(blocks):
+        out += before.get(n, [])
+        out.append(block)
+        if n == last:
+            out += end
+    if not blocks:
+        out += end
+    return out
 
 
 def append_image(page: bytes | None, *, author: bytes, key: bytes, file_name: str,

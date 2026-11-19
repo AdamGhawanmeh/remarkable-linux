@@ -124,18 +124,31 @@ def wait(ms: int) -> None:
     loop.exec()
 
 
+def describe(cls: type) -> tuple[set, dict, dict]:
+    """(properties, method name -> parameter counts, enums) of a bridge class's meta-object."""
+    meta = cls.staticMetaObject
+    properties = {meta.property(i).name() for i in range(meta.propertyCount())}
+    methods: dict[str, set[int]] = {}
+    for i in range(meta.methodCount()):
+        m = meta.method(i)
+        methods.setdefault(bytes(m.name()).decode(), set()).add(m.parameterCount())
+    enums = {}
+    for i in range(meta.enumeratorCount()):
+        e = meta.enumerator(i)
+        enums[e.name()] = {e.key(k): e.value(k) for k in range(e.keyCount())}
+    return properties, methods, enums
+
+
+# Read when this module is imported, before any test builds and tears down an app: once a
+# QML engine that used the pen toolbar is gone, PySide reports the Python wrappers of a few
+# bridge classes' staticMetaObject as deleted (FontExtender, DeviceRecovery, ...), so a
+# check that ran after such a test (another module's, in discovery order) would fail.
+META = {cls: describe(cls) for cls in CLASSES}
+
+
 class ApiParityTests(unittest.TestCase):
     def check(self, cls: type, names: list[str]) -> None:
-        meta = cls.staticMetaObject
-        properties = {meta.property(i).name() for i in range(meta.propertyCount())}
-        methods: dict[str, set[int]] = {}
-        for i in range(meta.methodCount()):
-            m = meta.method(i)
-            methods.setdefault(bytes(m.name()).decode(), set()).add(m.parameterCount())
-        enums = {}
-        for i in range(meta.enumeratorCount()):
-            e = meta.enumerator(i)
-            enums[e.name()] = {e.key(k): e.value(k) for k in range(e.keyCount())}
+        properties, methods, enums = META.get(cls) or describe(cls)
         for name in names:
             enums_only = name.endswith(":enums")
             spec = dict(API["classes"][name.removesuffix(":enums")])
@@ -1442,7 +1455,7 @@ class EditingTests(unittest.TestCase):
         wait(300)
         self.assertEqual(self.pending(), [])
         self.assertEqual(len(self.notices), 1)
-        self.assertIn("only turned on for the notebook named 'throwaway'", self.notices[0])
+        self.assertIn("only turned on for the document named 'throwaway'", self.notices[0])
 
     def test_a_file_that_is_not_an_image_changes_nothing(self):
         broken = self.dir / "broken.png"

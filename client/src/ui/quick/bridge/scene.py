@@ -18,15 +18,18 @@ the app's view does. What is typed is kept as pending edits of the library in ba
 (LibrarySource.add_text_edits): after a pause, before an undo or redo, and when text
 mode ends or the page changes.
 
-Editing so far is images on notebook pages, where the library allows editing
-(LibrarySource.editable): an image file dropped on a page
-(SceneController.insertImageFileAsSceneItem), and an image selected
-(selectImageAtPoint) then moved, resized, turned or deleted through the app's own
-SceneSelectionHandler (moveSelectedItems, scaleSelectedItems, rotateSelectedItems,
-deleteSelectedItems), with SelectionImage drawing the selected image while it is
-dragged. Pens and the eraser draw through bridge/pen.py, which hands each finished
-stroke or eraser pass to the view (pen_commit). The other editing members (conversion,
-stroke selection) exist so the QML binds, and do nothing yet (generated.py).
+Editing, where the library allows it (LibrarySource.editable), on notebook, PDF and
+ebook pages alike (typed text: notebook pages only): an image file dropped on a page
+(SceneController.insertImageFileAsSceneItem); items selected (selectImageAtPoint, a
+rectangle or a lasso) then moved, resized, turned, cut, copied, pasted or deleted
+through the app's own SceneSelectionHandler (moveSelectedItems, scaleSelectedItems,
+rotateSelectedItems, deleteSelectedItems), with SelectionImage drawing the selection
+while it is dragged; undo and redo. Pens and the eraser draw through bridge/pen.py,
+which hands each finished stroke or eraser pass to the view (pen_commit). A PDF or
+ebook page is the same scene as a notebook page, only wider or longer: the PDF page
+fills x in [-W/2, W/2], y in [0, H] at 226/72 px per point (ui/pages.py), and nothing
+is clipped to the 1404 x 1872 screen (ARCHITECTURE.md 5.4). Handwriting conversion
+exists so the QML binds, and does nothing yet (generated.py).
 
 Scene coordinates are the app's: tablet pixels at 226 DPI, x = 0 on the page's vertical
 centre line, y = 0 at its top (ui/pages.py uses x = 0 at the left edge). The tile
@@ -961,8 +964,6 @@ class _SceneView:
         if source is None or node is None or self._content is None or not self._page_id:
             return None
         refusal = source.edit_refusal(node)
-        if not refusal and self._content.has_pdf_page:
-            refusal = f"{what} can only be put on notebook pages"
         if refusal:
             _notify(refusal)
             return None
@@ -1034,8 +1035,7 @@ class _SceneView:
     # -- the selection --
     def _editable(self) -> bool:
         source, node = _source(), getattr(self._get("document"), "node", None)
-        return (source is not None and node is not None and self._content is not None
-                and not self._content.has_pdf_page and source.can_edit(node))
+        return source is not None and node is not None and self._content is not None and source.can_edit(node)
 
     def _layer_items(self, layer: int) -> list:
         """The items of a layer a selection can take (ui.selection.selectable), with the
@@ -1329,8 +1329,6 @@ class _SceneView:
             return refusal
         if self._content is None or not self._page_id:
             return "The page is still loading"
-        if self._content.has_pdf_page:
-            return "Strokes can only be drawn on notebook pages"
         return ""
 
     def pen_commit(self, kind: str, line, seq: int) -> None:

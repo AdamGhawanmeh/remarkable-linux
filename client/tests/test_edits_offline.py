@@ -271,20 +271,25 @@ class LibraryTests(Base):
     def test_only_the_named_notebook_may_be_edited(self):
         self.assertEqual(self.source.edit_refusal(self.doc), "")
         self.assertTrue(self.source.can_edit(self.doc))
-        for doc_id, why in ((OTHER, "only turned on for the notebook named 'throwaway'"),
+        for doc_id, why in ((OTHER, "only turned on for the document named 'throwaway'"),
                             ("nope", "not in the library")):
             self.assertIn(why, self.source.edit_refusal(self.tree.get(doc_id)))
         self.assertIn("not turned on", LibrarySource(self.sync).edit_refusal(self.doc))
 
-    def test_a_pdf_or_a_trashed_or_an_ambiguous_name_is_refused(self):
+    def test_a_trashed_or_an_ambiguous_name_is_refused(self):
+        # A PDF of the same name makes the name ambiguous as a notebook does: both are refused.
         self.cloud.put_item(PDF, meta("throwaway"), {"fileType": "pdf", "pageCount": 1}, {f"{PDF}.pdf": b"%PDF-1.4\n"})
         tree = self.source.refresh()
-        self.assertIn("Only notebooks", self.source.edit_refusal(tree.get(PDF)))
-        self.assertEqual(self.source.edit_refusal(tree.get(THROWAWAY)), "")     # the PDF does not count
+        for doc_id in (THROWAWAY, PDF):
+            self.assertIn("2 documents are named", self.source.edit_refusal(tree.get(doc_id)))
+        self.cloud.put_item(PDF, meta("throwaway", parent="trash"), {"fileType": "pdf", "pageCount": 1})
+        tree = self.source.refresh()
+        self.assertIn("trash", self.source.edit_refusal(tree.get(PDF)))
+        self.assertEqual(self.source.edit_refusal(tree.get(THROWAWAY)), "")     # one in the trash does not count
         self.cloud.put_item(OTHER, meta("throwaway"), notebook_content(PAGE1), {f"{OTHER}/{PAGE1}.rm": drawn_page()})
         tree = self.source.refresh()
         for doc_id in (THROWAWAY, OTHER):
-            self.assertIn("2 notebooks are named", self.source.edit_refusal(tree.get(doc_id)))
+            self.assertIn("2 documents are named", self.source.edit_refusal(tree.get(doc_id)))
         self.cloud.put_item(OTHER, meta("throwaway", parent="trash"), notebook_content(PAGE1))
         tree = self.source.refresh()
         self.assertIn("trash", self.source.edit_refusal(tree.get(OTHER)))
@@ -323,8 +328,22 @@ class LibraryTests(Base):
             self.source.insert_image(self.doc, PAGE1, self.image, "gif", box(), NOW)
         self.assertEqual(self.sync.edits.all(), [])
 
+    def test_a_block_the_writer_does_not_know_is_kept(self):
+        unknown = rm_writer.Block(0x7E, 1, 1, b"\x01\x02").encode()
+        odd = drawn_page() + unknown
+        self.cloud.put_item(THROWAWAY, meta("throwaway"), notebook_content(PAGE1), {f"{THROWAWAY}/{PAGE1}.rm": odd})
+        doc = self.source.refresh().get(THROWAWAY)
+        self.insert(doc=doc)
+        page = document_files(doc, self.sync.edits.of(THROWAWAY), lambda n: self.source.blob(doc, n),
+                              lambda e: self.image, self.sync.author())[f"{THROWAWAY}/{PAGE1}.rm"]
+        self.assertTrue(page.endswith(unknown))                 # where it was: after the items
+        self.assertEqual(len(page_images(page)), 1)
+
     def test_a_page_the_writer_does_not_understand_is_refused(self):
-        odd = drawn_page() + rm_writer.Block(0x7E, 1, 1, b"").encode()
+        header, blocks = rm_writer.split(drawn_page())
+        info = next(n for n, b in enumerate(blocks) if b.type == rm_writer.BLOCK_SCENE_INFO)
+        blocks[info] = rm_writer.Block(0x0D, 0, 1, blocks[info].payload + rm_writer.f_sub(11, b""))
+        odd = rm_writer.join(header, blocks)
         self.cloud.put_item(THROWAWAY, meta("throwaway"), notebook_content(PAGE1), {f"{THROWAWAY}/{PAGE1}.rm": odd})
         doc = self.source.refresh().get(THROWAWAY)
         with self.assertRaises(EditError) as raised:

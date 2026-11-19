@@ -180,7 +180,7 @@ when you use them.
 
 | Area | Status |
 |---|---|
-| Editing pages | See [Editing (experimental)](#editing-experimental) below: images, typed text, drawing, the eraser, undo/redo of all of them, and adding, duplicating, moving and deleting pages work. |
+| Editing pages | See [Editing (experimental)](#editing-experimental) below: images, typed text, drawing, the eraser, undo/redo of all of them, and adding, duplicating, moving and deleting pages work; all but typed text on PDF and EPUB pages too. |
 | Editing tags | **Working.** The Tag dialog on documents, folders and pages adds and removes tags as the official app does: ticked tags are kept or added (new ones timestamped now), unticked ones removed, half-ticked ones (only some of the chosen items have them) left alone; the item's `lastModified` is updated. Uploaded at once, like a rename. Pages added here and not uploaded yet cannot be tagged until their edits are uploaded. |
 | Duplicating documents | **Working.** Copy, then Paste, in the library makes a copy named as the official app names it ("Name copy", "Name copy 2", ...; translated), with new page ids and the same page files, as the app's copies are; it is uploaded at once like an import (only its `.content` and `.metadata` are new; the cloud already has the rest). A document with edits not uploaded yet is copied as shown, with them. Folders cannot be copied, as in the official app. |
 | Search in documents | The search bar inside a document opens but does not find anything yet. |
@@ -197,9 +197,10 @@ Editing is being built feature by feature, each one the way the official app doe
 client/.venv/bin/python client/run.py --edit-notebook NAME
 ```
 
-turns the app's own editing interface on for the one notebook with that name (not in
-the trash, and no other notebook may share the name). Edits are kept on this computer
-and drawn over the page until you upload them yourself (see Upload below).
+turns the app's own editing interface on for the one notebook, PDF or ebook with that
+name (not in the trash, and no other notebook, PDF or ebook may share the name). Edits
+are kept on this computer and drawn over the page until you upload them yourself (see
+Upload below).
 
 | Feature | Status |
 |---|---|
@@ -214,11 +215,14 @@ and drawn over the page until you upload them yourself (see Upload below).
 | Pages: add, duplicate, move, delete | **Working, not yet tried on a tablet.** "Add page" in the toolbar or page overview, and the page overview's Duplicate, Cut/Copy/Paste (move) and Delete, within the notebook. Saved as the official app saves them: the page list in `.content` is changed as its page map changes it (the same page-order keys, `idx`, and per-field timestamps), a duplicate copies the page's files under a new page id, a deleted page stays listed as deleted and its files leave the document, and a notebook left without pages gets a new "Blank" one. A new page has no `.rm` until something is put on it. Moving or pasting pages into another document, and changing a page's template, say "not available on Linux yet". |
 | Undo / redo | **Working.** Ctrl+Z / Ctrl+Shift+Z (or Edit > Undo, Redo) for strokes, eraser passes, typed text, and image inserts, pastes (several images pasted at once undo together), moves, resizes, turns, deletes and cuts. As in the official app each page has its own undo and redo, any new edit empties redo, and they are kept until the document is closed (or the page changes on another device). An undo is not a step back but new edits, as the tablet records it: an image taken off the page comes back as a new item right where it was among the layer's items, so undo and redo upload like any other edit. |
 | Layers | Not yet: edits go to Layer 1, as the app's do until another layer is chosen. |
+| PDFs and ebooks | **Working, not yet tried on a tablet.** Drawing, straight lines, the eraser, selecting (rectangle and lasso), moving, resizing, turning, copy, cut, paste, images and undo/redo work on PDF and EPUB pages as on notebook pages, over the PDF page at its real size (226/72 pixels per PDF point: A4, Letter, landscape and slide pages are wider or taller than the 1404 × 1872 screen, and ink is never clipped to it). A page that has no annotations yet gets its page file as the tablet makes one; on an annotated page, what the tablet wrote is kept byte for byte (its scene info, PDF text highlights, and anything this client does not read). An older PDF or ebook (`formatVersion` 1) gets the newer page list on its first edit, as the official app writes it when it saves. Typed text stays on notebook pages for now. A PDF or ebook uploaded from a computer and never opened on the tablet has no page list yet and cannot be edited until the tablet has opened it and synced. The eraser does not remove the tablet's PDF text highlights (the tablet's eraser does). |
 
 The first time editing turns on, the official app's "Desktop note-taking" introduction
 is shown. `client/tools/rm_roundtrip.py` checks the page writer against your own cached
 pages (every page must come back byte for byte, and take an image, a move, an undo of
-the move and a delete without any other block changing); it prints counts only.
+the move and a delete without any other block changing); `client/tools/pdf_edit_corpus.py`
+makes every kind of edit on every cached PDF and EPUB page in memory, and works out each
+such document's upload, without writing anything. Both print counts only.
 
 ## What install.sh puts where
 

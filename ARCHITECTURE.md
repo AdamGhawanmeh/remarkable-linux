@@ -1388,6 +1388,22 @@ The app upgrades version 1 when it loads a document (`fillContentFromDocument`,
 page when the lengths differ, no background without a usable map. All 64 formatVersion 1
 `.content` files of the cached library read the same as before the change.
 
+The registers the upgrade writes [O, 0x1406cd640 → 0x140876c70 → 0x140871670 →
+0x14086f560 → insertPage 0x140871e60]: the page map is made afresh for the loading
+author; each page is **appended** with insert mode 0 (the normal mode, so every written
+register is bumped once more by 0x1408715d0: `template`, `redir` and `idx` end at `A:2`,
+keys `ba`, `bb`, … as `key_after` gives them); the template is the i-th `.pagedata` line,
+else the default `Blank` (0x140817f50); `original` = `originalPageCount` when > 0, at
+the author's next tick (`A:1`); `lastOpened` is not set (written as `{"0:0", ""}`, as on
+12 cached files). Every cached cPages file has all four keys `lastOpened`, `original`,
+`pages`, `uuids`; on 45 of 50 PDFs `original` is stamped `1:1`. No cached document has
+both a formatVersion 1 and a 2 version, so the result is not compared with a real upgrade.
+*Client:* `core.pagemap.upgrade` does this; `core.edits.current_content` applies it
+whenever an edit writes `.content` (a page's `modifed`, a page added, pen settings),
+which is when the app first writes the upgraded file. A document uploaded with
+`"pages": null` (no page list) is not upgraded: it cannot be edited until a tablet has
+made its page list.
+
 **`.rm` v6 on PDF/EPUB pages** [O on real data]. A page only has a `.rm` once something was
 put on it: 87 of 2325 live PDF-backed pages, 53 of 58 inserted pages, 1 of 125 EPUB pages,
 4209 of 4540 notebook pages. Compared by page kind (notebook / PDF-backed / inserted into a
@@ -1433,6 +1449,35 @@ PDF / EPUB-backed):
   (182 of 4151 sideways, 55 downwards: scrolled or zoomed pages), so a reader must not
   clip either kind. EPUB pages behave like PDF pages: the `.pdf` rendition is the
   background.
+
+**Editing PDF and EPUB pages (client).** The same editing as on notebook pages (pens,
+straight lines, eraser, rectangle and lasso selection, move/scale/turn, clipboard,
+images, undo/redo; typed text not yet), gated like notebooks by `--edit-notebook NAME`
+(`LibrarySource.edit_refusal`: one non-trashed notebook, PDF or EPUB of that name; a
+PDF/EPUB needs its page list). Input goes through the same view ↔ scene transform as on
+notebook pages; the scene bounds are the PDF page's frame united with the ink
+(`ui/pages.py`), which `DocumentViewport` uses as `sceneBounds` for non-note pages (paste
+clamping, scrolling), so nothing is clipped to 1404 × 1872.
+- A page without a `.rm` gets `rm_writer.blank_page` (Layer 1, paper 1404 × 1872,
+  PageStats loads 1, SceneInfo field 6 zeros at `0:0`: the null `QRectF` the loader
+  defaults to, as on the 46 PDF pages without field 6) [I: the tablet's field 6 formula is
+  not traced, so it is not made up here].
+- An existing page keeps every block it does not change byte for byte, SceneInfo
+  included. Glyph ranges (0x03, PDF text highlights) and text items (0x06) are items of
+  their layer: their headers take part in the layer's sequence (left/right neighbours of
+  new items), their values are kept unread. Unknown blocks (0x0B `Array`, or any other
+  type) stay where they are; new items are inserted among the item blocks only. Ids are
+  read from such blocks as far as they are tagged (top level, and sub-blocks shaped like
+  LWW values); others cannot clash with new ids anyway, since those use this client's
+  own author index. None of the 4,226 cached pages has a 0x03, 0x06 or 0x0B block, so
+  this is checked on synthetic pages only. Deviation: the app's eraser deletes a glyph
+  range when more than half its rectangles' centres are inside the outline (§5.1); this
+  client's leaves glyph ranges alone.
+- `tools/pdf_edit_corpus.py` (read-only) makes every kind of edit on every cached PDF
+  and EPUB page and works out each document's upload: 113 documents (96 worked out to an
+  upload, 15 not wholly cached, 2 without a page list), 2,494 pages (141 with a `.rm`, 41
+  of them with a SceneInfo field 6), 19,952 edits, 51 formatVersion 1 documents
+  upgraded, 0 errors (2026-11-19).
 
 ### 5.5 Saving edits: `.metadata`, page `modifed` and PageStats
 

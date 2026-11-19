@@ -758,25 +758,8 @@ class _Chain:
 
 def _insert_items(blocks: list[w.Block], new: list[w.Block]) -> list[w.Block]:
     """`blocks` with the item blocks `new` where the app stores them: after the other
-    blocks, the items sorted by parent then id (rm_writer._insert_item, for many)."""
-    if not new:
-        return blocks
-    first = next((n for n, b in enumerate(blocks) if b.type in w.ITEM_BLOCKS), len(blocks))
-    if any(b.type not in w.ITEM_BLOCKS for b in blocks[first:]):
-        raise RmParseError("the page's items are not at its end")
-
-    def key(block: w.Block) -> tuple:
-        item = w.decode_item(block.payload)
-        return w.id_key(item.parent), w.id_key(item.item)
-
-    out, old = blocks[:first], [(key(b), b) for b in blocks[first:]]
-    at = 0
-    for new_key, block in sorted(((key(b), b) for b in new), key=lambda pair: pair[0]):
-        while at < len(old) and old[at][0] <= new_key:
-            out.append(old[at][1])
-            at += 1
-        out.append(block)
-    return out + [b for _, b in old[at:]]
+    blocks, the items sorted by parent then id (rm_writer.insert_items)."""
+    return w.insert_items(blocks, new)
 
 
 def delete_strokes(page: bytes, items: Iterable[tuple[int, int]]) -> bytes:

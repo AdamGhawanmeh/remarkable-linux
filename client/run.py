@@ -171,8 +171,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--self-test", action="store_true",
                       help="start on the demo library, check the interface loads, and quit")
     parser.add_argument("--edit-notebook", action="append", default=[], metavar="NAME",
-                        help="experimental: turn editing on for the notebook with this name (so far: drop an "
-                             "image file on a page). Edits stay on this computer until "
+                        help="experimental: turn editing on for the notebook, PDF or ebook with this name "
+                             "(the only one of that name). Edits stay on this computer until "
                              "client/tools/push_edits.py uploads them")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)

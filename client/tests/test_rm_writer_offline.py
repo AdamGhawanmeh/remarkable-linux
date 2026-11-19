@@ -6,6 +6,7 @@ Run: python3 -m unittest discover -s client/tests -p 'test_*offline.py'
 
 from __future__ import annotations
 
+import struct
 import sys
 import unittest
 import uuid
@@ -39,6 +40,16 @@ def stroke(item, left=ZERO, parent=LAYER) -> bytes:
     header = w.decode_item(b.payload)
     header.left = left
     return w.Block(b.type, b.min_version, b.version, header.encode()).encode()
+
+
+def glyph(item, left=ZERO, right=ZERO, parent=LAYER, text="Highlighted words", deleted=0) -> bytes:
+    """A CrdtGlyphItem (block 0x03): a PDF text highlight, laid out as the community's
+    readers (rmscene) read one: start, length, colour, text, rectangles (x, y, w, h)."""
+    raw = text.encode()
+    value = (b"\x01" + f_u32(2, 120) + f_u32(3, len(text)) + f_u32(4, 3)
+             + f_sub(5, varuint(len(raw)) + b"\x01" + raw)
+             + f_sub(6, varuint(1) + struct.pack("<4d", -300.0, 400.0, 250.0, 40.0)))
+    return block(0x03, w.ItemHeader(parent, item, left, right, deleted, None if deleted else value).encode())
 
 
 def page(*items: bytes, author: bytes = TABLET, extra: bytes = b"") -> bytes:
@@ -130,10 +141,23 @@ class IdTests(unittest.TestCase):
         self.assertEqual(w.highest_counter(blocks), 77)
 
     def test_a_block_that_is_not_understood_is_refused(self):
-        for bad in (block(0x7E, b""), block(0x0D, f_sub(11, b"")), block(0x05, w.ItemHeader(LAYER, (1, 9), ZERO, ZERO, 0, b"\x55").encode(), 2, 2)):
+        # A block this client edits must be understood in full.
+        for bad in (block(0x0D, f_sub(11, b"")), block(0x02, f_id(1, (0, 11)) + f_sub(12, b""))):
             _, [b] = w.split(w.V6_HEADER + bad)
             with self.assertRaises(RmParseError):
                 w.block_ids(b)
+
+    def test_the_ids_of_blocks_it_does_not_know_are_read_as_far_as_they_are_tagged(self):
+        # Kept byte for byte by every edit; their tagged ids count for the page's clock.
+        cases = ((block(0x7E, b""), []),
+                 (block(0x7E, f_id(1, (2, 40)) + f_sub(2, f_id(1, (3, 41)) + f_u8(2, 1)) + f_sub(3, b"\x05abc")),
+                  [(2, 40), (3, 41)]),
+                 (block(0x7E, b"\xff\xff\xff"), []),                      # not tagged values at all
+                 (block(0x05, w.ItemHeader(LAYER, (1, 9), ZERO, ZERO, 0, b"\x55").encode(), 2, 2), [LAYER, (1, 9), ZERO, ZERO]),
+                 (glyph((1, 30), left=(1, 15)), [LAYER, (1, 30), (1, 15), ZERO]))
+        for data, ids in cases:
+            _, [b] = w.split(w.V6_HEADER + data)
+            self.assertEqual(w.block_ids(b), ids)
 
     def test_sequence_replays_insertions(self):
         # 15 drawn, 16 drawn after it, 17 put between them, 18..19 a deleted run after 17.
@@ -236,8 +260,8 @@ class AppendImageTests(unittest.TestCase):
 
     def test_refuses_what_it_cannot_do_safely(self):
         good = page(stroke((1, 15)))
-        with self.assertRaises(RmParseError):               # a block it does not understand
-            self.add(good + block(0x7E, b""))
+        with self.assertRaises(RmParseError):               # a block it edits that it does not understand
+            self.add(page(stroke((1, 15)), extra=block(0x0D, f_sub(11, b""))))
         with self.assertRaises(RmParseError):               # not a layer of this page
             self.add(good, layer=(1, 99))
         with self.assertRaises(ValueError):

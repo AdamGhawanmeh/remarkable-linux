@@ -347,3 +347,60 @@ class PageMap:
         self.cpages["pages"] = self.live + sorted(self.dead, key=lambda e: e["id"])
         self.content["pageCount"] = len(self.live)
         return self.content
+
+
+# ------------------------------------------------------------------ formatVersion 1
+
+DEFAULT_TEMPLATE = "Blank"      # the app's default template name (0x140817f50)
+
+
+def is_legacy(content: dict) -> bool:
+    """Whether a .content is formatVersion 1 (`pages` + `redirectionPageMap`), which the
+    app upgrades before it changes anything (ARCHITECTURE.md 5.4)."""
+    return not isinstance(content.get("cPages"), dict) and "pages" in content
+
+
+def upgrade(content: dict, author_uuid: bytes | str, templates: list[str] | None = None) -> dict:
+    """A formatVersion 1 .content as reMarkable.exe upgrades it when it loads the
+    document (fillContentFromDocument, 0x1406cd640), for the author `author_uuid`;
+    `templates` are the .pagedata lines, if any. Returned as a new dict; one that is not
+    formatVersion 1 comes back as it is.
+
+    The page list is made afresh (0x140876c70): each page of `pages` is appended in the
+    normal insert mode (initializePages 0x140871670 -> 0x14086f560 -> insertPage
+    0x140871e60 with mode 0), with the i-th template (the default one past the end of
+    `templates`) and, when the redirection map is used, its PDF page (`map[i]`, or i when
+    the map's length differs). `original` is originalPageCount when that is above 0
+    (written with the next tick of the author's counter). Then cPages is written,
+    formatVersion is 2, pageCount the number of pages, and `pages`,
+    `redirectionPageMap` and `originalPageCount` go. PageMapError when there is no page
+    list (`"pages": null`: never opened on a tablet)."""
+    if not is_legacy(content):
+        return content
+    from .models import _redirection_map
+    ids = content.get("pages")
+    if not isinstance(ids, list) or not ids:
+        raise PageMapError("the document has no page list yet (open it once on a reMarkable)")
+    if any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+        raise PageMapError("the document's formatVersion 1 page list is not understood")
+    redirects = _redirection_map(content)
+    original = content.get("originalPageCount") if "redirectionPageMap" in content else None
+    original = int(original) if isinstance(original, (int, float)) and not isinstance(original, bool) else -1
+    out = {k: v for k, v in content.items() if k not in ("pages", "redirectionPageMap", "originalPageCount")}
+    cpages: dict = {"lastOpened": {"timestamp": "0:0", "value": ""},
+                    "original": {"timestamp": "0:0", "value": -1}, "pages": [], "uuids": []}
+    out["cPages"] = cpages
+    pagemap = PageMap(out, author_uuid)
+    templates = templates or []
+    for i, page_id in enumerate(ids):
+        if redirects is None:
+            redirect = None
+        else:
+            redirect = redirects[i] if len(redirects) == len(ids) else i
+        template = templates[i] if i < len(templates) and templates[i] else DEFAULT_TEMPLATE
+        pagemap.insert(len(pagemap.live), page_id, template, redirect)
+    if original > 0:
+        _set(cpages, "original", original, pagemap.author)
+    pagemap.save()
+    out["formatVersion"] = 2
+    return out
