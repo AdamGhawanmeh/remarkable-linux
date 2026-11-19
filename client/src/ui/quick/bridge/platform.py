@@ -31,6 +31,12 @@ from core.auth import PAIRING_URL, AuthNetworkError, PairingError, user_agent
 log = logging.getLogger("rm.ui.quick.platform")
 
 
+# Settings::paperSize accepts these (0x14102b900) and falls back to the first; a page's
+# scene is 1404 x 1872 until set otherwise (the page loader's default, 0x140a02fb0).
+PAGE_PAPER_SIZE = (1404.0, 1872.0)
+PAPER_SIZES = (PAGE_PAPER_SIZE, (1620.0, 2160.0), (954.0, 1696.0))
+
+
 class SettingsStore:
     """Where Settings keeps its values: an INI file (or memory, for tests)."""
 
@@ -204,8 +210,12 @@ class Settings(QObject):
     showSleepScreenCarousel = _stored("showSleepScreenCarousel", bool, False, "showSleepScreenCarouselChanged")
 
     def _paper_size(self) -> QSizeF:
+        """The stored paper size when it is one the app knows (1404 x 1872, 1620 x 2160,
+        954 x 1696), else 1404 x 1872, as Settings::paperSize returns it (0x14038bce0)."""
         value = self._store.get("paperSize")
-        return value if isinstance(value, QSizeF) else QSizeF()
+        if isinstance(value, QSizeF) and (value.width(), value.height()) in PAPER_SIZES:
+            return QSizeF(value)
+        return QSizeF(*PAGE_PAPER_SIZE)
 
     def _set_paper_size(self, size: QSizeF) -> None:
         self._store.set("paperSize", QSizeF(size))
@@ -898,8 +908,28 @@ class DocumentController(QObject):
 
     @Slot(str, int, str)
     @Slot(str, int, str, QSizeF)
-    def setTemplateForPage(self, document_id: str, page: int, template: str, paper_size=None) -> None:
-        self._unsupported(f"setTemplateForPage({document_id!r}, page {page}, {template!r})")
+    def setTemplateForPage(self, document_id: str, page: int, template: str, paper_size=None) -> bool:
+        """The page's template (LibrarySource.set_page_template: written only when it
+        differs; lastModified moves), as the app's template task makes it. With a paper
+        size, as the new-notebook dialog and Quick sheets pass Settings.paperSize, the
+        app also sets the page scene's paper size; an empty size refuses the whole call
+        ("invalid paper size when setting template"). A page's paper size here is the
+        scene default, 1404 x 1872 (every cached page has it): setting that one changes
+        nothing (Scene::setPaperSize compares first, 0x1408aa520); another one is not
+        made yet and is only logged."""
+        if paper_size is not None:
+            size = QSizeF(paper_size)
+            if size.isEmpty():
+                log.warning("setTemplateForPage(%r, page %d): invalid paper size when setting template",
+                            document_id, page)
+                return False
+            if (size.width(), size.height()) != PAGE_PAPER_SIZE:
+                self._unsupported(f"setTemplateForPage({document_id!r}, page {page}): paper size "
+                                  f"{size.width():g} x {size.height():g}")
+        return self._edit(document_id, "set template",
+                          lambda source, node: source.set_page_template(node, int(page), str(template or ""),
+                                                                        self._now_ms()),
+                          None, lambda entry, changed: entry.templatesChanged.emit() if changed else None)
 
     def _add_page(self, document_id: str, insert_index: int = -1, template=None, callback=None,
                   page_uuid: str = "") -> bool:
@@ -974,10 +1004,34 @@ class DocumentController(QObject):
     def setViewBackgroundFilter(self, document_id: str, value: str) -> None:
         self._unsupported("setViewBackgroundFilter")
 
-    @Slot(str, QSizeF)
-    @Slot(str, QSizeF, "QJSValue")
-    def setPaperSizeForQuickSheetPage(self, document_id: str, size: QSizeF, callback=None) -> None:
-        self._unsupported("setPaperSizeForQuickSheetPage")
+    @Slot(str, QSizeF, result=bool)
+    @Slot(str, QSizeF, "QJSValue", result=bool)
+    def setPaperSizeForQuickSheetPage(self, document_id: str, size: QSizeF, callback=None) -> bool:
+        """DocumentController::setPaperSizeForQuickSheetPage (0x140492cd0 -> 0x140492a80):
+        only for the Quick sheets document while it has fewer than 2 pages, it sets the
+        paper size of its first page's scene, then calls back. The scene keeps its size
+        when it is the same (0x1408aa520): with 1404 x 1872, the size every page here
+        has, nothing changes and the callback runs; another size would rewrite the page's
+        SceneInfo, which is not made yet (logged, no callback)."""
+        from core.create import is_quick_sheet
+        from .library import tr
+        library = self._library
+        node = library.tree.get(str(document_id)) if library is not None else None
+        if node is None:
+            log.warning("setPaperSizeForQuickSheetPage passed a null document")
+            return False
+        entry = library.entryForId(node.id)
+        if not is_quick_sheet(node, library.tree, tr("Document", "Quick sheets")) or entry.pageCount >= 2:
+            log.warning("Changing paper size is only allowed for Quick sheets that has one page.")
+            return False
+        size = QSizeF(size)
+        if (size.width(), size.height()) != PAGE_PAPER_SIZE:
+            self._unsupported(f"setPaperSizeForQuickSheetPage({document_id!r}, {size.width():g} x {size.height():g})")
+            return False
+        log.info("Set paper size for Quick sheet finished")
+        if callback is not None and callable(getattr(callback, "call", None)) and not callback.isUndefined():
+            QTimer.singleShot(0, self, lambda: callback.call([]))
+        return True
 
     @Slot("QVariant")
     def execute(self, task) -> None:

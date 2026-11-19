@@ -1590,6 +1590,8 @@ Every caller passes `QDateTime::currentMSecsSinceEpoch()`.
 | Page operations (5 functor bodies 0x140645430, 0x140645570, 0x140655170, 0x140655990, 0x140659cb0; not named one by one) | | now | the same page's `modifed` = now, upload timer |
 | **Page turn** (`Document::setCurrentPage`, 0x140667db0) | | **now** (unconditional once the page differs; asm 0x140667e2a–0x140667e3b) | The index is clamped to [0, pageCount − 1]. It does nothing if `lastOpenedPage` (and, for formatVersion 2, the cPages `lastOpened` register) already match. Otherwise: cPages `lastOpened` = page id, with timestamp = the document clock's next tick (0x140876db0); `lastOpenedPage` = index; `lastOpenedPageChanged` |
 | Opened / created (0x140669d40; called from `createDocument` 0x1404dd3b0 and a queued functor) | | unchanged | `lastOpened` = now, `lastOpenedChanged` |
+| `setOrientation`, `setCoverPageNumber`, `clearIsNew` (§5.6) | 0x140667f10, 0x1406676a0, 0x140684080 | **unchanged** | their own field only when it differs; stored and uploaded on unlock |
+| Template / paper-size tasks finished (0x14068f440 → 0x14065aff0) | | now, **only if the page map changed** | §5.6 |
 | Other callers (0x1404e0c10, 0x14065aff0, 0x140697340) | | now | not identified |
 
 Corpus check:
@@ -1655,6 +1657,129 @@ Corpus check:
 ends with `rm_writer.saved`: `loads` = the base file's + 1, once, however many edits the
 session made; a page with no file yet keeps the 1 `blank_page` writes, and a replay that
 changes nothing changes nothing.
+
+### 5.6 New notebooks, Quick sheets and the library's document setters
+
+Traced in reMarkable.exe 3.29 (`xofm/libs/library/src/librarycontroller.cpp`,
+`documentcontroller`, `Document`/`Entry` setters, the `.content` writer 0x1406ce210)
+[O unless marked]; checked read-only against the 232 notebooks of the cached library
+(`client/tools/create_schema_check.py`, counts only). QML callers: `NamingDialog.qml`
+(new notebook, `createNewAction` Ctrl+N), `LibraryHelpers.createNewQuicksheet`
+(`createQuicksheetAction` Ctrl+O), `ContentEntriesBase.selectEntry` (`clearIsNew`). Both
+actions are enabled only with `canEditDocuments` = `UserInfo.featureToggles.clientEdit`.
+
+**Dispatch** (`LibraryController` moc 0x140c8e5d0, static metacall 0x140473ef0): 1–3
+`createDocument(dir, visibleName[, uuid[, uuid_page]])` → 0x1404ddf10 → 0x1404dd3b0;
+4–5 `createDocumentFromExisting` → 0x1404ddfc0; 7 `quickSheets()` → 0x1404e1610 (returns
+a new `QmlDocumentWrapper*`); 17 `setOrientation` → 0x1404e26d0; 18
+`setCoverPageNumber` → 0x1404e1b20; 26 `clearIsNew` → 0x1404dc5c0. `DocumentController`
+(moc 0x140c8e550, metacall 0x140472e80): 1–2 `setTemplateForPage` → 0x140492f60; 20–21
+`setPaperSizeForQuickSheetPage` → 0x140492cd0 → 0x140492a80.
+
+**`createDocument`** (0x1404dd3b0), in order:
+1. "Creating document … in …"; refuses when the library's volume has ≤ 512 MiB free
+   (0x1404dff90: `> 0x20000000`, "Not enough free disk space, refusing to create new
+   document"); the parent defaults to My files; it must lock and not be in the trash
+   (0x140681860; "parent collection not locked.").
+2. Id: a new QUuid (0x14084b930), or `uuid` when it parses ("uuid {:?} supplied, using
+   it for document creation"). An existing id is refused ("refusing to create document
+   with id {} that already exists").
+3. `new Document` (0x840 bytes, ctor 0x14064f3c0). Defaults written by the `.content`
+   writer: `coverPageNumber` −1 (+0x250), `formatVersion` 1 → 2 by "ensure correct format
+   version" (0x14065e7e0), `textAlignment` justify (+0x278 = 8; written only for 8 or 1),
+   `textScale` 1.0 (+0x280), `lineHeight` **100** (+0x288), `margins` **not written**
+   (optional, +0x298 false), orientation 2 = portrait (+0x2a8), `zoomMode` 0 = bestFit
+   (+0x2ac), `sizeInBytes` `QString::number(+0x240 = 0)` = `"0"`, `fontName` "",
+   `documentMetadata`/`extraMetadata` `{}`; `viewBackgroundFilter` and the key after the
+   table (+0x258 object, likely `keyboardMetadata`) only when non-empty;
+   `lockedByPassword` only when set. `customZoom*` come from the scene defaults [I]: on all
+   232 cached notebooks CenterX 0, CenterY 936, 1404 × 1872, scale 1, portrait.
+4. `setVisibleName` (lastModified now), `setFileType(Notebook)` (0x140667aa0).
+5. Page: id a new QUuid or `uuid_page` ("uuid {:?} supplied, using it for page
+   creation"); 0x140668010 gives one page with the template list resized to one
+   **empty** name and no redirection; `initializePages` (0x140871670) inserts it in the
+   normal mode: the empty template writes no register, so the entry is `id` + `idx`
+   ("ba" at `A:2`); fileType Notebook → no `redir`; `original` stays −1 at `0:0`. cPages
+   `lastOpened` is then set from `.metadata` `lastOpenedPage` (0x140876db0), which is
+   −1 on a new entry (0x14067fef7) and is rejected: `{"0:0", ""}`.
+6. `setParent` (lastModified now), "opened" 0x140669d40 (`lastOpened` = now), added to the
+   folder (0x140695a60) and the library (0x14048b160), entry+0x51 set (store and upload
+   on unlock, 0x140684b60 → 0x140684790). No `.rm` and no `.pagedata` are written.
+
+`.metadata`: `createdTime`, `lastModified`, `lastOpened` now; `lastOpenedPage` −1;
+`new` false; `parent`; `pinned` false; `source` ""; `type`; `visibleName` (the writer's
+key set for documents, §5.5).
+
+The dialog then calls `setOrientation(id, Qt.Vertical)` and `setCoverPageNumber(id, −1|0)`
+(no-ops on the defaults unless "First page" was chosen), and
+`DocumentController.setTemplateForPage(id, lastOpenedPage, "Blank", Settings.paperSize)`,
+then opens the notebook in text mode. The template write gives the page `template`
+"Blank" at `A:1`. The result is the shape the tablet's own new notebooks have: of the 19
+cached one-page notebooks whose page was never reordered, 18 have `idx` "ba" at `A:2` and
+`template` at `A:1` (the 19th `idx` at `A:1`).
+
+**`setTemplateForPage`** (0x140492f60 → 0x140492d60): the paper size argument is a
+`QJSValue`; when it holds a `QSizeF` that is empty the call is refused ("invalid paper size
+when setting template"). A task (0x140690dc0, run 0x14068f060) sets the page scene's
+paper size (functor → `Scene::setPaperSize` 0x1408aa520, which returns at once when the
+size is the same) and the template; when it finishes (0x14068f440) 0x14065aff0 compares
+the page map with the pages (0x140669620, 0x140874970): **only changed registers are
+written**, and `lastModified` = now only if something changed.
+
+**`Settings.paperSize`** (getter 0x14038bce0, key index 0x2a): the stored size when it is
+one of 1404 × 1872, 1620 × 2160, 954 × 1696 (table 0x14102b900), else **1404 × 1872**.
+
+**Quick sheets.** No marker exists. `Document::isQuickSheet` (0x140660b20):
+`visibleName == tr("Quick sheets")` (context `Document`, 0x140664e70), not trashed
+(entry+0x70, the `isTrashed` getter of `QmlEntryWrapper`), `fileType == Notebook`.
+`Library` 0x1404d50c0 walks all entries and keeps the **smallest id** (QByteArray
+compare) among those. `quickSheets()` returns that one, else
+`createDocument(My files, tr("Quick sheets"))` with nothing else set. Ctrl+O
+(`createNewQuicksheet`): if the last page has content, `addPageWithTemplateAndPaperSizeFromPage
+(id, −1, "Blank", last)`, else, for a one-page Quick sheets,
+`setTemplateForPage(id, 0, templateForPage(0), Settings.paperSize)`; then
+`setLastOpenedPage(last)`, `setTemplateForPage(last, "Blank")` and open in text mode.
+`setPaperSizeForQuickSheetPage(id, size[, callback])` (no QML caller on the desktop):
+null document → "setPaperSizeForQuickSheetPage passed a null document"; not a Quick sheets
+or ≥ 2 pages → "Changing paper size is only allowed for Quick sheets that has one page.";
+else a task (0x140690e80, run 0x14068f1c0) sets page 0's scene paper size, then the
+callback.
+
+**`createDocumentFromExisting`** (0x1404ddfc0, "Creating document {} in {} from pages
+{} in {}"): the same checks, a new Document (name, Notebook, parent; **no page of its
+own, not marked opened**), then three tasks on the new document's worker, the second
+(0x14068ffb0) moving the pages from the source. The desktop QML calls it only on mobile.
+
+**Setters.** `setOrientation` → `Document` 0x140667f10: only when it differs; deletes
+`<id>.thumbnails` (0x14065cc40 flag 1); `orientationChanged`. Read: "landscape" → 1
+(`Qt::Horizontal`), anything else 2 (0x1406cf330); written: 1 → "landscape", else
+"portrait" (0x1406cf420). `setCoverPageNumber` → 0x1406676a0 (+0x250, signal 5).
+`clearIsNew` → only when `isNew`: `Entry::setNew(false)` (0x140684080, metadata setter
+0x14084d440), `isNewChanged`. None of the three calls `setLastModified`.
+
+*Client* (`core/create.py`, `LibrarySource.create_notebook`/`create_from_pages`/
+`set_page_template`, `LibraryController`, `DocumentController`):
+- A new notebook or Quick sheets is made in memory and shown at once (`view_tree`),
+  marked editable (with the copies, `editable-copies.json`), and uploaded on the next
+  event-loop pass through the Mutator (`SyncClient.create_document`, like an import),
+  so the dialog's follow-up calls land in its files before the upload, as the app's entry
+  upload timer coalesces them. A failed upload removes it. Refused offline (this client
+  keeps no local-only documents) and unless editing is turned on; `clientEdit` is on in
+  the library whenever editing is turned on (Ctrl+N, Ctrl+O), so the app's editing
+  tutorial shows the first time a notebook opens, as in the official app.
+- `setTemplateForPage` writes the template into an un-uploaded new notebook's `.content`,
+  otherwise it is a pending page edit (`edits.PageTemplate`, uploaded by push_edits);
+  a template the page already has changes nothing. A paper size other than 1404 × 1872
+  is not applied (logged): writing a page's SceneInfo paper size is not traced
+  (0x1408aa520 also updates fields 6–8). `setPaperSizeForQuickSheetPage` follows the
+  checks above and succeeds when the size is 1404 × 1872, the size every page here has.
+- `setOrientation`, `setCoverPageNumber`, `clearIsNew` are shown at once
+  (`LibrarySource.show_fields`) and committed (`set_document_settings`, `clear_new`) with
+  `lastModified` untouched; orientation also drops the `.thumbnails` files.
+- `createDocumentFromExisting`: new page ids (not traced whether the move keeps them),
+  each page's `.rm` (with pending edits), images and page files copied, the pages deleted
+  from the source as a pending `PageDelete`; note pages only (a PDF page is refused).
+- Deviation, unchanged: the client does not bump `lastModified` on a page turn (§5.5).
 
 ## 6. Implications for the Linux client
 

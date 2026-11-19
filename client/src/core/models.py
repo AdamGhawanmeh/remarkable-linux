@@ -272,7 +272,8 @@ class Content:
             pages=pages,
             orientation=str(raw.get("orientation", "")),
             tags=[t for t in tags if t],
-            cover_page_number=int(raw.get("coverPageNumber") or 0),
+            # A missing key reads -1 ("last page visited"), as the app reads it (0x1406cda70).
+            cover_page_number=_int(raw.get("coverPageNumber", -1), -1),
             size_in_bytes=int(raw.get("sizeInBytes") or 0),
             raw=raw,
         )

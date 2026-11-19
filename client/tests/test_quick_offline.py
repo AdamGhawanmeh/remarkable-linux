@@ -1060,6 +1060,10 @@ class EditingTests(unittest.TestCase):
                                    editable=("throwaway",))
         cls.source.refresh()
         cls.app = QuickApp(cls.source, tmp / "cache", config_dir=tmp)
+        # The app's editing tutorial was seen: with editing on in the library, it would
+        # cover the window the first time a notebook opens (and closing it with navDone
+        # leaves the keyboard focus on the hidden tutorial).
+        cls.app.singletons.settings.setRawValue("Onboarding", "ClientEdit", True)
         cls.app.load()
         cls.app.start(sync=False)
         wait(800)
@@ -1097,7 +1101,9 @@ class EditingTests(unittest.TestCase):
         return self.source.sync.edits.all()
 
     def test_the_editing_interface_is_on_only_in_the_notebook_that_may_be_edited(self):
-        self.assertFalse(self.editing())
+        # In the library it is on while editing is turned on: it lets the library make
+        # new notebooks and Quick sheets (Ctrl+N, Ctrl+O).
+        self.assertTrue(self.editing())
         self.open_document(self.OTHER)
         self.assertFalse(self.editing())
         self.assertFalse(self.drop_area().property("enabled"))
@@ -1107,7 +1113,7 @@ class EditingTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: self.drop_area().property("enabled")))
         wait(300)
         self.close_document()
-        self.assertFalse(self.editing())
+        self.assertTrue(self.editing())
         self.assertEqual(real_warnings(self.app.warnings), [])
 
     def test_a_copy_of_the_editable_notebook_may_be_edited_too(self):

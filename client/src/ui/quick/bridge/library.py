@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Any, Callable
 
-from PySide6.QtCore import (Property, QCoreApplication, QObject, QPointF, QSizeF, Qt, QTimer, Signal, Slot,
+from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QObject, QPointF, QSizeF, Qt, QTimer, Signal, Slot,
                             QEnum)
 
 from core.auth import CERTIFICATE_TIME_ERROR, HANDSHAKE_FAILED, http_error_name
@@ -842,7 +842,9 @@ class DocumentWrapper(EntryWrapper):
 
     @Slot(result=bool)
     def isQuickSheet(self) -> bool:
-        return False
+        """Document::isQuickSheet (core.create.is_quick_sheet)."""
+        from core.create import is_quick_sheet
+        return is_quick_sheet(self._node, getattr(self._library, "tree", None), tr("Document", "Quick sheets"))
 
 
 class Library(QObject):
@@ -1211,6 +1213,10 @@ class LibraryController(QObject):
         # (source id, copy id) after a copy is made: a copy of a notebook that may be
         # edited may be edited too (LibrarySource.inherit_editing).
         self.inherit_editing = inherit_editing or (lambda source_id, copy_id: False)
+        # Set by the app: its LibrarySource (documents made here, settings shown before
+        # they are uploaded) and how it shows the library again after such a change.
+        self.source: Callable[[], Any] = lambda: None
+        self.refresh: Callable[[], None] = lambda: None
 
     def _unsupported(self, what: str) -> None:
         # WARNING, so that it is in the journal: which call the UI made that is not built.
@@ -1228,23 +1234,95 @@ class LibraryController(QObject):
                     f"Created folder {name}")
         return ""
 
+    def _now_ms(self) -> int:
+        now = getattr(self.library, "now_ms", None)
+        return int(now()) if callable(now) else int(QDateTime.currentMSecsSinceEpoch())
+
+    def _upload_created(self, doc_id: str, name: str, after: Callable[[bool], None] | None = None) -> None:
+        """Upload a document made here on the next pass of the event loop (as the app's
+        entry upload timer, interval 0, coalesces the changes made right after creating
+        it: the new-notebook dialog's orientation, cover and template)."""
+        source = self.source()
+
+        def upload(sync, progress):
+            got = source.upload_created(doc_id)
+            if got is not None:
+                sync.create_document(doc_id, got[0], got[1], progress)
+
+        def done(ok: bool) -> None:
+            if not ok:
+                source.created_failed(doc_id)
+                self.refresh()
+            if after is not None:
+                after(ok)
+        QTimer.singleShot(0, self, lambda: self.submit(f"Creating {name}", upload, "", done))
+
     @Slot(str, str, result=str)
     @Slot(str, str, str, result=str)
     @Slot(str, str, str, str, result=str)
     def createDocument(self, directory_id: str, name: str, uuid: str = "", page_uuid: str = "") -> str:
-        self._unsupported("createDocument")
-        return ""
+        """A new notebook in folder `directory_id` (core.create, as reMarkable.exe makes
+        it): shown, openable and editable at once, uploaded right after (_upload_created).
+        Returns its id; "" when it is not made (the user is told why)."""
+        source = self.source()
+        if source is None:
+            self._unavailable(f"createDocument({directory_id!r}, {name!r})", "Not available on Linux yet")
+            return ""
+        from core.edits import EditError
+        from core.sync import SyncError
+        try:
+            node = source.create_notebook(str(name), str(directory_id or ROOT_ID), self._now_ms(),
+                                          uuid or None, page_uuid or None)
+        except (EditError, SyncError) as err:
+            log.warning("createDocument(%r, %r): %s", directory_id, name, err)
+            self.library.errorMessage.emit(str(err))
+            return ""
+        self.refresh()
+        self._upload_created(node.id, str(name))
+        return node.id
 
     @Slot(str, str, str, "QVariantList", result=str)
     @Slot(str, str, str, "QVariantList", "QJSValue", result=str)
     def createDocumentFromExisting(self, directory_id: str, name: str, source_id: str, pages: list,
                                    callback=None) -> str:
-        self._unsupported("createDocumentFromExisting")
-        return ""
+        """A new notebook of pages moved out of document `source_id` (the tablet's "move
+        pages to a new notebook"; the desktop QML calls it on mobile only): pages copied
+        with their files into a new notebook uploaded at once, and deleted from the source
+        as a pending page edit. The callback runs once the new notebook is uploaded, as
+        the app calls it once its page-move task is done. Returns its id ("" if not made)."""
+        source = self.source()
+        node = self.library.tree.get(str(source_id))
+        if source is None or not isinstance(node, DocumentNode):
+            self._unavailable(f"createDocumentFromExisting({source_id!r}): invalid source id",
+                              "Unable to move pages")
+            return ""
+        from core.edits import EditError
+        from core.sync import SyncError
+        try:
+            made, _ = source.create_from_pages(str(name), str(directory_id or ROOT_ID), node, list(pages or []),
+                                               self._now_ms())
+        except (EditError, SyncError) as err:
+            log.warning("createDocumentFromExisting(%r, pages %r): %s", source_id, pages, err)
+            self.library.errorMessage.emit(str(err))
+            return ""
+        self.refresh()
 
-    @Slot(result="QVariantList")
-    def quickSheets(self) -> list:
-        return []
+        def after(ok: bool) -> None:
+            if ok and callback is not None and callable(getattr(callback, "call", None)) and not callback.isUndefined():
+                callback.call([])
+        self._upload_created(made.id, str(name), after)
+        return made.id
+
+    @Slot(result=QObject)
+    def quickSheets(self) -> QObject | None:
+        """LibraryController::quickSheets: the Quick sheets document (core.create), made
+        in My files when there is none."""
+        from core.create import quick_sheets_id
+        name = tr("Document", "Quick sheets")
+        found = quick_sheets_id(self.library.tree, name)
+        if not found:
+            found = self.createDocument(ROOT_ID, name)
+        return self.library.entryForId(found) if found else None
 
     @Slot(str, str, result=str)
     @Slot(str, str, bool, result=str)
@@ -1316,13 +1394,46 @@ class LibraryController(QObject):
         from .scene import forget_history
         forget_history(document_id)
 
+    def _set_setting(self, document_id: str, what: str, field: str, value, change, unchanged: bool,
+                     drop_thumbnails: bool = False) -> None:
+        """A .content setting of a document, as the library's setters make it: nothing
+        when it already has that value; on a document made here and not uploaded yet,
+        in its files; otherwise shown at once and committed to the cloud (lastModified
+        stays: these setters do not call Entry::setLastModified)."""
+        node = self.library.tree.get(str(document_id))
+        if not isinstance(node, DocumentNode):
+            log.warning("%s: no document specified (%r)", what, document_id)
+            return
+        source = self.source()
+        if source is not None and source.change_created(node.id, lambda content, metadata: change(content)):
+            self.refresh()
+            return
+        if unchanged:
+            return
+        if source is not None:
+            source.show_fields(node.id, content={field: value})
+            self.refresh()
+        self.submit(what, lambda sync, _: sync.set_document_settings(node.id, change, drop_thumbnails), "")
+
     @Slot(str, int)
     def setOrientation(self, document_id: str, orientation: int) -> None:
-        self._unsupported("setOrientation")
+        """Qt.Horizontal: landscape; anything else portrait. The page thumbnails go when
+        it changes (the app deletes them to make them again)."""
+        from core.create import orientation_name, orientation_value, set_orientation
+        node = self.library.tree.get(str(document_id))
+        current = orientation_value(node.content.raw.get("orientation")) if isinstance(node, DocumentNode) else None
+        self._set_setting(document_id, "Setting orientation", "orientation", orientation_name(orientation),
+                          lambda content: set_orientation(content, int(orientation)),
+                          current == orientation_value(orientation_name(orientation)), drop_thumbnails=True)
 
     @Slot(str, int)
     def setCoverPageNumber(self, document_id: str, page: int) -> None:
-        self._unsupported("setCoverPageNumber")
+        """-1: the cover is the last page visited; 0: the first page."""
+        from core.create import set_cover_page
+        node = self.library.tree.get(str(document_id))
+        current = node.content.cover_page_number if isinstance(node, DocumentNode) else None
+        self._set_setting(document_id, "Setting cover page number", "coverPageNumber", int(page),
+                          lambda content: set_cover_page(content, int(page)), current == int(page))
 
     @Slot(str, str)
     def unlockWithPassword(self, document_id: str, password: str) -> None:
@@ -1359,7 +1470,24 @@ class LibraryController(QObject):
 
     @Slot(str)
     def clearIsNew(self, entry_id: str) -> None:
-        pass
+        """Selecting an entry clears its "new" flag (the dot of a document the tablet
+        marked new). Only an entry that is new changes; lastModified stays (Entry::setNew
+        does not touch it)."""
+        node = self.library.tree.get(str(entry_id))
+        if node is None:
+            log.warning("clearIsNew: no entry specified (%r)", entry_id)
+            return
+        if node.metadata.raw.get("new") is not True:
+            return
+        source = self.source()
+        if source is not None and source.change_created(
+                node.id, lambda content, metadata: metadata.update(new=False) is None):
+            self.refresh()
+            return
+        if source is not None:
+            source.show_fields(node.id, metadata={"new": False})
+            self.refresh()
+        self.submit("Clearing new", lambda sync, _: sync.clear_new([node.id]), "")
 
     @Slot(str, "QStringList", "QStringList")
     def setEntryTags(self, entry_id: str, tags: list, keep_tags: list) -> None:

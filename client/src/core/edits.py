@@ -633,6 +633,28 @@ class PageDelete(_PageEdit):
         return cls.new(raw["doc_id"], raw["pages"], raw["created_ms"], raw["blank_id"])
 
 
+@dataclass(frozen=True)
+class PageTemplate(_PageEdit):
+    """A page's template set (DocumentController.setTemplateForPage): the page map is
+    compared with the pages' templates after the task (0x14065aff0) and only a template
+    that differs is written, as a register write; lastModified then moves."""
+
+    doc_id: str
+    page: str
+    template: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, page: str, template: str, created_ms: int) -> "PageTemplate":
+        if not page or not template:
+            raise EditError("a template needs a page and a template name")
+        return cls(str(doc_id), str(page), str(template), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "PageTemplate":
+        return cls.new(raw["doc_id"], raw["page"], raw["template"], raw["created_ms"])
+
+
 # A character of a page's text, named so that it can be found again whatever ids the
 # page gives the edits when they are made again: ("page", author, counter), one the page
 # had, or ("edit", uid, offset), the offset-th UTF-16 unit typed by the TextEdit `uid`.
@@ -734,15 +756,16 @@ def _stored(value) -> tuple | None:
     return stored
 
 
-PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete)
+PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete, PageTemplate)
 DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
 
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
-        | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | StrokePaste | ItemsTransform
+        | PageTemplate | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | StrokePaste | ItemsTransform
         | ToolSettings)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
-                          "page-move": PageMove, "page-delete": PageDelete, "text": TextEdit,
+                          "page-move": PageMove, "page-delete": PageDelete, "page-template": PageTemplate,
+                          "text": TextEdit,
                           "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete,
                           "stroke-restore": StrokeRestore, "stroke-paste": StrokePaste,
                           "items-transform": ItemsTransform, "tool-settings": ToolSettings}
@@ -1417,9 +1440,11 @@ class Staged:
                     pagemap = PageMap(current_content(doc, read, author), author)
                 except (ValueError, PageMapError) as err:
                     raise EditError(f"the page list cannot be changed: {err}") from err
-            self.page_list_edits.append(edit)
-            self._apply(pagemap, edit)
-        if pagemap is not None:
+            # A template the page has already changes nothing (the app compares the page
+            # map before writing, 0x14065aff0): no page map write, no lastModified.
+            if self._apply(pagemap, edit) is not False:
+                self.page_list_edits.append(edit)
+        if pagemap is not None and self.page_list_edits:
             self.content = pagemap.save()
             live = pagemap.ids()
         self.ids: list[str] = live
@@ -1433,7 +1458,7 @@ class Staged:
         at = pagemap.index(after)
         return at + 1 if at >= 0 else min(max(index, 0), len(pagemap.live))
 
-    def _apply(self, pagemap: PageMap, edit: Edit) -> None:
+    def _apply(self, pagemap: PageMap, edit: Edit) -> bool | None:
         """Make a page edit on the page list. One the list has already (uploaded without
         it being noticed), or whose pages are gone, changes nothing."""
         try:
@@ -1463,6 +1488,8 @@ class Staged:
                 if not pagemap.live and not pagemap.known(edit.blank_id):
                     pagemap.insert(0, edit.blank_id, DEFAULT_TEMPLATE)
                     self.origin[edit.blank_id] = ("new",)
+            elif isinstance(edit, PageTemplate):
+                return pagemap.set_template(edit.page, edit.template)
         except PageMapError as err:
             raise EditError(f"the page list cannot be changed: {err}") from err
 

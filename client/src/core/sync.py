@@ -65,7 +65,7 @@ from viewer import rm_select, rm_stroke
 from viewer.rm_parser import Color, Tool
 
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, ItemsTransform, PageAdd,
-                    PageCopy, PageDelete, PageMove, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
+                    PageCopy, PageDelete, PageMove, PageTemplate, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
                     TextEdit, ToolSettings,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
@@ -430,6 +430,8 @@ def describe_edit(e) -> str:
         return f"  move pages {', '.join(e.pages)}\n    to {e.index}, after page {e.after or '(front)'}"
     if isinstance(e, PageDelete):
         return (f"  delete pages {', '.join(e.pages)}\n    (if no page is left: new \"Blank\" page {e.blank_id})")
+    if isinstance(e, PageTemplate):
+        return f"  template of page {e.page}: {e.template!r} (written only if the page has another)"
     if isinstance(e, (StrokeAdd, StrokeErase)):
         points = rm_stroke.unpack_points(bytes.fromhex(e.points))
         xs, ys = [p.x for p in points], [p.y for p in points]
@@ -1146,6 +1148,54 @@ class SyncClient:
             return [change]
         self._commit(f"create folder {name!r}", edit)
         return folder_id
+
+    def create_document(self, doc_id: str, files: dict[str, bytes], parent: str = ROOT_ID,
+                        progress: Callable[[int, int], None] | None = None) -> str:
+        """Upload a document made here (core.create: a new notebook, Quick sheets, a
+        notebook of moved pages) with its files, committed directly as imports are. A
+        document already in the cloud under that id is left alone (a retried commit)."""
+        files = dict(files)
+        entries = {n: file_entry(n, d) for n, d in files.items()}
+        change = ItemChange(doc_id, entries, {entries[n].hash: d for n, d in files.items()})
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            if doc_id in tree:
+                return []
+            self._check_folder(tree, parent)
+            return [change]
+        self._commit(f"create document {doc_id}", edit, progress)
+        return doc_id
+
+    def set_document_settings(self, doc_id: str, change: Callable[[dict], bool],
+                              drop_thumbnails: bool = False) -> DocumentTree:
+        """Change a document's .content with `change(content)` (False: nothing to change),
+        as the library's setOrientation and setCoverPageNumber do: lastModified stays
+        (neither calls Entry::setLastModified). `drop_thumbnails` also takes the page
+        thumbnails out of the document, as setOrientation deletes its thumbnail folder."""
+        from .create import thumbnail_files
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            node = tree.get(doc_id)
+            if not isinstance(node, Document):
+                raise SyncError("the document is no longer in the library")
+            files = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
+            name = f"{node.id}.content"
+            if name not in files:
+                raise SyncError("the document has no .content")
+            content = json.loads(self.get_blob(files[name].hash, name))
+            if not change(content):
+                return []
+            blob = json_bytes(content)
+            files[name] = entry = file_entry(name, blob)
+            if drop_thumbnails:
+                for thumb in thumbnail_files(node.id, files):
+                    del files[thumb]
+            return [ItemChange(node.id, files, {entry.hash: blob})]
+        return self._commit(f"settings of {doc_id}", edit)
+
+    def clear_new(self, item_ids: Iterable[str]) -> DocumentTree:
+        """LibraryController::clearIsNew: "new" false, lastModified left as it is."""
+        return self._update("clear new", item_ids, touch=False, new=False)
 
     def _content_change(self, node: Node, change: Callable[[dict, int], bool]) -> ItemChange | None:
         """`node` with its .content changed by `change(content, now_ms)` (False: nothing to

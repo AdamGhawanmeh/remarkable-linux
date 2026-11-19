@@ -331,6 +331,18 @@ class PageMap:
         self.live.sort(key=self._order)
         return True
 
+    def set_template(self, page_id: str, template: str) -> bool:
+        """Give the live page `page_id` the template `template`, as the app does after a
+        setTemplateForPage task: the page map is compared with the pages' templates
+        (0x14065aff0 -> 0x140874970) and only a template that differs is written, as a
+        register write (author, counter + 1). An empty name changes nothing. Whether
+        anything was written."""
+        at = self.index(page_id)
+        if at < 0 or not template or _value(self.live[at], "template", "") == template:
+            return False
+        _set(self.live[at], "template", str(template), self.author)
+        return True
+
     def delete(self, index: int) -> str:
         """Delete the live page at `index` (deletePage, 0x1408704d0): it stays listed,
         marked deleted. Returns its id."""

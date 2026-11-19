@@ -164,9 +164,15 @@ class QuickApp:
 
     def _update_editing(self) -> None:
         """The app's editing interface (UserInfo.featureToggles.clientEdit) is on while
-        every document shown is one the library lets this client edit."""
+        every document shown is one the library lets this client edit. In the library
+        (no document shown) it is on when editing is turned on at all: it is what lets
+        the library make new notebooks and Quick sheets (Ctrl+N, Ctrl+O)."""
         shown = self.library.open_documents()
-        self.singletons.user_info.set_client_edit(bool(shown) and all(self.source.can_edit(d) for d in shown))
+        if shown:
+            on = all(self.source.can_edit(d) for d in shown)
+        else:
+            on = bool(getattr(self.source, "editable", ()))
+        self.singletons.user_info.set_client_edit(on)
 
     @property
     def logged_in(self) -> bool:
@@ -269,6 +275,9 @@ class QuickApp:
         controller.source = lambda: self.source
         controller.refresh = lambda: self.set_tree(self.source.sync.tree)
         controller.notify = self.library.errorMessage.emit
+        library_controller = self.singletons.controller
+        library_controller.source = lambda: self.source
+        library_controller.refresh = lambda: self.set_tree(self.source.sync.tree)
         set_clipboard(self.singletons.clipboard)
         self.translator = QTranslator()
         self._translate(self.singletons.language.languageCode)

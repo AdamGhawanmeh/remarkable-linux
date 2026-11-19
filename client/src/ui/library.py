@@ -24,9 +24,10 @@ from typing import Callable
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
 from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
-                        PageAdd, PageCopy, PageDelete, PageHistory, PageMove, Staged, StrokeAdd, StrokeChange,
-                        StrokeDelete, StrokeErase, StrokePart, StrokePaste, ToolSettings, document_files, swapped)
-from core.sync import SyncClient, SyncError, sha256_hex
+                        PageAdd, PageCopy, PageDelete, PageHistory, PageMove, PageTemplate, Staged, StrokeAdd, StrokeChange,
+                        StrokeDelete, StrokeErase, StrokePart, StrokePaste, ToolSettings, document_files, page_images,
+                        swapped)
+from core.sync import SyncClient, SyncError, build_index, file_entry, sha256_hex
 from core.config import atomic_write_json, read_json
 from viewer import rm_select, rm_stroke, rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
@@ -403,6 +404,13 @@ class LibrarySource:
         # Documents worked out with their pending edits, by id: (key, Staged).
         self._staged: dict[str, tuple[tuple, Staged]] = {}
         self._history_lock = threading.RLock()
+        # Documents made here (createDocument, Quick sheets) until the cloud has them, by
+        # id: their node, files and folder, and whether their upload has started.
+        self._created: dict[str, dict] = {}
+        # Changes of .content/.metadata fields sent to the cloud and shown before the
+        # cloud's copy has them, by document id: (hash of the copy they apply to,
+        # content fields, metadata fields). Dropped once that copy is replaced.
+        self._shown: dict[str, tuple[str, dict, dict]] = {}
 
     @property
     def writable(self) -> bool:
@@ -425,7 +433,172 @@ class LibrarySource:
             self._scenes.clear()
 
     def blob(self, doc: Document, name: str) -> bytes:
+        created = self._created.get(doc.id)
+        if created is not None and name in created["files"]:
+            return created["files"][name]
         return self.sync.get_blob(doc.files[name], name, cached_only=self.cached_only)
+
+    # -- documents made here (core.create) ------------------------------------------
+
+    def synced(self, doc_id: str) -> Node | None:
+        """The item as last synced, or a document made here that the cloud does not have
+        yet (it is shown, opened and edited at once, as the app's are)."""
+        node = self.sync.tree.get(doc_id)
+        if node is not None:
+            return node
+        created = self._created.get(doc_id)
+        return created["node"] if created is not None else None
+
+    def created(self, doc_id: str) -> Document | None:
+        """A document made here and not in the cloud yet, or None."""
+        created = self._created.get(doc_id)
+        return created["node"] if created is not None and doc_id not in self.sync.tree else None
+
+    def _created_node(self, doc_id: str, files: dict[str, bytes]) -> Document:
+        from core.models import Metadata, make_node
+        schema = self.sync.root.schema_version if self.sync.root is not None else 3
+        entries = [file_entry(n, d) for n, d in files.items()]
+        doc_hash, _ = build_index(schema, entries, doc_id)
+        for entry in entries:
+            self.sync.blobs.put(entry.hash, files[entry.id])
+        node = make_node(doc_id, Metadata.parse(files[f"{doc_id}.metadata"]),
+                         Content.parse(files[f"{doc_id}.content"]), hash=doc_hash,
+                         files={e.id: e.hash for e in entries})
+        return node
+
+    def creation_refusal(self, parent: str) -> str:
+        """Why a document cannot be made here now ("": it can): createDocument's own
+        checks (free disk space, the folder), and this client's: editing turned on, and
+        online, since the cloud is where the document is kept."""
+        from core.create import MIN_FREE_BYTES
+        import shutil
+        if not self.editable:
+            return "Editing is not turned on"
+        if not self.writable:
+            return "Not possible offline"
+        try:
+            if shutil.disk_usage(self.sync.root_dir).free <= MIN_FREE_BYTES:
+                return "Not enough free disk space"
+        except OSError:
+            pass
+        tree = self.sync.tree
+        folder = tree.get(parent) if parent else None
+        if parent and parent != ROOT_ID and (folder is None or not folder.is_folder or tree.is_trashed(parent)):
+            return "The folder is no longer in the library"
+        return ""
+
+    def _add_created(self, doc_id: str, files: dict[str, bytes], parent: str) -> Document:
+        if self.synced(doc_id) is not None:
+            raise EditError(f"refusing to create document with id {doc_id} that already exists")
+        node = self._created_node(doc_id, files)
+        with self._lock:
+            self._created[doc_id] = {"node": node, "files": dict(files), "parent": parent, "uploading": False}
+            self._copies = self._read_copies() | {doc_id}
+            atomic_write_json(self._copies_file, {"version": 1, "ids": sorted(self._copies)})
+        log.info("made document %s here; it may be edited", doc_id)
+        return node
+
+    def create_notebook(self, name: str, parent: str, now_ms: int, doc_id: str | None = None,
+                        page_id: str | None = None) -> Document:
+        """A new notebook (LibraryController::createDocument, core.create), shown at once
+        and uploaded by upload_created. EditError when it cannot be made."""
+        from core.create import given_uuid, notebook_content, notebook_files, notebook_metadata
+        refusal = self.creation_refusal(parent)
+        if refusal:
+            raise EditError(refusal)
+        doc_id = given_uuid(doc_id) or str(uuid.uuid4())
+        page_id = given_uuid(page_id) or str(uuid.uuid4())
+        content = notebook_content(self.sync.author(), page_id)
+        metadata = notebook_metadata(name, parent or ROOT_ID, now_ms)
+        return self._add_created(doc_id, notebook_files(doc_id, content, metadata), parent or ROOT_ID)
+
+    def create_from_pages(self, name: str, parent: str, source: Document, indices, now_ms: int,
+                          doc_id: str | None = None) -> tuple[Document, PageDelete]:
+        """A new notebook made of pages moved out of `source` (createDocumentFromExisting):
+        each page with its edits, files and template becomes a page of the new notebook
+        (new page ids), and the pages are deleted from `source` as a pending page edit.
+        Note pages only: a page showing a PDF page cannot leave its PDF."""
+        from core.create import notebook_files, notebook_from_pages, notebook_metadata
+        from core.edits import page_files
+        refusal = self.creation_refusal(parent)
+        if refusal:
+            raise EditError(refusal)
+        source = self._editable(source)
+        staged = self.staged(source)
+        pages = self._pages_at(staged.ids, indices)
+        content = staged.content if staged.changes_page_list else None
+        if content is None:
+            from core.edits import current_content
+            content = current_content(source, lambda n: self.blob(source, n), self.sync.author())
+        from core.pagemap import PageMap
+        infos = [PageMap(content, self.sync.author()).info(p) for p in pages]
+        if any(i is None for i in infos):
+            raise EditError("a page to move is not in the document")
+        if any(i.redirect is not None for i in infos):
+            raise EditError("Pages of a PDF or ebook cannot be moved into a notebook")
+        doc_id = str(uuid.uuid4()) if doc_id is None else doc_id
+        moved = [(p, str(uuid.uuid4()), i.template) for p, i in zip(pages, infos)]
+        files = notebook_files(doc_id, notebook_from_pages(self.sync.author(), [(n, t) for _, n, t in moved]),
+                               notebook_metadata(name, parent or ROOT_ID, now_ms, opened=False))
+        for old, new, _ in moved:
+            page = staged.page(old)
+            if page is not None:
+                files[f"{doc_id}/{new}.rm"] = page
+            for file_name in sorted(set(page_images(page).values())):
+                found = staged.image_source(old, file_name)
+                if found is not None:
+                    files[f"{doc_id}/{new}/{file_name}"] = (self.blob(source, found[1]) if found[0] == "doc"
+                                                           else self.sync.edits.data(found[1]))
+            if old in staged.origin:                     # added or copied here: its source's files
+                extra = staged.copied_files(old)
+            else:
+                extra = [(n, n) for n in page_files(source, old)
+                         if not n.endswith(".rm") and not n.startswith(f"{source.id}/{old}/")]
+            for from_name, as_name in extra:             # -metadata.json, highlights, thumbnail
+                files[doc_id + as_name[len(source.id):].replace(old, new)] = self.blob(source, from_name)
+        delete = PageDelete.new(source.id, pages, now_ms)
+        node = self._add_created(doc_id, files, parent or ROOT_ID)
+        self._add_edit(source, delete)
+        return node, delete
+
+    def change_created(self, doc_id: str, change: Callable[[dict, dict], bool]) -> bool:
+        """Change a document made here before its upload has started: `change(content,
+        metadata)` on its .content and .metadata (False: nothing changed). False when it
+        is not such a document (it is changed in the cloud then)."""
+        from core.create import notebook_files
+        with self._lock:
+            created = self._created.get(doc_id)
+            if created is None or created["uploading"] or doc_id in self.sync.tree:
+                return False
+            files = created["files"]
+            content = json.loads(files[f"{doc_id}.content"])
+            metadata = json.loads(files[f"{doc_id}.metadata"])
+        if change(content, metadata):
+            files = {**files, **notebook_files(doc_id, content, metadata)}
+            node = self._created_node(doc_id, files)
+            with self._lock:
+                created.update(files=files, node=node)
+                self._staged.pop(doc_id, None)
+                self._scenes.clear()
+        return True
+
+    def upload_created(self, doc_id: str) -> tuple[dict[str, bytes], str] | None:
+        """The files and folder of a document made here, now being uploaded (no more
+        local changes to it); None when there is nothing to upload."""
+        with self._lock:
+            created = self._created.get(doc_id)
+            if created is None or created["uploading"]:
+                return None
+            created["uploading"] = True
+            return dict(created["files"]), created["parent"]
+
+    def created_failed(self, doc_id: str) -> None:
+        """Its upload failed: the document goes, with the edits made to it here."""
+        with self._lock:
+            created = self._created.pop(doc_id, None)
+            self._staged.pop(doc_id, None)
+        if created is not None and doc_id not in self.sync.tree:
+            self.sync.edits.discard(self.sync.edits.of(doc_id))
 
     # -- editing ------------------------------------------------------------------
 
@@ -441,7 +614,7 @@ class LibrarySource:
         """A copy of document `source_id` was made (LibraryController.cloneEntry): when
         the source may be edited here, so may the copy, from now on (kept with the
         cache). Whether it may."""
-        source = self.sync.tree.get(source_id)
+        source = self.synced(source_id)
         if not self.can_edit(source) or not copy_id:
             return False
         with self._lock:
@@ -460,8 +633,10 @@ class LibrarySource:
         if not self.editable:
             return "Editing is not turned on"
         tree = self.sync.tree
-        if not isinstance(doc, Document) or tree.get(doc.id) is None:
+        if not isinstance(doc, Document) or self.synced(doc.id) is None:
             return "This document is not in the library"
+        if doc.id in self._created:                     # made here, not uploaded yet: a notebook
+            return ""
         if doc.id not in self._copies:
             if doc.name not in self.editable:
                 return f"Editing is only turned on for the document named {' or '.join(map(repr, self.editable))}"
@@ -486,7 +661,7 @@ class LibrarySource:
 
     def staged(self, doc: Document) -> Staged:
         """The document as last synced with its pending edits (core.edits.Staged)."""
-        synced = self.sync.tree.get(doc.id)
+        synced = self.synced(doc.id)
         base = synced if isinstance(synced, Document) else doc
         edits = self.sync.edits.of(doc.id)
         key = (base.hash, tuple(edits))
@@ -500,7 +675,41 @@ class LibrarySource:
             self._staged[doc.id] = (key, staged)
         return staged
 
+    def show_fields(self, doc_id: str, content: dict | None = None, metadata: dict | None = None) -> None:
+        """Show these .content / .metadata fields of an item at once, while the change
+        that sets them is on its way to the cloud (the app shows its own changes before
+        they are uploaded)."""
+        node = self.sync.tree.get(doc_id)
+        if node is None:
+            return
+        with self._lock:
+            old = self._shown.get(doc_id)
+            fields = (dict(old[1]), dict(old[2])) if old is not None and old[0] == node.hash else ({}, {})
+            fields[0].update(content or {})
+            fields[1].update(metadata or {})
+            self._shown[doc_id] = (node.hash, fields[0], fields[1])
+
+    def _with_shown(self, doc: Node, synced: Node | None) -> Node:
+        shown = self._shown.get(doc.id)
+        if shown is None:
+            return doc
+        if synced is None or synced.hash != shown[0]:
+            with self._lock:
+                if self._shown.get(doc.id) is shown:
+                    del self._shown[doc.id]             # the cloud's copy changed: it is what counts
+            return doc
+        from core.models import Metadata
+        metadata = Metadata.parse({**doc.metadata.raw, **shown[2]})
+        marked = hashlib.sha256(f"{doc.hash}:{json.dumps([shown[1], shown[2]], sort_keys=True)}".encode()).hexdigest()
+        if isinstance(doc, Document):
+            return Document(id=doc.id, metadata=metadata, hash=marked, files=dict(doc.files),
+                            content=Content.parse({**(doc.content.raw if doc.content else {}), **shown[1]}))
+        return Folder(id=doc.id, metadata=metadata, hash=marked, files=dict(doc.files), content=doc.content)
+
     def view(self, doc: Node) -> Node:
+        return self._with_shown(self._view(doc), self.sync.tree.get(doc.id))
+
+    def _view(self, doc: Node) -> Node:
         """`doc` as the app shows it: with the page list its pending page edits make
         (added, copied, moved and deleted pages). Its hash is made from the synced one
         and the edits, so that views and thumbnails of the old page list are not reused;
@@ -522,11 +731,17 @@ class LibrarySource:
                         content=Content.parse(staged.content))
 
     def view_tree(self, tree: DocumentTree) -> DocumentTree:
-        """`tree` with each document that has pending page edits as view() shows it."""
-        documents = set(self.sync.edits.documents())
-        if not documents & set(tree.nodes):
+        """`tree` with each document that has pending page edits as view() shows it, and
+        the documents made here that the cloud does not have yet."""
+        with self._lock:
+            for doc_id in [i for i in self._created if i in self.sync.tree]:
+                del self._created[doc_id]           # uploaded: the cloud's copy from now on
+            made = [c["node"] for i, c in self._created.items() if i not in tree]
+        documents = set(self.sync.edits.documents()) | set(self._shown)
+        if not documents & (set(tree.nodes) | {n.id for n in made}) and not made:
             return tree
-        return DocumentTree([self.view(node) if node.id in documents else node for node in tree.nodes.values()])
+        nodes = list(tree.nodes.values()) + made
+        return DocumentTree([self.view(node) if node.id in documents else node for node in nodes])
 
     # -- pages: add, duplicate, move, delete (the app's DocumentController) --
 
@@ -548,6 +763,44 @@ class LibrarySource:
         if not wanted or wanted[0] < 0 or wanted[-1] >= len(ids):
             raise EditError(f"no such pages: {sorted(wanted)} of {len(ids)}")
         return [ids[i] for i in wanted]
+
+    def page_template(self, doc: Document, index: int) -> tuple[str, str]:
+        """(page id, its template as shown here: "" when it has none) of the page at
+        `index`; EditError when there is no such page."""
+        from core.edits import current_content
+        from core.pagemap import PageMap
+        staged = self.staged(self.synced(doc.id) or doc)
+        if not 0 <= int(index) < len(staged.ids):
+            raise EditError(f"no page {index} of {len(staged.ids)}")
+        page_id = staged.ids[int(index)]
+        base = self.synced(doc.id) or doc
+        content = staged.content if staged.changes_page_list else current_content(
+            base, lambda n: self.blob(base, n), self.sync.author())
+        info = PageMap(json.loads(json.dumps(content)), self.sync.author()).info(page_id)
+        return page_id, info.template if info is not None else ""
+
+    def set_page_template(self, doc: Document, index: int, template: str, now_ms: int) -> bool:
+        """DocumentController::setTemplateForPage: the page at `index` gets `template` when
+        it has another (an empty name changes nothing), and lastModified moves. On a
+        document made here and not uploaded yet it is written into its .content at once;
+        otherwise it is a pending page edit (PageTemplate). Whether anything changed."""
+        from core.create import set_page_template
+        if not template:
+            return False
+        doc = self._editable(doc)
+        page_id, current = self.page_template(doc, index)
+        if current == template:
+            return False
+
+        def change(content: dict, metadata: dict) -> bool:
+            if not set_page_template(content, page_id, template, self.sync.author()):
+                return False
+            metadata["lastModified"] = str(max(int(metadata.get("lastModified") or 0), int(now_ms)))
+            return True
+        if self.change_created(doc.id, change):
+            return True
+        self._add_edit(doc, PageTemplate.new(doc.id, page_id, template, now_ms))
+        return True
 
     def add_page(self, doc: Document, index: int, template: str, now_ms: int, page_uuid: str = "") -> PageAdd:
         """Add an empty page at `index` (past the end or negative: at the end, as
@@ -618,7 +871,7 @@ class LibrarySource:
         ("<doc>/<page>/<file name>"), or put on the page here and not uploaded yet: what
         the app's paste loads to store a copy (0x1409a8240). EditError when it cannot be
         had (the document is gone, or the file is not cached offline)."""
-        doc = self.sync.tree.get(doc_id)
+        doc = self.synced(doc_id)
         name = f"{doc_id}/{page_id}/{file_name}"
         if isinstance(doc, Document) and name in doc.files:
             try:
@@ -659,7 +912,7 @@ class LibrarySource:
     # -- undo and redo --
 
     def _seen(self, doc_id: str, page_id: str):
-        synced = self.sync.tree.get(doc_id)
+        synced = self.synced(doc_id)
         files = synced.files if isinstance(synced, Document) else {}
         return files.get(f"{doc_id}/{page_id}.rm"), tuple(e for e in self.sync.edits.of(doc_id) if e.page_id == page_id)
 
@@ -836,7 +1089,7 @@ class LibrarySource:
     def item_values(self, doc: Document, page_id: str, items) -> dict:
         """The values (rm_stroke.LineValue, rm_writer.ImageValue) of live items of a page
         as shown here, by id: what copying clones."""
-        _, live = self._items(self.sync.tree.get(doc.id) or doc, page_id)
+        _, live = self._items(self.synced(doc.id) or doc, page_id)
         return {tuple(i): (live[tuple(i)].line if live[tuple(i)].is_line else live[tuple(i)].image)
                 for i in items if tuple(i) in live}
 
@@ -928,7 +1181,7 @@ class LibrarySource:
     def tool_settings(self, doc: Document) -> dict[str, str]:
         """The pen settings of a document (its .content "extraMetadata", with the
         pending ToolSettings over it): {} when it has none or they cannot be read."""
-        synced = self.sync.tree.get(doc.id)
+        synced = self.synced(doc.id)
         extra: dict = {}
         if isinstance(synced, Document) and f"{doc.id}.content" in synced.files:
             try:
@@ -973,7 +1226,7 @@ class LibrarySource:
         refusal = self.edit_refusal(doc)
         if refusal:
             raise EditError(refusal)
-        doc = self.sync.tree.get(doc.id)                # the document as last synced
+        doc = self.synced(doc.id)                # the document as last synced
         if page_id is not None and page_id not in self.staged(doc).ids:
             raise EditError("this page is not in the document's page list")
         return doc
