@@ -53,7 +53,7 @@ from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
 from core.edits import EditError
 from core.models import FileType
-from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH
+from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, Layer
 from viewer.rm_parser import ParagraphStyle as StyleType
 from viewer import rm_select as rsel
 from viewer import rm_text
@@ -886,7 +886,8 @@ SceneTileManager = qml_class("SceneTileManager", QObject, _TileManager,
 class _Controller:
     _DEFAULTS = {"defaultPortraitBounds": PORTRAIT, "paperPortraitBounds": PORTRAIT, "paperNoteBounds": PORTRAIT,
                  "boundingRect": PORTRAIT, "primaryContentRect": PORTRAIT,
-                 "explicitPaperSize": QSize(PAGE_WIDTH, PAGE_HEIGHT), "backgroundVisible": True}
+                 "explicitPaperSize": QSize(PAGE_WIDTH, PAGE_HEIGHT), "backgroundVisible": True,
+                 "isRootDocumentVisible": True, "layerCount": 0, "currentLayer": 0}
 
     def __init__(self, parent: QObject | None = None) -> None:
         QObject.__init__(self, parent)
@@ -900,7 +901,7 @@ class _Controller:
     def set_page(self, frame: QRectF, bounds: QRectF, layers: list, links: list[dict]) -> None:
         """The loaded page: its frame (paper), content bounds and links, in scene
         coordinates."""
-        self.layers = layers
+        self.layers = list(layers)
         self.links = links
         self._set("explicitPaperSize", QSize(round(frame.width()), round(frame.height())))
         self._set("primaryContentRect", frame)
@@ -908,16 +909,80 @@ class _Controller:
             # Unchanged, but the page was loaded again: DocumentViewport re-applies its
             # scroll bounds and LayersFoldout re-reads the layers on this signal.
             getattr(self, self._NOTIFY["boundingRect"]).emit()
+        if not self._set("layerCount", len(self.layers)):
+            self.layerStatesChanged.emit()
 
     @Slot(bool)
     def setBackgroundVisible(self, visible: bool) -> None:
         """Hide template / Show template (and the Layers foldout's Template or
-        Background row): the page is drawn again at once without, or with, its
-        template or PDF page. The tablet keeps this per page in the .rm (SceneInfo
-        field 2, a last-write-wins bool); here it lasts while the page is shown, from
-        the value the page has (see SceneView._on_loaded)."""
-        if self._set("backgroundVisible", bool(visible)) and self.view is not None:
-            self.view._render()
+        Background row): persisted to SceneInfo field 2 (undoable) on edit-enabled pages,
+        and live-toggled on read-only pages."""
+        if self.view is not None:
+            self.view.set_background_visible(bool(visible))
+        else:
+            self._set("backgroundVisible", bool(visible))
+
+    @Slot(bool)
+    def setRootDocumentVisible(self, visible: bool) -> None:
+        """Show/hide typed text (LayersFoldout's Text row): persisted to SceneInfo field 3
+        (undoable) on edit-enabled pages, and live-toggled on read-only pages."""
+        if self.view is not None:
+            self.view.set_root_document_visible(bool(visible))
+        else:
+            self._set("isRootDocumentVisible", bool(visible))
+
+    @Slot()
+    def clearRootDocument(self) -> None:
+        if self.view is not None:
+            self.view.clear_root_document()
+
+    @Slot(int)
+    def setCurrentLayer(self, index: int) -> None:
+        idx = int(index)
+        if self.view is not None:
+            self.view.set_current_layer(idx)
+        elif 0 <= idx < len(self.layers):
+            self._set("currentLayer", idx)
+
+    @Slot()
+    def addLayer(self) -> None:
+        if self.view is not None:
+            self.view.add_layer()
+
+    @Slot(int)
+    def deleteLayer(self, index: int) -> None:
+        if self.view is not None:
+            self.view.delete_layer(int(index))
+
+    @Slot(int, int)
+    def moveLayer(self, index: int, new_position: int) -> None:
+        if self.view is not None:
+            self.view.move_layer(int(index), int(new_position))
+
+    @Slot(int)
+    def mergeLayerDown(self, index: int) -> None:
+        if self.view is not None:
+            self.view.merge_layer_down(int(index))
+
+    @Slot(int, str)
+    def setLayerName(self, index: int, name: str) -> None:
+        if self.view is not None:
+            self.view.rename_layer(int(index), str(name))
+
+    @Slot(int, result=str)
+    def layerName(self, index: int) -> str:
+        idx = int(index)
+        return self.layers[idx].name if 0 <= idx < len(self.layers) else ""
+
+    @Slot(int, bool)
+    def setLayerVisible(self, index: int, visible: bool) -> None:
+        if self.view is not None:
+            self.view.set_layer_visible(int(index), bool(visible))
+
+    @Slot(int)
+    def clearLinesInLayer(self, index: int) -> None:
+        if self.view is not None:
+            self.view.clear_lines_in_layer(int(index))
 
     @Slot(QPointF, result="QVariantMap")
     def linkAt(self, pos: QPointF) -> dict:
@@ -1194,7 +1259,8 @@ class _Controller:
 
     @Slot(int, result=bool)
     def isLayerVisible(self, index: int) -> bool:
-        return 0 <= index < len(self.layers) and self.layers[index].visible
+        idx = int(index)
+        return self.layers[idx].visible if 0 <= idx < len(self.layers) else True
 
 
 SceneController = qml_class("SceneController", QObject, _Controller,
@@ -1355,23 +1421,37 @@ class _SceneView:
         self._shown_key = self._page_key(node, shown) if node is not None else self._loading_key
         if self._pen_loading:
             self._pen_rendering, self._pen_loading = self._pen_loading, 0
-        layers = content.scene.layers if content.scene is not None else []
+        layers = (list(content.scene.layers) if content.scene is not None and content.scene.layers
+                  else [Layer(name="Layer 1", visible=True, node_id=(0, 11))])
         # The page's own bounds first: set_page then tells DocumentViewport, whose
         # updateSceneBoundingRect widens them on note pages (a margin below the paper).
         # The other way round, a reload after an edit put the bare bounds back and the
         # view jumped.
         self._tiles._set("sceneBoundingRect", bounds)
-        self._controller.set_page(frame, bounds, layers, links)
-        if shown != getattr(self, "_background_page", None):
-            # A page newly shown starts with its template as the page has it (the
-            # tablet's Hide template, SceneInfo field 2); a reload after an edit keeps
-            # what was chosen here.
-            self._background_page = shown
-            self._controller._set("backgroundVisible",
-                                  content.scene.background_visible if content.scene is not None else True)
-        # The layer edits go to: Layer 1, the one the app uses until another is chosen.
+        # Active layer: SceneInfo field 1 when still live, else Layer 1 (0:11), else top.
         node_ids = [layer.node_id for layer in layers]
-        self._controller._set("currentLayer", node_ids.index((0, 11)) if (0, 11) in node_ids else max(len(layers) - 1, 0))
+        cur_node = content.scene.current_layer if content.scene is not None else None
+        if cur_node in node_ids:
+            cur_idx = node_ids.index(cur_node)
+        elif (0, 11) in node_ids:
+            cur_idx = node_ids.index((0, 11))
+        else:
+            cur_idx = max(len(layers) - 1, 0)
+        self._controller._set("currentLayer", cur_idx)
+        self._controller.set_page(frame, bounds, layers, links)
+        bg = content.scene.background_visible if content.scene is not None else True
+        rd = content.scene.root_document_visible if content.scene is not None else True
+        if self._editable() or shown != getattr(self, "_background_page", None):
+            # Edit-enabled pages persist backgroundVisible and isRootDocumentVisible in
+            # SceneInfo (0x0D fields 2 and 3), so reloads reflect the page's state (also
+            # after undo/redo). Read-only pages start from SceneInfo and keep live toggles.
+            self._background_page = shown
+            self._controller._set("backgroundVisible", bg)
+            self._controller._set("isRootDocumentVisible", rd)
+        if self.text_session is None:
+            text = content.scene.text if content.scene is not None else None
+            self._controller._set("hasRootDocument", text is not None)
+            self._controller._set("rootDocumentLength", rm_text.units(text.text) if text is not None else 0)
         self._update_viewport()
         self._set("defaultCenter", QPointF(0, frame.height() / 2))
         self._set("sceneExteriorBoundary", bounds)
@@ -1467,6 +1547,9 @@ class _SceneView:
             emit_from_worker(self, lambda: self._edited.emit((error, select)))
         self._pool.start(_Job(job))
 
+    def _active_layer(self) -> int:
+        return int(self._controller._get("currentLayer") or 0)
+
     def _insert_image(self, url: QUrl, pos: QPointF) -> None:
         """Put an image file on the page shown, centred on a scene position
         (insertImageFileAsSceneItem): prepared as the app stores one (ui/editing.py) and
@@ -1478,11 +1561,12 @@ class _SceneView:
             _notify("Only image files on this computer can be inserted")
             return
         source, node, page_id = target
-        path, x, y, now_ms = url.toLocalFile(), pos.x(), pos.y(), int(time.time() * 1000)
+        path, x, y, now_ms, layer = url.toLocalFile(), pos.x(), pos.y(), int(time.time() * 1000), self._active_layer()
 
         def insert():
             data, extension, vertices = prepare_image(path, x, y)
-            return bytes.fromhex(source.insert_image(node, page_id, data, extension, vertices, now_ms).key)
+            return bytes.fromhex(source.insert_image(node, page_id, data, extension, vertices, now_ms,
+                                                     layer_index=layer).key)
         self._run_insertion(page_id, insert)
 
     def paste_picture(self, picture: QImage, pos: QPointF) -> None:
@@ -1493,13 +1577,157 @@ class _SceneView:
         if target is None or picture.isNull():
             return
         source, node, page_id = target
-        x, y, now_ms = pos.x(), pos.y(), int(time.time() * 1000)
+        x, y, now_ms, layer = pos.x(), pos.y(), int(time.time() * 1000), self._active_layer()
 
         def insert():
             data, extension, size = editing.encode_image(picture)
             corners = editing.corners(x, y, *editing.placed_size(size.width(), size.height()))
-            return bytes.fromhex(source.insert_image(node, page_id, data, extension, corners, now_ms).key)
+            return bytes.fromhex(source.insert_image(node, page_id, data, extension, corners, now_ms,
+                                                     layer_index=layer).key)
         self._run_insertion(page_id, insert)
+
+    # -- layers & SceneInfo --
+    def _close_selection_for_layer_edit(self) -> None:
+        if self._sel is not None:
+            self._controller.selectionCleared.emit()
+            self._set_selection(None)
+
+    def _run_layer_edit(self, what: str, fn) -> None:
+        self._close_selection_for_layer_edit()
+        page_id = self._page_id
+
+        def job():
+            error = None
+            try:
+                fn()
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("%s on page %s", what, page_id)
+                error = f"Could not {what}: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._edited.emit((error, None)))
+        self._pool.start(_Job(job))
+
+    def add_layer(self) -> None:
+        target = self._insertion_target("Layers")
+        if target is None:
+            return
+        source, node, page_id = target
+        now_ms = _now_ms()
+        self._run_layer_edit("add layer", lambda: source.add_layer(node, page_id, now_ms))
+
+    def delete_layer(self, index: int) -> None:
+        target = self._insertion_target("Layers")
+        if target is None:
+            return
+        source, node, page_id = target
+        now_ms = _now_ms()
+        self._run_layer_edit("delete layer", lambda: source.delete_layer(node, page_id, index, now_ms))
+
+    def rename_layer(self, index: int, name: str) -> None:
+        target = self._insertion_target("Layers")
+        if target is None:
+            return
+        source, node, page_id = target
+        now_ms = _now_ms()
+        self._run_layer_edit("rename layer", lambda: source.rename_layer(node, page_id, index, name, now_ms))
+
+    def set_layer_visible(self, index: int, visible: bool) -> None:
+        if not 0 <= index < len(self._controller.layers):
+            return
+        if self._editable():
+            source, node, page_id = _source(), self._get("document").node, self._page_id
+            now_ms = _now_ms()
+            self._run_layer_edit("change layer visibility",
+                                 lambda: source.set_layer_visible(node, page_id, index, visible, now_ms))
+            return
+        # Read-only page: toggle visibility live in memory without writing.
+        layer = self._controller.layers[index]
+        if layer.visible != bool(visible):
+            layer.visible = bool(visible)
+            if self._content is not None and self._content.scene is not None and index < len(self._content.scene.layers):
+                self._content.scene.layers[index].visible = bool(visible)
+            self._controller.layerStatesChanged.emit()
+            self._render()
+
+    def move_layer(self, index: int, new_position: int) -> None:
+        target = self._insertion_target("Layers")
+        if target is None:
+            return
+        source, node, page_id = target
+        now_ms = _now_ms()
+        self._run_layer_edit("move layer", lambda: source.move_layer(node, page_id, index, new_position, now_ms))
+
+    def merge_layer_down(self, index: int) -> None:
+        target = self._insertion_target("Layers")
+        if target is None:
+            return
+        source, node, page_id = target
+        now_ms = _now_ms()
+        self._run_layer_edit("merge layer", lambda: source.merge_layer_down(node, page_id, index, now_ms))
+
+    def clear_lines_in_layer(self, index: int) -> None:
+        target = self._insertion_target("Layers")
+        if target is None:
+            return
+        source, node, page_id = target
+        now_ms = _now_ms()
+        self._run_layer_edit("clear layer", lambda: source.clear_lines_in_layer(node, page_id, index, now_ms))
+
+    def set_current_layer(self, index: int) -> None:
+        if not 0 <= index < len(self._controller.layers):
+            return
+        self._close_selection_for_layer_edit()
+        changed = self._controller._set("currentLayer", index)
+        if not changed:
+            return
+        if self._editable():
+            source, node, page_id = _source(), self._get("document").node, self._page_id
+            now_ms = _now_ms()
+            self._run_layer_edit("switch layer", lambda: source.set_current_layer(node, page_id, index, now_ms))
+
+    def set_background_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._editable():
+            source, node, page_id = _source(), self._get("document").node, self._page_id
+            now_ms = _now_ms()
+            if self._controller._set("backgroundVisible", visible):
+                self._render()
+            self._run_layer_edit("toggle template visibility",
+                                 lambda: source.set_background_visible(node, page_id, visible, now_ms))
+            return
+        if self._controller._set("backgroundVisible", visible):
+            self._render()
+
+    def set_root_document_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._editable():
+            source, node, page_id = _source(), self._get("document").node, self._page_id
+            now_ms = _now_ms()
+            if self._controller._set("isRootDocumentVisible", visible):
+                self._render()
+            self._run_layer_edit("toggle text visibility",
+                                 lambda: source.set_root_document_visible(node, page_id, visible, now_ms))
+            return
+        if self._controller._set("isRootDocumentVisible", visible):
+            self._render()
+
+    def clear_root_document(self) -> None:
+        if self.text_session is not None:
+            def clear(t: textedit.TextSession) -> None:
+                t.select_all()
+                t.backspace()
+            self.text_do(clear)
+            return
+        if self._text_target() is None or not self._controller._get("hasRootDocument"):
+            return
+        def clear(t: textedit.TextSession) -> None:
+            t.select_all()
+            t.backspace()
+        self._text_then.append(clear)
+        if not self._get("textModeEnabled"):
+            self._text_then.append(lambda t: QTimer.singleShot(0, self.stop_text))
+        self.start_text(StyleType.TITLE)
 
     def _on_edited(self, result) -> None:
         """An edit was made (or refused): draw the page again, with what it concerns
@@ -1746,7 +1974,7 @@ class _SceneView:
             with source.edit_action(node, page_id) as action:      # undone at once, as the app's add-items
                 strokes = [v for kind, v in placed if kind == "line"]
                 if strokes:
-                    ids = source.paste_strokes(node, page_id, strokes, now_ms, action)[1]
+                    ids = source.paste_strokes(node, page_id, strokes, now_ms, action, layer_index=layer)[1]
                 for kind, value in placed:
                     if kind == "image":
                         key = paste_one(*value, action)
@@ -1764,7 +1992,8 @@ class _SceneView:
                 log.warning("dropping pasted image item, failed to load source image ref")
                 return None
             data, extension, _ = editing.encode_image(picture)
-            edit = source.insert_image(node, page_id, data, extension, corners, now_ms, item["timestamps"], action)
+            edit = source.insert_image(node, page_id, data, extension, corners, now_ms, item["timestamps"], action,
+                                       layer_index=layer)
             return bytes.fromhex(edit.key)
         self._run_insertion(page_id, insert)
 
@@ -1835,14 +2064,16 @@ class _SceneView:
             self._set_selection(None)
         now_ms = _now_ms()
         scene = self._content.scene if self._content is not None else None
+        layer = self._active_layer()
 
         def job():
             error, changed = None, True
             try:
                 if kind == "erase":
-                    changed = source.erase_strokes(node, page_id, line, now_ms, anchor_offsets(scene)) is not None
+                    changed = source.erase_strokes(node, page_id, line, now_ms, anchor_offsets(scene),
+                                                   layer_index=layer) is not None
                 else:
-                    source.add_stroke(node, page_id, line, now_ms)
+                    source.add_stroke(node, page_id, line, now_ms, layer_index=layer)
             except (EditError, *EXPECTED_ERRORS) as err:
                 error = str(err)
             except Exception as err:      # a stroke never takes the page view down with it
@@ -1924,6 +2155,8 @@ class _SceneView:
     def checkbox_links(self) -> list[tuple[int, QRectF]]:
         """The checkboxes of the page as shown (with what is being typed): (text index
         of the paragraph, box in scene coordinates); laid out once per text shown."""
+        if not self._controller._get("isRootDocumentVisible"):
+            return []
         from viewer.renderer import checkbox_boxes, layout_text
         session = self.text_session
         lines = session.lines() if session is not None else None
@@ -2206,6 +2439,10 @@ class _SceneView:
         if self.text_session is not None:
             from dataclasses import replace
             content = replace(content, scene=self.text_session.shown_scene())
+        root_doc_visible = bool(self._controller._get("isRootDocumentVisible"))
+        if content.scene is not None and content.scene.root_document_visible != root_doc_visible:
+            from dataclasses import replace
+            content = replace(content, scene=replace(content.scene, root_document_visible=root_doc_visible))
         hidden = list(self._sel.items) if self._sel is not None else []
         if (hidden or self._hidden) and content.scene is not None:
             from dataclasses import replace
@@ -2348,24 +2585,37 @@ PagePickerModel = qml_class("PagePickerModel", QAbstractListModel, _PagePicker)
 
 
 class _Layers:
-    """The current page's layers (LayersFoldout's Repeater)."""
+    """The current page's layers (LayersFoldout's Repeater), roles as reMarkable.exe
+    SceneLayersModel::buildItems (0x14045bbc0)."""
 
     ROLES = (b"layerIndex", b"layerName", b"layerVisible", b"layerSelected", b"layerMoveUpEnabled",
              b"layerMoveDownEnabled", b"layerMergeEnabled", b"layerTrashEnabled")
 
     def __init__(self, parent: QObject | None = None) -> None:
         QAbstractListModel.__init__(self, parent)
+        self._watched_controller = None
 
     def _property_changed(self, name: str) -> None:
         if name == "controller":
+            old, self._watched_controller = self._watched_controller, None
+            if old is not None and shiboken6.isValid(old):
+                for sig_name in ("layerStatesChanged", "currentLayerChanged", old._NOTIFY["boundingRect"]):
+                    try:
+                        getattr(old, sig_name).disconnect(self._reset)
+                    except (RuntimeError, TypeError, AttributeError):
+                        pass
             controller = self._get("controller")
-            if controller is not None:
-                getattr(controller, controller._NOTIFY["boundingRect"]).connect(self._reset)
+            if controller is not None and shiboken6.isValid(controller):
+                for sig_name in ("layerStatesChanged", "currentLayerChanged", controller._NOTIFY["boundingRect"]):
+                    sig = getattr(controller, sig_name, None)
+                    if sig is not None:
+                        sig.connect(self._reset)
+                self._watched_controller = controller
             self._reset()
 
     def _layers(self) -> list:
         controller = self._get("controller")
-        return controller.layers if controller is not None else []
+        return controller.layers if controller is not None and shiboken6.isValid(controller) else []
 
     def _reset(self) -> None:
         self.beginResetModel()
@@ -2379,8 +2629,10 @@ class _Layers:
         layers = self._layers()
         if not index.isValid() or not 0 <= index.row() < len(layers):
             return None
-        layer, row = layers[index.row()], index.row()
-        values = (row, layer.name, layer.visible, row == len(layers) - 1, False, False, False, False)
+        layer, row, count = layers[index.row()], index.row(), len(layers)
+        controller = self._get("controller")
+        current = int(controller._get("currentLayer") or 0) if controller is not None else max(count - 1, 0)
+        values = (row, layer.name, layer.visible, row == current, row < count - 1, row > 0, row > 0, count > 1)
         offset = int(role) - Qt.ItemDataRole.UserRole.value
         return values[offset] if 0 <= offset < len(values) else None
 

@@ -572,7 +572,7 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
                 out.append(f'<polyline points="{coords}" stroke-width="{run.width:g}"{attr}/>')
             out.append("</g>")
         out.append("</g>")
-    if lines:
+    if lines and (include_hidden or scene.root_document_visible):
         out.append(f'<g id="text" fill="{TEXT_COLOR}">')
         for line in lines:
             if line.marker and line.marker_font:
@@ -676,6 +676,8 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     if layers == "darken":
         return drawn
 
+    if not (include_hidden or scene.root_document_visible):
+        return drawn
     painter.setPen(QColor(TEXT_COLOR))
     for line in lines:
         drawn += 1

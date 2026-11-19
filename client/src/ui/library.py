@@ -24,12 +24,14 @@ from typing import Callable
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
 from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
-                        PageAdd, PageCopy, PageDelete, PageHistory, PageMove, PageTemplate, Staged, StrokeAdd, StrokeChange,
-                        StrokeDelete, StrokeErase, StrokePart, StrokePaste, ToolSettings, document_files, page_images,
-                        swapped)
+                        LayerAdd, LayerAttachChange, LayerDelete, LayerMergeChange, LayerMergeDown, LayerMove,
+                        LayerMoveChange, LayerRename, LayerRenameChange, LayerVisibility, LayerVisibilityChange,
+                        PageAdd, PageCopy, PageDelete, PageHistory, PageMove, PageTemplate, SceneFlagChange, SceneFlags,
+                        Staged, StrokeAdd, StrokeChange, StrokeDelete, StrokeErase, StrokePart, StrokePaste,
+                        ToolSettings, document_files, page_images, swapped)
 from core.sync import SyncClient, SyncError, build_index, file_entry, sha256_hex
 from core.config import atomic_write_json, read_json
-from viewer import rm_select, rm_stroke, rm_writer
+from viewer import rm_layer, rm_select, rm_stroke, rm_writer
 from viewer.rm_parser import PageScene, RmParseError, parse
 from viewer.templates import parse_pagedata
 
@@ -851,16 +853,31 @@ class LibrarySource:
         self._add_edit(doc, edit)
         return edit
 
+    def _layer_ref(self, doc: Document, page_id: str, layer_index: int | None):
+        """(ItemRef, (author, counter)) of live layer `layer_index` on `page_id`, or
+        (None, None) when `layer_index` is None (meaning the page's current layer)."""
+        if layer_index is None:
+            return None, None
+        done = self.staged(doc).replay(page_id)
+        infos = rm_layer.layers_info(done.page)
+        idx = int(layer_index)
+        if not 0 <= idx < len(infos):
+            raise EditError(f"no layer {idx} of {len(infos)}")
+        node_id = infos[idx].node_id
+        return done.ref(node_id), node_id
+
     def insert_image(self, doc: Document, page_id: str, data: bytes, extension: str, vertices,
-                     now_ms: int, timestamps=None, action: list[Change] | None = None) -> ImageInsert:
+                     now_ms: int, timestamps=None, action: list[Change] | None = None,
+                     layer_index: int | None = None) -> ImageInsert:
         """Put an image (`data`: a PNG or JPEG file as the app stores one, see
         ui.editing.encode_image) on a page, here only: the edit is kept with the cache
         and drawn over the page until SyncClient.push_edits uploads it. EditError when
         `doc` may not be edited, or the page cannot take the image safely. It can be
         undone: on its own, or as part of `action` (see edit_action)."""
         doc = self._editable(doc, page_id)
+        layer_ref, _ = self._layer_ref(doc, page_id, layer_index)
         edit = ImageInsert.new(doc.id, page_id, extension, vertices, sha256_hex(data), len(data), now_ms,
-                               timestamps)
+                               timestamps, layer=layer_ref)
         with self.edit_action(doc, page_id, action) as changes:
             self._add_edit(doc, edit, data)
             changes.append(Change(edit.key, None, ("edit", edit.uid)))
@@ -1005,7 +1022,8 @@ class LibrarySource:
                 history.push(step)
             history.seen = self._seen(doc.id, page_id)
 
-    def add_stroke(self, doc: Document, page_id: str, line, now_ms: int) -> StrokeAdd:
+    def add_stroke(self, doc: Document, page_id: str, line, now_ms: int,
+                   layer_index: int | None = None) -> StrokeAdd:
         """Keep a stroke drawn on a page: `line` as the app would add it
         (viewer.rm_stroke.draw), one action for undo (the app's AddItem). Refused, with
         nothing kept, on a document that may not be edited. On a page with typed text
@@ -1013,7 +1031,8 @@ class LibrarySource:
         with self._history_lock:
             doc = self._editable(doc, page_id)
             history = self._history(doc.id, page_id)
-            edit = StrokeAdd.new(doc.id, page_id, line, now_ms)
+            layer_ref, _ = self._layer_ref(doc, page_id, layer_index)
+            edit = StrokeAdd.new(doc.id, page_id, line, now_ms, layer=layer_ref)
             self._add_edit(doc, edit)
             done = self.staged(doc).replay(page_id)
             item = done.made.get(edit.uid)
@@ -1023,7 +1042,8 @@ class LibrarySource:
             history.seen = self._seen(doc.id, page_id)
         return edit
 
-    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int, offsets=None) -> StrokeErase | None:
+    def erase_strokes(self, doc: Document, page_id: str, eraser, now_ms: int, offsets=None,
+                      layer_index: int | None = None) -> StrokeErase | None:
         """Keep an eraser taken over a page: `eraser`, the eraser's own line
         (viewer.rm_stroke.eraser_line), one action for undo (the app's eraser action:
         the strokes it deleted put back, the pieces it left taken away). None, with
@@ -1039,15 +1059,18 @@ class LibrarySource:
             before = self.staged(doc).replay(page_id)
             if before.page is None:
                 return None
+            layer_ref, layer_node = self._layer_ref(doc, page_id, layer_index)
             try:
                 anchors = _node_anchors(before.page, offsets)
-                erased = rm_stroke.erase(before.page, author=self.sync.author(), eraser=eraser, anchors=anchors)
+                erased = rm_stroke.erase(before.page, author=self.sync.author(), eraser=eraser,
+                                         layer=layer_node, anchors=anchors)
             except (RmParseError, ValueError) as err:
                 raise EditError(f"the page cannot be erased on: {err}") from err
             if not erased.deleted:
                 return None
             edit = StrokeErase.new(doc.id, page_id, eraser, now_ms,
-                                   anchors=[(a, c, x, y) for (a, c), (x, y) in anchors.items()])
+                                   anchors=[(a, c, x, y) for (a, c), (x, y) in anchors.items()],
+                                   layer=layer_ref)
             self._add_edit(doc, edit)
             old = _stroke_values(before.page)
             after = self.staged(doc).replay(page_id)
@@ -1135,12 +1158,14 @@ class LibrarySource:
             history.seen = self._seen(doc.id, page_id)
             return edit, moved
 
-    def paste_strokes(self, doc: Document, page_id: str, lines, now_ms: int, action: list | None = None):
-        """Paste line values (placed already: rm_select.pasted) on top of the page's
-        current layer, one StrokePaste, part of `action` or one action for undo (the
-        app's add-items). (edit, the ids they took)."""
+    def paste_strokes(self, doc: Document, page_id: str, lines, now_ms: int, action: list | None = None,
+                      layer_index: int | None = None):
+        """Paste line values (placed already: rm_select.pasted) on top of the target
+        layer (default: current layer), one StrokePaste, part of `action` or one action
+        for undo (the app's add-items). (edit, the ids they took)."""
         doc = self._editable(doc, page_id)
-        edit = StrokePaste.new(doc.id, page_id, lines, now_ms)
+        layer_ref, _ = self._layer_ref(doc, page_id, layer_index)
+        edit = StrokePaste.new(doc.id, page_id, lines, now_ms, layer=layer_ref)
         with self.edit_action(doc, page_id, action) as changes:
             self._add_edit(doc, edit)
             after, now = self._items(doc, page_id)
@@ -1148,6 +1173,235 @@ class LibrarySource:
             changes.append(StrokeChange(remove=tuple(StrokePart(("edit", f"{edit.uid}/{n}"), now[i].line.encode().hex())
                                                      for n, i in enumerate(ids) if i in now)))
         return edit, [i for i in ids if i is not None]
+
+    # -- layers & SceneInfo --
+
+    def _current_layer_node(self, page: bytes | None) -> tuple[int, int]:
+        if page is None:
+            return rm_writer.LAYER_1
+        return rm_writer.current_layer(rm_writer.split(page)[1])
+
+    def add_layer(self, doc: Document, page_id: str, now_ms: int) -> LayerAdd:
+        """Add a new layer on top of `page_id` (max 5 live layers), making it active, as
+        one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            if len(infos) >= rm_layer.MAX_LAYERS:
+                raise EditError(f"Limit of {rm_layer.MAX_LAYERS} layers reached")
+            old_cur = before.ref(self._current_layer_node(before.page))
+            name = (rm_layer.next_layer_name(rm_writer.split(before.page)[1])
+                    if before.page is not None else f"Layer {len(infos) + 1}")
+            edit = LayerAdd.new(doc.id, page_id, name, now_ms)
+            self._add_edit(doc, edit)
+            new_ref = ("edit", edit.uid)
+            history.push([LayerAttachChange(new_ref, new_ref, old_cur, attached=True)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def delete_layer(self, doc: Document, page_id: str, layer_index: int, now_ms: int) -> LayerDelete:
+        """Delete (detach) layer `layer_index` on `page_id` (refusing the last layer),
+        as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            idx = int(layer_index)
+            if not 0 <= idx < len(infos):
+                raise EditError(f"no layer {idx} of {len(infos)}")
+            if len(infos) <= 1:
+                raise EditError("Cannot delete the last layer")
+            target_node = infos[idx].node_id
+            old_cur_node = self._current_layer_node(before.page)
+            old_cur_idx = next((n for n, info in enumerate(infos) if info.node_id == old_cur_node), len(infos) - 1)
+            remaining = [info.node_id for info in infos if info.node_id != target_node]
+            if idx == old_cur_idx:
+                new_cur_node = remaining[old_cur_idx - 1] if old_cur_idx == len(remaining) else remaining[old_cur_idx]
+            else:
+                new_cur_node = old_cur_node
+            target_ref = before.ref(target_node)
+            old_cur_ref = before.ref(old_cur_node)
+            new_cur_ref = before.ref(new_cur_node)
+            edit = LayerDelete.new(doc.id, page_id, target_ref, now_ms, new_current=new_cur_ref)
+            self._add_edit(doc, edit)
+            history.push([LayerAttachChange(target_ref, old_cur_ref, new_cur_ref, attached=False)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def rename_layer(self, doc: Document, page_id: str, layer_index: int, name: str, now_ms: int) -> LayerRename | None:
+        """Rename layer `layer_index` on `page_id`, as one undo step. None when unchanged."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            idx = int(layer_index)
+            if not 0 <= idx < len(infos):
+                raise EditError(f"no layer {idx} of {len(infos)}")
+            old_name = infos[idx].name
+            new_name = str(name)
+            if old_name == new_name:
+                return None
+            target_ref = before.ref(infos[idx].node_id)
+            edit = LayerRename.new(doc.id, page_id, target_ref, new_name, now_ms)
+            self._add_edit(doc, edit)
+            history.push([LayerRenameChange(target_ref, old_name, new_name)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def set_layer_visible(self, doc: Document, page_id: str, layer_index: int, visible: bool,
+                          now_ms: int) -> LayerVisibility | None:
+        """Toggle visibility of layer `layer_index` on `page_id`, as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            idx = int(layer_index)
+            if not 0 <= idx < len(infos):
+                raise EditError(f"no layer {idx} of {len(infos)}")
+            old_visible = infos[idx].visible
+            new_visible = bool(visible)
+            if old_visible == new_visible:
+                return None
+            target_ref = before.ref(infos[idx].node_id)
+            edit = LayerVisibility.new(doc.id, page_id, target_ref, new_visible, now_ms)
+            self._add_edit(doc, edit)
+            history.push([LayerVisibilityChange(target_ref, old_visible, new_visible)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def move_layer(self, doc: Document, page_id: str, from_index: int, to_index: int,
+                   now_ms: int) -> LayerMove | None:
+        """Reorder layer `from_index` to `to_index` (0 = bottom) on `page_id`, as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            src, dst = int(from_index), int(to_index)
+            if not 0 <= src < len(infos) or not 0 <= dst < len(infos):
+                raise EditError(f"invalid layer move {src} -> {dst} of {len(infos)}")
+            if src == dst:
+                return None
+            target_ref = before.ref(infos[src].node_id)
+            edit = LayerMove.new(doc.id, page_id, target_ref, dst, now_ms)
+            self._add_edit(doc, edit)
+            history.push([LayerMoveChange(target_ref, src, dst)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def merge_layer_down(self, doc: Document, page_id: str, layer_index: int, now_ms: int) -> LayerMergeDown:
+        """Merge layer `layer_index` (>= 1) down into `layer_index - 1`, as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            idx = int(layer_index)
+            if not 1 <= idx < len(infos) or before.page is None:
+                raise EditError(f"cannot merge layer {idx} down")
+            src_node = infos[idx].node_id
+            dst_node = infos[idx - 1].node_id
+            try:
+                merged = rm_layer.merge_layer_down(before.page, author=self.sync.author(), layer=src_node)
+            except (RmParseError, ValueError) as err:
+                raise EditError(f"cannot merge layer: {err}") from err
+            src_ref = before.ref(src_node)
+            dst_ref = before.ref(dst_node)
+            edit = LayerMergeDown.new(doc.id, page_id, src_ref, now_ms)
+            self._add_edit(doc, edit)
+            src_items = tuple((before.ref(old_id), kind, raw.hex(), None)
+                              for old_id, kind, raw, _ in merged.transferred)
+            dst_items = tuple(("edit", f"{edit.uid}/{n}") for n in range(len(src_items)))
+            groups = tuple(before.ref(g) for g in merged.moved_groups)
+            history.push([LayerMergeChange(src_ref, dst_ref, groups, src_items, dst_items,
+                                           before.ref(merged.old_current), merged=True)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def clear_lines_in_layer(self, doc: Document, page_id: str, layer_index: int,
+                             now_ms: int) -> StrokeDelete | None:
+        """Delete all strokes in layer `layer_index` (and groups below it), as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            if before.page is None:
+                return None
+            infos = rm_layer.layers_info(before.page)
+            idx = int(layer_index)
+            if not 0 <= idx < len(infos):
+                raise EditError(f"no layer {idx} of {len(infos)}")
+            _, deleted = rm_layer.clear_lines_in_layer(before.page, author=self.sync.author(),
+                                                       layer=infos[idx].node_id)
+            if not deleted:
+                return None
+            edit = StrokeDelete.new(doc.id, page_id, [before.ref(i) for i, _ in deleted], now_ms)
+            self._add_edit(doc, edit)
+            history.push([StrokeChange(readd=tuple(StrokePart(before.ref(i), raw.hex()) for i, raw in deleted))])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def set_current_layer(self, doc: Document, page_id: str, layer_index: int,
+                          now_ms: int) -> SceneFlags | None:
+        """Persist active layer `layer_index` to SceneInfo field 1 without disturbing the
+        undo stack. None when unchanged (or default Layer 1 on an empty page)."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            infos = rm_layer.layers_info(before.page)
+            idx = int(layer_index)
+            if not 0 <= idx < len(infos):
+                raise EditError(f"no layer {idx} of {len(infos)}")
+            target_node = infos[idx].node_id
+            if before.page is None and target_node == rm_writer.LAYER_1:
+                return None
+            cur_node, _, _ = rm_layer.scene_info(before.page)
+            if cur_node == target_node:
+                return None
+            edit = SceneFlags.new(doc.id, page_id, now_ms, current_layer=before.ref(target_node))
+            self._add_edit(doc, edit)
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def set_background_visible(self, doc: Document, page_id: str, visible: bool,
+                               now_ms: int) -> SceneFlags | None:
+        """Persist SceneInfo field 2 (backgroundVisible / Hide template) as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            _, old_bg, _ = rm_layer.scene_info(before.page)
+            new_bg = bool(visible)
+            if old_bg == new_bg:
+                return None
+            edit = SceneFlags.new(doc.id, page_id, now_ms, background_visible=new_bg)
+            self._add_edit(doc, edit)
+            history.push([SceneFlagChange("background_visible", old_bg, new_bg)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
+
+    def set_root_document_visible(self, doc: Document, page_id: str, visible: bool,
+                                  now_ms: int) -> SceneFlags | None:
+        """Persist SceneInfo field 3 (rootDocumentVisible / Text row) as one undo step."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            before = self.staged(doc).replay(page_id)
+            _, _, old_rd = rm_layer.scene_info(before.page)
+            new_rd = bool(visible)
+            if old_rd == new_rd:
+                return None
+            edit = SceneFlags.new(doc.id, page_id, now_ms, root_document_visible=new_rd)
+            self._add_edit(doc, edit)
+            history.push([SceneFlagChange("root_document_visible", old_rd, new_rd)])
+            history.seen = self._seen(doc.id, page_id)
+        return edit
 
     def delete_items(self, doc: Document, page_id: str, items, now_ms: int) -> bool:
         """Delete selected strokes and images of a page (the app's deleteSelectedItems),

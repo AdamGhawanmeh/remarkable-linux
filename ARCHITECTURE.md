@@ -1581,14 +1581,14 @@ PDF / EPUB-backed):
   zeros, like notebooks. 46 PDF pages and the one annotated EPUB page have no field 6 at all (older writers), so
   it is optional. The client only writes SceneInfo when it creates a page (`rm_writer.blank_page`:
   zeros); it never rewrites an existing one.
-- **Field 2 is "Hide template"** [corpus]: of 4,256 cached v6 pages, 4,253 have it at
+- **Field 2 is "Hide template"** [O + corpus]: of 4,256 cached v6 pages, 4,253 have it at
   `0:0`, true; 3 carry a later timestamp (1:15, 1:18, 1:170) and are true again: the
   tablet saves the toggle in the page. The desktop QML's View > Hide template and the
   Layers foldout's Template (notebooks) / Background (PDF) row call
-  `setBackgroundVisible`. The client reads the field (`PageScene.background_visible`),
-  starts each page shown from it and redraws without the template or PDF page while it is
-  hidden; it does not write the field (not traced which id the write takes or whether it
-  is an undo step).
+  `setBackgroundVisible`. Traced in §5.8 (`0x1409583c0` → `0x1408aa340`): it takes
+  `++clock` for field 2's LWW timestamp and is an undoable action on `SceneActionStack`.
+  The client reads the field (`PageScene.background_visible`), persists it (undoably) on
+  edit-enabled pages (`SceneFlags`), and keeps the live toggle working on read-only pages.
 - **Coordinates: same system, wider extent.** x is centred on the page (0 = middle),
   y = 0 at the top, in screen pixels. The PDF page fills [−W/2, W/2] × [0, H] with W, H =
   PDF size × 226/72 (§5.2). On the 46 annotated pages whose PDF is cached, 25 have ink
@@ -1990,6 +1990,83 @@ after the previous entry's whose rendition text holds its title (the client has 
 layout engine), else on the previous entry's page. The cached library: 6 of 75 PDFs and
 EPUBs with a cached rendition have an outline (111 entries); no cached EPUB has its
 `.epub` blob (fetched on demand), and their renditions have no outline.
+
+### 5.8 Layers and SceneInfo visibility
+
+Traced in reMarkable.exe 3.29 [O] from `SceneController::qt_static_metacall`
+(0x1403c99b0, slots 65–79), `SceneAction` subclasses, `SceneTree` (0x1408de730–0x1408e080f),
+and `SceneLayersModel::buildItems` (0x14045bbc0); verified read-only across all 4,276
+cached v6 pages (44 multi-layer / reordered pages, max 4 live layers, 0 errors).
+
+**SceneTreeMove (0x01) and live layers.** Layers are `SceneTreeNode` (0x02) blocks
+attached under `ROOT_NODE` (`0:1`) and ordered by `CrdtGroupItem` (0x04) blocks in
+`ROOT_NODE`'s CRDT sequence. Deleting a layer (or detaching an emptied anchored group)
+does **not** delete its `CrdtGroupItem` or its strokes; instead, `SceneTree::deleteNode`
+(0x1408e03b0) appends a `SceneTreeMove` with `1F = ++clock`, `2F = nodeId`, `31 = 0`,
+`4C = { 1F: 0:0 }`. Replaying all `SceneTreeMove` blocks in move-id order gives each
+node's current parent: a layer is live only if its final parent is `0:1` (a detached
+layer's tree node, root group item and child strokes stay in the file so undo can
+re-attach it with a `SceneTreeMove` `31 = 1, 4C = { 1F: 0:1 }`, reusing the existing
+root group item). Real cached pages show up to 8 root group items with 6 detached layers
+(leaving 2 live layers).
+
+**Layer operations (all go through `SceneController::pushAction` 0x1404470a0):**
+
+- **Add (`addLayer` 0x140437910 → `add-layer-crdt`, init 0x14095c080, redo 0x14095d320,
+  undo 0x14095ed60):** refuses at `layerCount >= 5` (*"add-layer-crdt::initialize: too many
+  layers: %d"*). Default name (`0x1408a88d0`): starts at `n = len(live) + 1` and
+  increments `n` while `"Layer %1"` matches any live layer's name. Takes 4 consecutive
+  clock counters: `nodeId = clock+1` (`SceneTreeMove` `1F=nodeId, 2F=0:0, 31=1, 4C={1F:0:1}`),
+  `labelTs = clock+2` (`SceneTreeNode` with label LWW and visible LWW `(0:0, true)`),
+  `groupItemId = clock+3` (`CrdtGroupItem` appended to `ROOT_NODE`), and
+  `currentLayerTs = clock+4` (`SceneInfo` field 1 set to `nodeId`). Undo detaches `nodeId`
+  (`SceneTree::deleteNode`) and sets `currentLayer = oldSize - 2`; redo re-attaches `nodeId`
+  (`SceneTree::moveNode` with `reuse=true`) and sets `currentLayer = count - 1`.
+- **Delete (`deleteLayer` 0x14043cda0 → `delete-layer-crdt`, init 0x14095c100, redo
+  0x14095d620, undo 0x14095ef80):** calls `SceneTree::deleteNode(nodeId)`. Active-layer
+  fallback (`0x14095d7de`): if `deletedIdx < oldCur` or `oldCur == newCount`, sets
+  `currentLayer = oldCur - 1`; otherwise keeps `oldCur` (pointing to the layer that shifted
+  into that index). Undo re-attaches `nodeId` under `0:1` and restores `oldCur`.
+- **Rename & visibility (`setLayerName` 0x1404485b0 → 0x14095e1d0 → 0x1408cfac0;
+  `setLayerVisible` 0x1404486d0 → 0x14095e3d0 → 0x1408cfb60):** updates `SceneTreeNode`
+  field 2 (label LWW string) or field 3 (visible LWW bool) with timestamp `++clock`,
+  swapping old and new values in the action so undo calls redo.
+- **Reorder (`moveLayer` 0x1404442f0 → `move-layer-crdt`, init 0x14095c6b0, redo
+  0x14095df40 → `SceneTree::reorderNode` 0x1408df3c0):** deletes the layer's old
+  `CrdtGroupItem` in `ROOT_NODE` (`deletedLength = 1`, no value) and inserts a new
+  `CrdtGroupItem` for the same `nodeId` at the target `(left, right)` in `ROOT_NODE`'s
+  CRDT sequence (no `SceneTreeMove` added; confirmed on cached reordered pages). Updates
+  `currentLayer` so the active layer tracks the same node; undo moves it back to `oldIdx`.
+- **Merge down (`mergeLayerDown` 0x140443de0 → `merge-layer-down-crdt`, init 0x14095c330,
+  redo 0x14095d840, undo 0x14095f180):** requires `1 <= srcIdx < count`. Iterates live
+  items of `src` in sequence order: child `CrdtGroupItem`s (type 2, including text-anchored
+  groups) are moved to `dst` via `SceneTree::moveNode` (`0x1408de730`, adding a group item
+  in `dst` and appending a `SceneTreeMove` to `dst`); non-group items (lines, images, etc.)
+  are cloned (`id = 0:0, parent = 0:0, moveId = 0:0`, timestamps kept; shader `sourceId`s
+  renamed via `0x1408cb8d0`), appended to `dst`, and deleted from `src`. `src` is then
+  detached via `SceneTree::deleteNode`, and if `srcIdx <= oldCur` then
+  `currentLayer = oldCur - 1`. Undo deletes the clones from `dst`, re-attaches `src`,
+  restores `src`'s deleted items right after their deleted slots (`0x1408cbd60`), moves
+  the child groups back to `src`, and restores `oldCur`.
+- **SceneInfo (0x0D) flags (`setCurrentLayer` 0x140958470 → 0x1408aa470;
+  `setBackgroundVisible` 0x1409583c0 → 0x1408aa340; `setRootDocumentVisible` 0x14095e5e0 →
+  0x1408aad70):** field 1 (`currentLayer`, LWW id), field 2 (`backgroundVisible`, LWW bool),
+  field 3 (`rootDocumentVisible`, LWW bool), each taking `++clock` when changed.
+  Deviation: in the client, `setCurrentLayer` persists field 1 without pushing an undo step
+  so Ctrl+Z reverts content/layer mutations rather than layer-selection clicks (while add,
+  delete, move and merge restore `currentLayer` as part of their own undo steps).
+- **Hidden layer behavior:** `Scene::addLine` (0x1409578c0), `Scene::erase` (0x140996ae0),
+  `Scene::cloneAddAndSelectItems` (0x1409af310), `SceneController::addSelectionRect`
+  (0x140437a20) and `SceneController::selectImageAtPoint` (0x140446740) do not check
+  `SceneTreeNode::visible` (+0x160); real tablet pages can also have `currentLayer`
+  pointing to a hidden layer. Operations target `currentLayer` as usual, and hidden layers
+  are skipped during rendering until shown again.
+- **`SceneLayersModel::buildItems` (0x14045bbc0):** exposes 8 roles per row `i` of `n`
+  live layers (`layerIndex = i`, `layerName`, `layerVisible`,
+  `layerSelected = (i == currentLayer)`, `layerMoveUpEnabled = (i < n - 1)`,
+  `layerMoveDownEnabled = (i > 0)`, `layerMergeEnabled = (i > 0)`,
+  `layerTrashEnabled = (n > 1)`). `LayersFoldout.qml` rotates the repeater 180° so index
+  `n - 1` sits at the top and index `0` at the bottom.
 
 ## 6. Implications for the Linux client
 

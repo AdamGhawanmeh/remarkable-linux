@@ -460,6 +460,10 @@ class PageScene:
     # SceneInfo (0x0D) field 2, a last-write-wins bool: whether the template (or the
     # PDF page) is shown, as the tablet's "Hide template" leaves it. True when absent.
     background_visible: bool = True
+    # SceneInfo (0x0D) field 3, a last-write-wins bool: whether typed text is shown.
+    root_document_visible: bool = True
+    # SceneInfo (0x0D) field 1, a last-write-wins id: the active layer node id, or None.
+    current_layer: tuple[int, int] | None = None
 
     @property
     def strokes(self) -> list[Stroke]:
@@ -937,29 +941,61 @@ def _left(f) -> tuple[int, int]:
     return f[3].raw if 3 in f and f[3].type == TAG_ID else (0, 0)
 
 
-def _stacking(entries: list[tuple], group_child: dict[tuple, tuple]) -> dict[tuple, int] | None:
-    """The stacking rank of every scene item id (bottom first), from the CRDT sequences
-    of the nodes, a group item expanded into its node's items where it stands. None
-    when a sequence does not fit together (an item after an unknown one)."""
+def _right(f) -> tuple[int, int]:
+    return f[4].raw if 4 in f and f[4].type == TAG_ID else (0, 0)
+
+
+def _order_node_sequence(items: list[tuple]) -> list[tuple] | None:
+    """Order one node's CRDT sequence items [(item, left, right, deleted_length)],
+    replaying insertions in id order (counter, author). Respects `right` so moved items
+    (left=0:0, right=first) land before `right`, while concurrent inserts with identical
+    (left, right) keep rising id order. None if an item follows an unknown neighbour."""
+    after: dict[tuple, tuple | None] = {}
+    left_of: dict[tuple, tuple] = {}
+    right_of: dict[tuple, tuple] = {}
+    known: set[tuple] = set()
+    for item, left, right, deleted_length in sorted(items, key=lambda x: (x[0][1], x[0][0])):
+        for n in range(max(deleted_length, 1)):
+            this = (item[0], item[1] + n)
+            if this in known or (left != _NO_ID and left not in known):
+                return None
+            prev = left
+            cur = after.get(prev)
+            stop = None if right == _NO_ID else right
+            while cur is not None and cur != stop:
+                if left_of.get(cur) == left and right_of.get(cur) == right:
+                    if _id_key(this) < _id_key(cur):
+                        break
+                    prev = cur
+                    cur = after.get(cur)
+                else:
+                    break
+            after[this], after[prev] = cur, this
+            left_of[this], right_of[this] = left, right
+            known.add(this)
+            left = this
+    order, this = [], after.get(_NO_ID)
+    while this is not None:
+        order.append(this)
+        this = after.get(this)
+    return order
+
+
+def _stacking(entries: list[tuple], group_child: dict[tuple, tuple],
+              tree_parent: dict[tuple, tuple] | None = None
+              ) -> tuple[dict[tuple, int] | None, dict[tuple, list[tuple]]]:
+    """The stacking rank of every scene item id (bottom first), and each parent node's
+    ordered CRDT sequence, from the CRDT sequences of the nodes, a group item expanded
+    into its node's items where it stands. (None, {}) when a sequence does not fit
+    together (an item after an unknown one)."""
     by_parent: dict[tuple, list[tuple]] = {}
-    for parent, item, left, deleted_length in entries:
-        by_parent.setdefault(parent, []).append((item, left, deleted_length))
+    for parent, item, left, right, deleted_length in entries:
+        by_parent.setdefault(parent, []).append((item, left, right, deleted_length))
     sequences: dict[tuple, list[tuple]] = {}
     for parent, items in by_parent.items():
-        after: dict[tuple, tuple | None] = {}
-        known: set[tuple] = set()
-        for item, left, deleted_length in sorted(items, key=lambda x: (x[0][1], x[0][0])):
-            for n in range(max(deleted_length, 1)):
-                this = (item[0], item[1] + n)
-                if this in known or (left != (0, 0) and left not in known):
-                    return None
-                after[this], after[left] = after.get(left), this
-                known.add(this)
-                left = this
-        order, this = [], after.get((0, 0))
-        while this is not None:
-            order.append(this)
-            this = after.get(this)
+        order = _order_node_sequence(items)
+        if order is None:
+            return None, {}
         sequences[parent] = order
     rank: dict[tuple, int] = {}
 
@@ -968,11 +1004,12 @@ def _stacking(entries: list[tuple], group_child: dict[tuple, tuple]) -> dict[tup
             rank.setdefault(item, len(rank))
             child = group_child.get(item)
             if child is not None and child not in seen:
-                seen.add(child)
-                walk(child, seen)
+                if tree_parent is None or tree_parent.get(child, node) == node:
+                    seen.add(child)
+                    walk(child, seen)
     for node in [ROOT_NODE, *sequences]:
         walk(node, {node})
-    return rank
+    return rank, sequences
 
 
 def _parse_v6(data: bytes) -> PageScene:
@@ -980,7 +1017,10 @@ def _parse_v6(data: bytes) -> PageScene:
     names: dict[tuple, str] = {}
     visible: dict[tuple, bool] = {}
     background_visible = True
-    layer_order: list[tuple] = []           # child node ids under the root, in order
+    root_document_visible = True
+    current_layer: tuple[int, int] | None = None
+    tree_moves: list[tuple[tuple, tuple, tuple]] = []  # (move_id, target_node, parent)
+    root_groups_file_order: list[tuple] = [] # child node ids under the root, in file order
     lines: list[tuple[tuple, Stroke]] = []  # (parent node, stroke) in file order
     deleted: set[tuple] = set()
     skipped: dict[int, int] = {}
@@ -991,7 +1031,7 @@ def _parse_v6(data: bytes) -> PageScene:
     image_files: dict[bytes, str] = {}      # imageRef -> file name (SceneImagesTable)
     node_parent: dict[tuple, tuple] = {}    # group node -> parent node (group items)
     anchors: dict[tuple, Anchor] = {}
-    sequence_items: list[tuple] = []        # (parent, id, left, deleted length) of every scene item
+    sequence_items: list[tuple] = []        # (parent, id, left, right, deleted length) of every scene item
     group_child: dict[tuple, tuple] = {}    # live group item id -> its child node
 
     while r.pos < len(data):
@@ -1002,6 +1042,16 @@ def _parse_v6(data: bytes) -> PageScene:
         try:
             if block_type == BLOCK_AUTHORS:
                 authors = _decode_authors(payload)
+            elif block_type == BLOCK_SCENE_TREE:
+                f = _read_fields(payload)
+                move_id = _field(f, 1, TAG_ID, "scene tree move").raw
+                target = _field(f, 2, TAG_ID, "scene tree move").raw
+                parent = _NO_ID
+                if 4 in f and f[4].type == TAG_LENGTH4:
+                    pf = _read_fields(f[4].raw)
+                    if 1 in pf and pf[1].type == TAG_ID:
+                        parent = pf[1].raw
+                tree_moves.append((move_id, target, parent))
             elif block_type == BLOCK_TREE_NODE:
                 f = _read_fields(payload)
                 node = _field(f, 1, TAG_ID, "tree node").raw
@@ -1017,7 +1067,7 @@ def _parse_v6(data: bytes) -> PageScene:
                 item = _field(f, 2, TAG_ID, "scene item").raw
                 deleted_length = f[5].as_int() if 5 in f else 0
                 value = f[6].raw if 6 in f and f[6].type == TAG_LENGTH4 else b""
-                sequence_items.append((parent, item, _left(f), deleted_length))
+                sequence_items.append((parent, item, _left(f), _right(f), deleted_length))
                 if block_type == BLOCK_TOMBSTONE or deleted_length or not value:
                     deleted.add(item)
                 elif block_type == BLOCK_SCENE_GROUP:
@@ -1025,8 +1075,8 @@ def _parse_v6(data: bytes) -> PageScene:
                     child = _field(_read_fields(value[1:]), 2, TAG_ID, "group item").raw
                     node_parent[child] = parent
                     group_child[item] = child
-                    if parent == ROOT_NODE and child not in layer_order:
-                        layer_order.append(child)
+                    if parent == ROOT_NODE and child not in root_groups_file_order:
+                        root_groups_file_order.append(child)
                 else:
                     stroke = _decode_line(value, version, item, _left(f),
                                           f[4].raw if 4 in f and f[4].type == TAG_ID else None)
@@ -1034,17 +1084,23 @@ def _parse_v6(data: bytes) -> PageScene:
                     lines.append((parent, stroke))
             elif block_type == BLOCK_ROOT_TEXT:
                 text = _decode_root_text(payload, authors)
-            elif block_type == 0x0D:                # SceneInfo: field 2 background visible
+            elif block_type == 0x0D:                # SceneInfo: 1 currentLayer, 2 background, 3 rootDoc
                 f = _read_fields(payload)
+                if 1 in f and f[1].type == TAG_LENGTH4:
+                    inner = _read_fields(f[1].raw)
+                    if 2 in inner and inner[2].type == TAG_ID and inner[2].raw != _NO_ID:
+                        current_layer = inner[2].raw
                 if 2 in f and f[2].type == TAG_LENGTH4:
                     background_visible = _lww_bool(f[2].raw)
+                if 3 in f and f[3].type == TAG_LENGTH4:
+                    root_document_visible = _lww_bool(f[3].raw)
             elif block_type == BLOCK_IMAGE_ITEM:
                 # Same item header as other scene items; the value is kept raw.
                 f = _read_fields(payload)
                 item = _field(f, 2, TAG_ID, "image item").raw
                 deleted_length = f[5].as_int() if 5 in f else 0
                 value = f[6].raw if 6 in f and f[6].type == TAG_LENGTH4 else b""
-                sequence_items.append((_field(f, 1, TAG_ID, "image item").raw, item, _left(f), deleted_length))
+                sequence_items.append((_field(f, 1, TAG_ID, "image item").raw, item, _left(f), _right(f), deleted_length))
                 if deleted_length or not value:
                     deleted.add(item)
                 else:
@@ -1062,13 +1118,26 @@ def _parse_v6(data: bytes) -> PageScene:
         except (RmParseError, struct.error, IndexError) as err:
             raise RmParseError(f"block type {block_type:#x} at offset {start}: {err}") from err
 
+    # Replay SceneTreeMove (0x01) blocks in move-id order to find each node's current
+    # parent in the scene tree. A node moved to (0, 0) is detached (deleted layer or
+    # emptied anchored group); its tree node and group item stay in the file for undo.
+    tree_parent: dict[tuple, tuple] = {}
+    for move_id, target, parent in sorted(tree_moves, key=lambda m: (m[0][1], m[0][0])):
+        node = move_id if target == _NO_ID else target
+        tree_parent[node] = parent
+
     def owner(node):
-        """(layer node, nearest anchor) for a stroke's parent node."""
+        """(layer node, nearest anchor) for a stroke's parent node, or (_NO_ID, None)
+        when the node (or an ancestor) was detached by SceneTreeMove to (0, 0)."""
         anchor, seen = None, set()
         while node not in seen:
             seen.add(node)
+            if node == _NO_ID:
+                return _NO_ID, None
             anchor = anchor or anchors.get(node)
-            parent = node_parent.get(node)
+            parent = tree_parent.get(node, node_parent.get(node))
+            if parent == _NO_ID:
+                return _NO_ID, None
             if parent is None or parent == ROOT_NODE:
                 return node, anchor
             node = parent
@@ -1077,14 +1146,27 @@ def _parse_v6(data: bytes) -> PageScene:
     # Stacking: the order of each node's items is its CRDT sequence (each item after its
     # left neighbour, replayed in id order), a group item standing for its node's items.
     # Items are mostly stored in that order, but not one put back by undo, which goes
-    # right after the item it was (rm_writer.restore_image). File order if the sequence
-    # cannot be worked out.
-    rank = _stacking(sequence_items, group_child)
+    # right after the item it was (rm_writer.restore_image), or a moved layer. File order
+    # if the sequence cannot be worked out.
+    rank, sequences = _stacking(sequence_items, group_child, tree_parent)
     if rank is not None:
         for _, stroke in lines:
             stroke.seq = rank.get(stroke.item_id, stroke.seq)
         for image in images:
             image.seq = rank.get(image.item_id, image.seq)
+
+    # Layer order: root's live group items in CRDT sequence order (excluding layers
+    # detached by SceneTreeMove to parent != ROOT_NODE), falling back to file order.
+    layer_order: list[tuple] = []
+    if ROOT_NODE in sequences:
+        for item_id in sequences[ROOT_NODE]:
+            child = group_child.get(item_id)
+            if child is not None and tree_parent.get(child, ROOT_NODE) == ROOT_NODE and child not in layer_order:
+                layer_order.append(child)
+    else:
+        for child in root_groups_file_order:
+            if tree_parent.get(child, ROOT_NODE) == ROOT_NODE and child not in layer_order:
+                layer_order.append(child)
 
     placed = []
     for parent, stroke in lines:
@@ -1092,8 +1174,10 @@ def _parse_v6(data: bytes) -> PageScene:
             placed.append((ROOT_NODE, stroke))
             continue
         layer, stroke.anchor = owner(parent)
+        if layer == _NO_ID:
+            continue
         placed.append((layer, stroke))
-    # Layer order: root's group items, then any other top-level node owning strokes.
+    # Any other live top-level node owning strokes (synthetic pages without root group items).
     for layer, _ in placed:
         if layer != ROOT_NODE and layer not in layer_order:
             layer_order.append(layer)
@@ -1110,14 +1194,19 @@ def _parse_v6(data: bytes) -> PageScene:
     result = list(layers.values())
     if root_strokes:
         result.insert(0, Layer(name="Root", strokes=root_strokes, node_id=ROOT_NODE))
-    images = [img for img in images if img.item_id not in deleted]
+    live_images: list[ImageItem] = []
     for image in images:
+        if image.item_id in deleted:
+            continue
         image.file_name = image_files.get(image.image_ref, "")
         if image.parent_id == ROOT_NODE:
             target = None
         else:
             layer, _ = owner(image.parent_id)
+            if layer == _NO_ID:
+                continue
             target = layers.get(layer)
+        live_images.append(image)
         if target is not None:
             target.images.append(image)
         elif result and result[0].node_id == ROOT_NODE:
@@ -1125,8 +1214,9 @@ def _parse_v6(data: bytes) -> PageScene:
         else:
             result.insert(0, Layer(name="Root", images=[image], node_id=ROOT_NODE))
     return PageScene(version=6, layers=result, x_origin=PAGE_WIDTH / 2, text=text,
-                     images=images, block_counts=counts, skipped_blocks=skipped,
-                     background_visible=background_visible)
+                     images=live_images, block_counts=counts, skipped_blocks=skipped,
+                     background_visible=background_visible, root_document_visible=root_document_visible,
+                     current_layer=current_layer)
 
 
 IMAGE_ITEM_TYPE = 7      # the value's leading byte, as 2 is a group and 3 a line

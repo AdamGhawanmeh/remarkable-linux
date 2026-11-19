@@ -537,14 +537,47 @@ def sequence(blocks: list[Block], parent: tuple[int, int]) -> list[tuple[tuple[i
     return out
 
 
+def decode_tree_move(payload: bytes) -> tuple[tuple[int, int], tuple[int, int], int, tuple[int, int]]:
+    """(move_id, target_node, is_update, parent_id) of a SceneTreeMove (0x01) block."""
+    fields = {i: (k, v) for i, k, v in read_values(payload)}
+    if 1 not in fields or fields[1][0] != TAG_ID:
+        raise RmParseError("tree move has no id")
+    if 2 not in fields or fields[2][0] != TAG_ID:
+        raise RmParseError("tree move has no node")
+    is_update = int(fields[3][1]) if 3 in fields and fields[3][0] == TAG_BYTE1 else 0
+    parent = ZERO_ID
+    if 4 in fields and fields[4][0] == TAG_LENGTH4:
+        pf = {i: (k, v) for i, k, v in read_values(fields[4][1])}
+        if 1 in pf and pf[1][0] == TAG_ID:
+            parent = pf[1][1]
+    return fields[1][1], fields[2][1], is_update, parent
+
+
+def encode_tree_move(move_id: tuple[int, int], target_node: tuple[int, int], is_update: int,
+                     parent: tuple[int, int]) -> bytes:
+    """Payload of a SceneTreeMove (0x01, v1.1) block."""
+    return f_id(1, move_id) + f_id(2, target_node) + f_u8(3, 1 if is_update else 0) + f_sub(4, f_id(1, parent))
+
+
+def tree_parents(blocks: list[Block]) -> dict[tuple[int, int], tuple[int, int]]:
+    """Each node's current parent from replaying SceneTreeMove (0x01) blocks in move-id order."""
+    moves = [decode_tree_move(b.payload) for b in blocks if b.type == BLOCK_TREE_MOVE]
+    parents: dict[tuple[int, int], tuple[int, int]] = {}
+    for move_id, target, _, parent in sorted(moves, key=lambda m: id_key(m[0])):
+        parents[move_id if target == ZERO_ID else target] = parent
+    return parents
+
+
 def layers(blocks: list[Block]) -> list[tuple[int, int]]:
-    """The layer nodes of the page, bottom to top: the live group items of the root."""
+    """The live layer nodes of the page, bottom to top: the live group items of the root
+    whose node is still attached to the root (not detached by SceneTreeMove)."""
+    parents = tree_parents(blocks)
     out = []
     for _, block in sequence(blocks, ROOT_NODE):
         item = decode_item(block.payload)
         if block.type == BLOCK_GROUP_ITEM and item.value is not None:
             child = [v for i, k, v in read_values(item.value[1:]) if (i, k) == (2, TAG_ID)]
-            if child and child[0] not in out:
+            if child and parents.get(child[0], ROOT_NODE) == ROOT_NODE and child[0] not in out:
                 out.append(child[0])
     return out
 

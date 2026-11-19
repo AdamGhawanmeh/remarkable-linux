@@ -1095,8 +1095,9 @@ class Erased:
 
 def group_nodes(blocks: list[w.Block], node: tuple[int, int]) -> list[tuple[tuple[int, int], tuple[int, int]]]:
     """(group node, its parent node) for the groups below `node`, at any depth, through
-    live group items: each node before the ones below it, in the order its parent holds
-    them (the scene's group visitor, 0x1408d1670)."""
+    live group items whose node is still attached to that parent (SceneTreeMove): each
+    node before the ones below it, in the order its parent holds them (0x1408d1670)."""
+    parents = w.tree_parents(blocks)
     out: list[tuple[tuple[int, int], tuple[int, int]]] = []
     seen = {tuple(node)}
 
@@ -1110,7 +1111,7 @@ def group_nodes(blocks: list[w.Block], node: tuple[int, int]) -> list[tuple[tupl
             if item.value is None:
                 continue
             child = next((v for i, k, v in w.read_values(item.value[1:]) if (i, k) == (2, w.TAG_ID)), None)
-            if child is None or child in seen:
+            if child is None or child in seen or parents.get(child, parent) != parent:
                 continue
             seen.add(child)
             out.append((child, parent))

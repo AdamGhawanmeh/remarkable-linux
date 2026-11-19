@@ -78,6 +78,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from viewer import rm_layer
 from viewer import rm_select
 from viewer import rm_stroke
 from viewer import rm_writer
@@ -115,6 +116,7 @@ class ImageInsert:
     # A pasted copy keeps the (boundsTimestamp, imageRef timestamp) of the item copied.
     timestamps: tuple[tuple[int, int], tuple[int, int]] | None = None
     uid: str = ""                   # names the item it makes, for undo (ItemRef)
+    layer: tuple | None = None      # target layer (ItemRef), or None for the page's current layer
 
     @property
     def path(self) -> str:
@@ -123,20 +125,20 @@ class ImageInsert:
 
     @classmethod
     def new(cls, doc_id: str, page_id: str, extension: str, vertices, sha256: str, size: int,
-            created_ms: int, timestamps=None) -> "ImageInsert":
+            created_ms: int, timestamps=None, layer=None) -> "ImageInsert":
         """With a new file name and key: two random UUIDs, as the app makes them. The key
         is stored as the tablet's is, the UUID's bytes last to first."""
         if extension not in IMAGE_EXTENSIONS:
             raise EditError(f"images are stored as {' or '.join(IMAGE_EXTENSIONS)}, not {extension!r}")
         corners = _corners(vertices)
         return cls(doc_id, page_id, f"{uuid.uuid4()}.{extension}", uuid.uuid4().bytes[::-1].hex(), corners,
-                   sha256, int(size), int(created_ms), _timestamps(timestamps), uuid.uuid4().hex)
+                   sha256, int(size), int(created_ms), _timestamps(timestamps), uuid.uuid4().hex, _opt_ref(layer))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "ImageInsert":
         return cls(str(raw["doc_id"]), str(raw["page_id"]), str(raw["file_name"]), str(raw["key"]),
                    _corners(raw["vertices"]), str(raw["sha256"]), int(raw["size"]), int(raw["created_ms"]),
-                   _timestamps(raw.get("timestamps")), str(raw.get("uid") or ""))
+                   _timestamps(raw.get("timestamps")), str(raw.get("uid") or ""), _opt_ref(raw.get("layer")))
 
 
 def _timestamps(value):
@@ -221,6 +223,10 @@ def _ref(value) -> ItemRef:
     raise EditError(f"not an item reference: {value!r}")
 
 
+def _opt_ref(value) -> ItemRef | None:
+    return None if value is None else _ref(value)
+
+
 @dataclass(frozen=True)
 class ImageRestore:
     """An image put back on its page as it was before an edit took it off: the item
@@ -278,12 +284,14 @@ class StrokeAdd:
     created_ms: int
     argb: int | None = None
     uid: str = ""                   # names the item it makes (ItemRef)
+    layer: ItemRef | None = None    # target layer (ItemRef), or None for the page's current layer
 
     def line(self) -> rm_stroke.LineValue:
         return rm_stroke.new_line(self.tool, self.color, self.thickness, bytes.fromhex(self.points), argb=self.argb)
 
     @classmethod
-    def new(cls, doc_id: str, page_id: str, line: rm_stroke.LineValue, created_ms: int, uid: str | None = None) -> "StrokeAdd":
+    def new(cls, doc_id: str, page_id: str, line: rm_stroke.LineValue, created_ms: int, uid: str | None = None,
+            layer=None) -> "StrokeAdd":
         if line.tool in rm_stroke.NOT_DRAWN:
             raise EditError(f"tool {line.tool} does not draw")
         if line.count >= rm_stroke.MAX_LINE_POINTS:
@@ -291,14 +299,14 @@ class StrokeAdd:
         return cls(str(doc_id), str(page_id), int(line.tool), int(line.color), _number(line.thickness_scale, "pen size"),
                    _points(line.points), int(created_ms),
                    (rm_stroke.DEFAULT_ARGB if line.argb is None else int(line.argb)) if line.color == rm_stroke.COLOR_ARGB
-                   else None, uuid.uuid4().hex if uid is None else str(uid))
+                   else None, uuid.uuid4().hex if uid is None else str(uid), _opt_ref(layer))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "StrokeAdd":
         argb = raw.get("argb")
         return cls(str(raw["doc_id"]), str(raw["page_id"]), int(raw["tool"]), int(raw["color"]),
                    _number(raw["thickness"], "pen size"), _points(raw["points"]), int(raw["created_ms"]),
-                   None if argb is None else int(argb), str(raw.get("uid") or ""))
+                   None if argb is None else int(argb), str(raw.get("uid") or ""), _opt_ref(raw.get("layer")))
 
 
 @dataclass(frozen=True)
@@ -323,6 +331,7 @@ class StrokeErase:
     created_ms: int
     uid: str = ""
     anchors: tuple[tuple[int, int, float, float], ...] = ()
+    layer: ItemRef | None = None
 
     def line(self) -> rm_stroke.LineValue:
         return rm_stroke.new_line(self.tool, 2, self.thickness, bytes.fromhex(self.points))
@@ -332,7 +341,7 @@ class StrokeErase:
 
     @classmethod
     def new(cls, doc_id: str, page_id: str, eraser: rm_stroke.LineValue, created_ms: int,
-            uid: str | None = None, anchors=()) -> "StrokeErase":
+            uid: str | None = None, anchors=(), layer=None) -> "StrokeErase":
         if eraser.tool not in (rm_stroke.ERASER, rm_stroke.ERASE_SECTION):
             raise EditError(f"tool {eraser.tool} does not erase")
         if eraser.count >= rm_stroke.MAX_STORED_POINTS:
@@ -340,14 +349,16 @@ class StrokeErase:
         nodes = tuple(sorted((int(a), int(c), _number(x, "anchor position"), _number(y, "anchor position"))
                              for a, c, x, y in anchors))
         return cls(str(doc_id), str(page_id), int(eraser.tool), _number(eraser.thickness_scale, "eraser size"),
-                   _points(eraser.points), int(created_ms), uuid.uuid4().hex if uid is None else str(uid), nodes)
+                   _points(eraser.points), int(created_ms), uuid.uuid4().hex if uid is None else str(uid), nodes,
+                   _opt_ref(layer))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "StrokeErase":
         nodes = tuple((int(a), int(c), _number(x, "anchor position"), _number(y, "anchor position"))
                       for a, c, x, y in raw.get("anchors") or ())
         return cls(str(raw["doc_id"]), str(raw["page_id"]), int(raw["tool"]), _number(raw["thickness"], "eraser size"),
-                   _points(raw["points"]), int(raw["created_ms"]), str(raw.get("uid") or ""), nodes)
+                   _points(raw["points"]), int(raw["created_ms"]), str(raw.get("uid") or ""), nodes,
+                   _opt_ref(raw.get("layer")))
 
 
 @dataclass(frozen=True)
@@ -461,12 +472,14 @@ class StrokePaste:
     values: tuple[str, ...]
     created_ms: int
     uid: str = ""
+    layer: ItemRef | None = None
 
     def lines(self) -> list[rm_stroke.LineValue]:
         return [rm_stroke.decode_line_value(bytes.fromhex(v)) for v in self.values]
 
     @classmethod
-    def new(cls, doc_id: str, page_id: str, values, created_ms: int, uid: str | None = None) -> "StrokePaste":
+    def new(cls, doc_id: str, page_id: str, values, created_ms: int, uid: str | None = None,
+            layer=None) -> "StrokePaste":
         out = []
         for value in values:
             data = value.encode() if isinstance(value, rm_stroke.LineValue) else (
@@ -480,11 +493,221 @@ class StrokePaste:
             out.append(data.hex())
         if not out:
             raise EditError("a paste of no strokes")
-        return cls(str(doc_id), str(page_id), tuple(out), int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+        return cls(str(doc_id), str(page_id), tuple(out), int(created_ms), uuid.uuid4().hex if uid is None else str(uid),
+                   _opt_ref(layer))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "StrokePaste":
-        return cls.new(raw["doc_id"], raw["page_id"], raw["values"], raw["created_ms"], raw.get("uid") or "")
+        return cls.new(raw["doc_id"], raw["page_id"], raw["values"], raw["created_ms"], raw.get("uid") or "",
+                       raw.get("layer"))
+
+
+# ------------------------------------------------------------------ layers & SceneInfo
+
+@dataclass(frozen=True)
+class LayerAdd:
+    """A new layer added on top of a page (rm_layer.add_layer); named ("edit", uid)."""
+
+    doc_id: str
+    page_id: str
+    name: str
+    created_ms: int
+    uid: str = ""
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, name: str, created_ms: int, uid: str | None = None) -> "LayerAdd":
+        return cls(str(doc_id), str(page_id), str(name or ""), int(created_ms),
+                   uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerAdd":
+        return cls.new(raw["doc_id"], raw["page_id"], raw.get("name") or "", raw["created_ms"], raw.get("uid") or "")
+
+
+@dataclass(frozen=True)
+class LayerDelete:
+    """A layer detached via SceneTreeMove to (0, 0) (rm_layer.detach_layer)."""
+
+    doc_id: str
+    page_id: str
+    layer: ItemRef
+    created_ms: int
+    new_current: ItemRef | None = None
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, layer, created_ms: int, new_current=None) -> "LayerDelete":
+        return cls(str(doc_id), str(page_id), _ref(layer), int(created_ms), _opt_ref(new_current))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerDelete":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["created_ms"], raw.get("new_current"))
+
+
+@dataclass(frozen=True)
+class LayerReattach:
+    """A detached layer re-attached under ROOT_NODE (rm_layer.reattach_layer)."""
+
+    doc_id: str
+    page_id: str
+    layer: ItemRef
+    created_ms: int
+    set_current: ItemRef | None = None
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, layer, created_ms: int, set_current=None) -> "LayerReattach":
+        return cls(str(doc_id), str(page_id), _ref(layer), int(created_ms), _opt_ref(set_current))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerReattach":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["created_ms"], raw.get("set_current"))
+
+
+@dataclass(frozen=True)
+class LayerRename:
+    """A layer renamed (SceneTreeNode field 2 LWW string)."""
+
+    doc_id: str
+    page_id: str
+    layer: ItemRef
+    name: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, layer, name: str, created_ms: int) -> "LayerRename":
+        return cls(str(doc_id), str(page_id), _ref(layer), str(name), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerRename":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["name"], raw["created_ms"])
+
+
+@dataclass(frozen=True)
+class LayerVisibility:
+    """A layer's visibility changed (SceneTreeNode field 3 LWW bool)."""
+
+    doc_id: str
+    page_id: str
+    layer: ItemRef
+    visible: bool
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, layer, visible: bool, created_ms: int) -> "LayerVisibility":
+        return cls(str(doc_id), str(page_id), _ref(layer), bool(visible), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerVisibility":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], bool(raw["visible"]), raw["created_ms"])
+
+
+@dataclass(frozen=True)
+class LayerMove:
+    """A layer moved to `new_index` (0 = bottom) in ROOT_NODE's CRDT sequence."""
+
+    doc_id: str
+    page_id: str
+    layer: ItemRef
+    new_index: int
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, layer, new_index: int, created_ms: int) -> "LayerMove":
+        if int(new_index) < 0:
+            raise EditError(f"invalid layer index {new_index}")
+        return cls(str(doc_id), str(page_id), _ref(layer), int(new_index), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerMove":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["new_index"], raw["created_ms"])
+
+
+@dataclass(frozen=True)
+class LayerMergeDown:
+    """A layer merged down into the layer beneath it (rm_layer.merge_layer_down). Cloned
+    items added to dst are named ("edit", "<uid>/<n>")."""
+
+    doc_id: str
+    page_id: str
+    layer: ItemRef
+    created_ms: int
+    uid: str = ""
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, layer, created_ms: int, uid: str | None = None) -> "LayerMergeDown":
+        return cls(str(doc_id), str(page_id), _ref(layer), int(created_ms),
+                   uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerMergeDown":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["created_ms"], raw.get("uid") or "")
+
+
+@dataclass(frozen=True)
+class LayerUnmerge:
+    """Undo of LayerMergeDown (rm_layer.unmerge_layer): deletes cloned items from dst,
+    re-attaches src, restores src's deleted items (named ("edit", "<uid>/<n>")), moves
+    child groups back to src, and restores currentLayer."""
+
+    doc_id: str
+    page_id: str
+    src: ItemRef
+    dst: ItemRef
+    moved_groups: tuple[ItemRef, ...]
+    # (deleted item ref in src, block_type, raw value hex, origin ref or None)
+    restore_items: tuple[tuple[ItemRef, int, str, ItemRef | None], ...]
+    remove_from_dst: tuple[ItemRef, ...]
+    old_current: ItemRef | None
+    created_ms: int
+    uid: str = ""
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, src, dst, moved_groups, restore_items, remove_from_dst,
+            old_current, created_ms: int, uid: str | None = None) -> "LayerUnmerge":
+        restored = tuple((_ref(r), int(k), bytes.fromhex(str(v)).hex(), _opt_ref(o)) for r, k, v, o in restore_items)
+        return cls(str(doc_id), str(page_id), _ref(src), _ref(dst),
+                   tuple(_ref(g) for g in moved_groups), restored, tuple(_ref(r) for r in remove_from_dst),
+                   _opt_ref(old_current), int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "LayerUnmerge":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["src"], raw["dst"], raw.get("moved_groups") or (),
+                       raw.get("restore_items") or (), raw.get("remove_from_dst") or (),
+                       raw.get("old_current"), raw["created_ms"], raw.get("uid") or "")
+
+
+@dataclass(frozen=True)
+class SceneFlags:
+    """SceneInfo (0x0D) LWW fields updated: currentLayer (1), backgroundVisible (2),
+    and/or rootDocumentVisible (3)."""
+
+    doc_id: str
+    page_id: str
+    created_ms: int
+    current_layer: ItemRef | None = None
+    background_visible: bool | None = None
+    root_document_visible: bool | None = None
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, created_ms: int, *, current_layer=None,
+            background_visible: bool | None = None, root_document_visible: bool | None = None) -> "SceneFlags":
+        if current_layer is None and background_visible is None and root_document_visible is None:
+            raise EditError("a SceneFlags edit must change at least one field")
+        return cls(str(doc_id), str(page_id), int(created_ms), _opt_ref(current_layer),
+                   None if background_visible is None else bool(background_visible),
+                   None if root_document_visible is None else bool(root_document_visible))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "SceneFlags":
+        bg = raw.get("background_visible")
+        rd = raw.get("root_document_visible")
+        return cls.new(raw["doc_id"], raw["page_id"], raw["created_ms"],
+                       current_layer=raw.get("current_layer"),
+                       background_visible=None if bg is None else bool(bg),
+                       root_document_visible=None if rd is None else bool(rd))
+
+
+LAYER_EDITS = (LayerAdd, LayerDelete, LayerReattach, LayerRename, LayerVisibility,
+               LayerMove, LayerMergeDown, LayerUnmerge, SceneFlags)
 
 
 STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore, StrokePaste, ItemsTransform)
@@ -761,14 +984,18 @@ DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty
 
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
         | PageTemplate | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | StrokePaste | ItemsTransform
-        | ToolSettings)
+        | ToolSettings | LayerAdd | LayerDelete | LayerReattach | LayerRename | LayerVisibility | LayerMove
+        | LayerMergeDown | LayerUnmerge | SceneFlags)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
                           "page-move": PageMove, "page-delete": PageDelete, "page-template": PageTemplate,
                           "text": TextEdit,
                           "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete,
                           "stroke-restore": StrokeRestore, "stroke-paste": StrokePaste,
-                          "items-transform": ItemsTransform, "tool-settings": ToolSettings}
+                          "items-transform": ItemsTransform, "tool-settings": ToolSettings,
+                          "layer-add": LayerAdd, "layer-delete": LayerDelete, "layer-reattach": LayerReattach,
+                          "layer-rename": LayerRename, "layer-visible": LayerVisibility, "layer-move": LayerMove,
+                          "layer-merge": LayerMergeDown, "layer-unmerge": LayerUnmerge, "scene-flags": SceneFlags}
 
 
 class PendingEdits:
@@ -971,17 +1198,93 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 continue
             page = _text_edit(page, edit, author, Replay(page, made, removed, typed))
             continue
+        if isinstance(edit, LAYER_EDITS):
+            done = Replay(page, made, removed, typed)
+            try:
+                if isinstance(edit, LayerAdd):
+                    page, node_id = rm_layer.add_layer(page, author=author, name=edit.name or None)
+                    if edit.uid:
+                        made[edit.uid] = node_id
+                elif isinstance(edit, LayerDelete):
+                    target = done.resolve(edit.layer)
+                    new_cur = done.resolve(edit.new_current) if edit.new_current is not None else None
+                    if page is not None and target is not None and target in rm_writer.layers(rm_writer.split(page)[1]):
+                        page, _ = rm_layer.detach_layer(page, author=author, layer=target, new_current=new_cur)
+                elif isinstance(edit, LayerReattach):
+                    target = done.resolve(edit.layer)
+                    set_cur = done.resolve(edit.set_current) if edit.set_current is not None else None
+                    if page is not None and target is not None:
+                        page = rm_layer.reattach_layer(page, author=author, layer=target, set_current=set_cur)
+                elif isinstance(edit, LayerRename):
+                    target = done.resolve(edit.layer)
+                    if target is not None:
+                        page = rm_layer.set_layer_name(page, author=author, layer=target, name=edit.name)
+                elif isinstance(edit, LayerVisibility):
+                    target = done.resolve(edit.layer)
+                    if target is not None:
+                        page = rm_layer.set_layer_visible(page, author=author, layer=target, visible=edit.visible)
+                elif isinstance(edit, LayerMove):
+                    target = done.resolve(edit.layer)
+                    if page is not None and target is not None and target in rm_writer.layers(rm_writer.split(page)[1]):
+                        page = rm_layer.move_layer(page, author=author, layer=target, new_index=edit.new_index)
+                elif isinstance(edit, LayerMergeDown):
+                    target = done.resolve(edit.layer)
+                    if page is not None and target is not None and target in rm_writer.layers(rm_writer.split(page)[1]):
+                        merged = rm_layer.merge_layer_down(page, author=author, layer=target)
+                        page = merged.page
+                        for n, (old_id, kind, raw, new_id) in enumerate(merged.transferred):
+                            if edit.uid:
+                                made[f"{edit.uid}/{n}"] = new_id
+                            if kind == rm_writer.BLOCK_IMAGE_ITEM:
+                                removed[old_id] = rm_writer.decode_image_value(raw)
+                elif isinstance(edit, LayerUnmerge):
+                    src = done.resolve(edit.src)
+                    dst = done.resolve(edit.dst)
+                    if page is not None and src is not None and dst is not None:
+                        groups = tuple(g for g in (done.resolve(r) for r in edit.moved_groups) if g is not None)
+                        rest_items = []
+                        rest_indices = []
+                        for n, (ref, kind, raw_hex, orig_ref) in enumerate(edit.restore_items):
+                            item_id = done.resolve(ref)
+                            if item_id is not None:
+                                orig = done.resolve(orig_ref) if orig_ref is not None else None
+                                rest_items.append((item_id, kind, bytes.fromhex(raw_hex), orig))
+                                rest_indices.append((n, item_id))
+                        rem_dst = tuple(i for i in (done.resolve(r) for r in edit.remove_from_dst) if i is not None)
+                        old_cur = done.resolve(edit.old_current) if edit.old_current is not None else None
+                        page, restored = rm_layer.unmerge_layer(
+                            page, author=author, src=src, dst=dst, moved_groups=groups,
+                            restore_items=tuple(rest_items), remove_from_dst=rem_dst, old_current=old_cur)
+                        for n, item_id in rest_indices:
+                            if edit.uid and item_id in restored:
+                                made[f"{edit.uid}/{n}"] = restored[item_id]
+                elif isinstance(edit, SceneFlags):
+                    cur = done.resolve(edit.current_layer) if edit.current_layer is not None else None
+                    if edit.current_layer is not None and cur is None:
+                        continue
+                    page = rm_layer.set_scene_info(
+                        page, author=author, current_layer=cur,
+                        background_visible=edit.background_visible,
+                        root_document_visible=edit.root_document_visible)
+            except (rm_layer.LayerError, RmParseError, ValueError) as err:
+                raise EditError(f"the layer edit does not fit the page: {err}") from err
+            continue
         if isinstance(edit, StrokeAdd):
-            # Strokes drawn one after the other are put on the page together.
+            # Strokes drawn one after the other on the same layer are put on the page together.
             run = [edit]
-            while at < len(edits) and isinstance(edits[at], StrokeAdd):
+            while at < len(edits) and isinstance(edits[at], StrokeAdd) and edits[at].layer == edit.layer:
                 run.append(edits[at])
                 at += 1
-            page = _draw(page, run, author, made)
+            done = Replay(page, made, removed, typed)
+            target_layer = done.resolve(edit.layer) if edit.layer is not None else None
+            page = _draw(page, run, author, made, target_layer)
             continue
         if isinstance(edit, StrokeErase):
             if page is not None:
-                erased = rm_stroke.erase(page, author=author, eraser=edit.line(), anchors=edit.anchor_map())
+                done = Replay(page, made, removed, typed)
+                target_layer = done.resolve(edit.layer) if edit.layer is not None else None
+                erased = rm_stroke.erase(page, author=author, eraser=edit.line(), layer=target_layer,
+                                         anchors=edit.anchor_map())
                 page = erased.page
                 for n, piece in enumerate(erased.made):
                     made[f"{edit.uid}/{n}"] = piece
@@ -1007,8 +1310,10 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 made[edit.uid] = new_id
             continue
         if isinstance(edit, StrokePaste):
+            done = Replay(page, made, removed, typed)
+            target_layer = done.resolve(edit.layer) if edit.layer is not None else None
             try:
-                page, ids = rm_select.append_items(page, author=author, values=edit.lines())
+                page, ids = rm_select.append_items(page, author=author, values=edit.lines(), layer=target_layer)
             except (rm_select.SelectError, rm_stroke.StrokeError) as err:
                 raise EditError(f"the paste does not fit the page: {err}") from err
             made.update((f"{edit.uid}/{n}", item) for n, item in enumerate(ids))
@@ -1035,8 +1340,11 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
         key = bytes.fromhex(edit.key)
         if isinstance(edit, ImageInsert):
             if key not in page_images(page):
+                done = Replay(page, made, removed, typed)
+                target_layer = done.resolve(edit.layer) if edit.layer is not None else None
                 page = rm_writer.append_image(page, author=author, key=key, file_name=edit.file_name,
-                                              vertices=list(edit.vertices), timestamps=edit.timestamps)
+                                              vertices=list(edit.vertices), layer=target_layer,
+                                              timestamps=edit.timestamps)
                 note(edit.uid, key)
             continue
         if not isinstance(edit, (ImageTransform, ImageDelete, ImageRestore)):
@@ -1074,15 +1382,20 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
     return Replay(page, made, removed, typed)
 
 
-def _draw(page: bytes | None, edits: list[StrokeAdd], author: bytes, made: dict[str, tuple[int, int]]) -> bytes | None:
+def _draw(page: bytes | None, edits: list[StrokeAdd], author: bytes, made: dict[str, tuple[int, int]],
+          layer: tuple[int, int] | None = None) -> bytes | None:
     """`page` with the strokes of `edits` drawn on it, in order. One the page has
-    already (the very same line, not yet taken for an edit before this one: an upload
-    that went through without being noticed) is not drawn again."""
+    already (the very same line on the same layer, not yet taken for an edit before this
+    one: an upload that went through without being noticed) is not drawn again."""
     lines, uids = [], []
     taken = set(made.values())
+    by_parent = None
+    if page is not None and layer is not None:
+        by_parent = {s.item: s.parent for s in rm_stroke.strokes(page)}
     for edit in edits:
         line = edit.line()
-        there = next((item for item in rm_stroke.find_strokes(page, line) if item not in taken), None)
+        there = next((item for item in rm_stroke.find_strokes(page, line)
+                      if item not in taken and (by_parent is None or by_parent.get(item) == layer)), None)
         if there is not None:
             taken.add(there)
             if edit.uid:
@@ -1091,7 +1404,7 @@ def _draw(page: bytes | None, edits: list[StrokeAdd], author: bytes, made: dict[
             lines.append(line)
             uids.append(edit.uid)
     if lines:
-        page, ids = rm_stroke.append_strokes(page, author=author, lines=lines)
+        page, ids = rm_stroke.append_strokes(page, author=author, lines=lines, layer=layer)
         made.update((uid, item) for uid, item in zip(uids, ids) if uid)
     return page
 
@@ -1278,6 +1591,69 @@ class StrokeChange:
     readd: tuple[StrokePart, ...] = ()
 
 
+@dataclass(frozen=True)
+class LayerAttachChange:
+    """A layer added (attached=True) or deleted (attached=False), swapped by undo/redo
+    between LayerDelete and LayerReattach."""
+
+    layer: ItemRef
+    current_when_attached: ItemRef | None
+    current_when_detached: ItemRef | None
+    attached: bool
+
+
+@dataclass(frozen=True)
+class LayerRenameChange:
+    """A layer renamed: swapped by undo/redo between old_name and new_name."""
+
+    layer: ItemRef
+    old_name: str
+    new_name: str
+
+
+@dataclass(frozen=True)
+class LayerVisibilityChange:
+    """A layer's visibility changed: swapped by undo/redo between old_visible and new_visible."""
+
+    layer: ItemRef
+    old_visible: bool
+    new_visible: bool
+
+
+@dataclass(frozen=True)
+class LayerMoveChange:
+    """A layer reordered: swapped by undo/redo between old_index and new_index."""
+
+    layer: ItemRef
+    old_index: int
+    new_index: int
+
+
+@dataclass(frozen=True)
+class LayerMergeChange:
+    """A layer merged down into dst (merged=True) or unmerged (merged=False), swapped by
+    undo/redo between LayerUnmerge and LayerMergeDown."""
+
+    src: ItemRef
+    dst: ItemRef
+    moved_groups: tuple[ItemRef, ...]
+    # (item ref in src, block_type, raw value hex, origin ref or None)
+    src_items: tuple[tuple[ItemRef, int, str, ItemRef | None], ...]
+    dst_items: tuple[ItemRef, ...]
+    old_current: ItemRef | None
+    merged: bool = True
+
+
+@dataclass(frozen=True)
+class SceneFlagChange:
+    """SceneInfo bool flag changed ("background_visible" or "root_document_visible"),
+    swapped by undo/redo between old_value and new_value."""
+
+    field: str
+    old_value: bool
+    new_value: bool
+
+
 BODY_TEXT = (1, None, None)         # how a paragraph without a style of its own is stored
 
 
@@ -1296,6 +1672,60 @@ def swapped(changes: tuple, doc_id: str, page_id: str, now_ms: int,
     edits: list[Edit] = []
     back: list = []
     for change in reversed(changes):
+        if isinstance(change, LayerAttachChange):
+            layer = name(change.layer)
+            cur_att = name(change.current_when_attached) if change.current_when_attached is not None else None
+            cur_det = name(change.current_when_detached) if change.current_when_detached is not None else None
+            if change.attached:
+                edits.append(LayerDelete.new(doc_id, page_id, layer, now_ms, new_current=cur_det))
+            else:
+                edits.append(LayerReattach.new(doc_id, page_id, layer, now_ms, set_current=cur_att))
+            back.append(LayerAttachChange(layer, cur_att, cur_det, not change.attached))
+            continue
+        if isinstance(change, LayerRenameChange):
+            layer = name(change.layer)
+            edits.append(LayerRename.new(doc_id, page_id, layer, change.old_name, now_ms))
+            back.append(LayerRenameChange(layer, change.new_name, change.old_name))
+            continue
+        if isinstance(change, LayerVisibilityChange):
+            layer = name(change.layer)
+            edits.append(LayerVisibility.new(doc_id, page_id, layer, change.old_visible, now_ms))
+            back.append(LayerVisibilityChange(layer, change.new_visible, change.old_visible))
+            continue
+        if isinstance(change, LayerMoveChange):
+            layer = name(change.layer)
+            edits.append(LayerMove.new(doc_id, page_id, layer, change.old_index, now_ms))
+            back.append(LayerMoveChange(layer, change.new_index, change.old_index))
+            continue
+        if isinstance(change, LayerMergeChange):
+            src, dst = name(change.src), name(change.dst)
+            groups = tuple(name(g) for g in change.moved_groups)
+            old_cur = name(change.old_current) if change.old_current is not None else None
+            if change.merged:
+                src_items = tuple((name(r), k, v, name(o) if o is not None else None)
+                                  for r, k, v, o in change.src_items)
+                dst_items = tuple(name(r) for r in change.dst_items)
+                unmerge = LayerUnmerge.new(doc_id, page_id, src, dst, groups, src_items, dst_items, old_cur, now_ms)
+                edits.append(unmerge)
+                restored_src = []
+                for n, (ref, kind, raw_hex, orig) in enumerate(src_items):
+                    made_ref = ("edit", f"{unmerge.uid}/{n}")
+                    if aliases is not None:
+                        aliases[ref] = made_ref
+                    restored_src.append((made_ref, kind, raw_hex, orig or ref))
+                back.append(LayerMergeChange(src, dst, groups, tuple(restored_src), (), old_cur, merged=False))
+            else:
+                merge = LayerMergeDown.new(doc_id, page_id, src, now_ms)
+                edits.append(merge)
+                src_items = tuple((name(r), k, v, name(o) if o is not None else None)
+                                  for r, k, v, o in change.src_items)
+                new_dst = tuple(("edit", f"{merge.uid}/{n}") for n in range(len(src_items)))
+                back.append(LayerMergeChange(src, dst, groups, src_items, new_dst, old_cur, merged=True))
+            continue
+        if isinstance(change, SceneFlagChange):
+            edits.append(SceneFlags.new(doc_id, page_id, now_ms, **{change.field: change.old_value}))
+            back.append(SceneFlagChange(change.field, change.new_value, change.old_value))
+            continue
         if isinstance(change, StrokeChange):
             gone = tuple(StrokePart(name(p.ref), p.value, p.origin) for p in change.remove)
             if gone:

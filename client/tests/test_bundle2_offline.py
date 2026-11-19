@@ -586,7 +586,9 @@ class Bundle2QmlTests(unittest.TestCase):
         self.assertGreater(without, 0)                  # the text and the ink are still there
         controller.setBackgroundVisible(True)
         self.assertTrue(self.wait_for(lambda: dark() == with_template))
-        self.assertEqual(self.pending(), [])            # nothing written to the page
+        self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2))
+        self.assertEqual([e.background_visible for e in self.pending()], [False, True])
+        self.assertTrue(parse(self.page()).background_visible)
         self.assertEqual(tq.real_warnings(self.app.warnings), [])
 
     def test_calligraphy_follows_the_right_hand_setting(self):
