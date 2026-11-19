@@ -41,7 +41,7 @@ from typing import Callable
 
 import shiboken6
 from PySide6.QtCore import (Property, QByteArray, QEvent, QObject, QPointF, QTimer, QUrl, Qt, Signal, Slot)
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPointingDevice, QTransform
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPointingDevice
 from PySide6.QtQml import QQmlComponent, QQmlContext, qmlEngine
 from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
@@ -520,7 +520,11 @@ class PenSurface(QQuickPaintedItem):
             return
         to_view = self.view.scene_to_view()
         offset = self.mapFromItem(self.view, QPointF(0, 0))
-        painter.setTransform(QTransform.fromTranslate(offset.x(), offset.y()))
+        # Combined with, never replacing, the transform the painter comes with: on a
+        # HiDPI screen Qt paints this item into a texture of device pixels and hands
+        # over a painter already scaled by the device pixel ratio. Replacing it drew the
+        # preview at 1/ratio of its place: up and to the left of the pen.
+        painter.translate(offset)
         painter.setTransform(to_view, True)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         for _, preview in self._previews:

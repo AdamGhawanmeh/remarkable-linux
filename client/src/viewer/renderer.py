@@ -397,13 +397,15 @@ def _ink_bounds(scene: PageScene, lines: list[TextLine], offsets, measure: Measu
 # --------------------------------------------------------------------- bounds
 
 def render_bounds(scene: PageScene, crop: str = "page", margin: float = 20.0,
-                  measure: Measure = estimate_width) -> tuple[float, float, float, float]:
+                  measure: Measure = estimate_width,
+                  paper: tuple[float, float, float, float] | None = None) -> tuple[float, float, float, float]:
     """(x, y, width, height) of the area to render.
 
     "page" (default, faithful): the page, grown to include any ink or text outside
     it. "content": ink and text only. "clip": exactly the 1404 × 1872 page, cutting
     off anything beyond it, for fixed 3:4 thumbnails. Anchored strokes are measured
-    where they are drawn.
+    where they are drawn. `paper` (x, y, width, height) is the page for "page" when
+    it is not the scene's own 1404 × 1872 (a PDF page's frame).
     """
     if crop == "clip":
         return 0.0, 0.0, float(scene.width), float(scene.height)
@@ -416,7 +418,10 @@ def render_bounds(scene: PageScene, crop: str = "page", margin: float = 20.0,
         return x0 - margin, y0 - margin, x1 - x0 + 2 * margin, y1 - y0 + 2 * margin
     if crop != "page":
         raise ValueError(f"unknown crop mode {crop!r}")
-    x0, y0, x1, y1 = 0.0, 0.0, float(scene.width), float(scene.height)
+    if paper is None:
+        x0, y0, x1, y1 = 0.0, 0.0, float(scene.width), float(scene.height)
+    else:
+        x0, y0, x1, y1 = paper[0], paper[1], paper[0] + paper[2], paper[1] + paper[3]
     if content:
         # Grow only on sides where something really lies outside the page; ink that
         # merely comes close to an edge must not change the page size.

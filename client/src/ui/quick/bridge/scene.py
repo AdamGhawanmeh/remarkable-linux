@@ -519,7 +519,10 @@ class _Controller:
         self.links = links
         self._set("explicitPaperSize", QSize(round(frame.width()), round(frame.height())))
         self._set("primaryContentRect", frame)
-        self._set("boundingRect", bounds)
+        if not self._set("boundingRect", bounds):
+            # Unchanged, but the page was loaded again: DocumentViewport re-applies its
+            # scroll bounds and LayersFoldout re-reads the layers on this signal.
+            getattr(self, self._NOTIFY["boundingRect"]).emit()
 
     @Slot(QPointF, result="QVariantMap")
     def linkAt(self, pos: QPointF) -> dict:
@@ -930,11 +933,15 @@ class _SceneView:
         if self._pen_loading:
             self._pen_rendering, self._pen_loading = self._pen_loading, 0
         layers = content.scene.layers if content.scene is not None else []
+        # The page's own bounds first: set_page then tells DocumentViewport, whose
+        # updateSceneBoundingRect widens them on note pages (a margin below the paper).
+        # The other way round, a reload after an edit put the bare bounds back and the
+        # view jumped.
+        self._tiles._set("sceneBoundingRect", bounds)
         self._controller.set_page(frame, bounds, layers, links)
         # The layer edits go to: Layer 1, the one the app uses until another is chosen.
         node_ids = [layer.node_id for layer in layers]
         self._controller._set("currentLayer", node_ids.index((0, 11)) if (0, 11) in node_ids else max(len(layers) - 1, 0))
-        self._tiles._set("sceneBoundingRect", bounds)
         self._update_viewport()
         self._set("defaultCenter", QPointF(0, frame.height() / 2))
         self._set("sceneExteriorBoundary", bounds)

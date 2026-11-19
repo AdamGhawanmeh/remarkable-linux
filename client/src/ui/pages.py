@@ -105,8 +105,10 @@ class PageContent:
         """"clip": the page frame; "page": the frame plus any ink/text beyond it."""
         frame = self.frame()
         if crop == "page" and self.scene is not None:
-            x, y, w, h = render_bounds(self.scene, "page", measure=qt_measure)
-            frame = frame.united(QRectF(x, y, w, h)) if self.has_pdf_page else QRectF(x, y, w, h)
+            # A PDF page is its frame, not the notebook paper: grown only where ink lies
+            # beyond it (a slide stays 16:9 once drawn on).
+            paper = (frame.x(), frame.y(), frame.width(), frame.height()) if self.has_pdf_page else None
+            frame = QRectF(*render_bounds(self.scene, "page", measure=qt_measure, paper=paper))
         elif crop != "clip" and crop != "page":
             raise ValueError(f"unknown crop mode {crop!r}")
         return frame.x(), frame.y(), frame.width(), frame.height()

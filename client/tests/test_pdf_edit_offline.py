@@ -696,3 +696,190 @@ class QuickTests(unittest.TestCase):
         tools.deactivate()
         self.assertEqual(self.notices, [])
         self.assertEqual(self.tq.real_warnings(self.app.warnings), [])
+
+    # -- the live preview, seen while the pen is still down --
+    @staticmethod
+    def dark(rgb: int) -> bool:
+        """At least half black: an edge is where the stroke covers half the pixel, so a
+        render resampled by a fraction of a pixel (a slide's frame is 3013.33 px wide)
+        keeps its edges."""
+        return max((rgb >> s) & 255 for s in (0, 8, 16)) < 160
+
+    @staticmethod
+    def blue(rgb: int) -> bool:
+        """The lasso's selection blue (#3f86ff), dashes and all."""
+        r, g, b = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
+        return b > 200 and r < 150 and b - r > 80
+
+    def changed(self, before, after, region: QRect, ink=None) -> QRect:
+        """The device pixels of `region` (window coordinates) that became `ink` (default:
+        dark, a black stroke) between two grabs, as a rectangle in device pixels (empty:
+        none). Faint anti-aliasing and the page's own re-renders (its edge, its shadow)
+        do not count."""
+        ink = ink or self.dark
+        dpr = getattr(self, "window_ratio", None) or self.window.devicePixelRatio()   # offscreen grabs say 1
+        box = QRect(round(region.left() * dpr), round(region.top() * dpr),
+                    round(region.width() * dpr), round(region.height() * dpr)).intersected(before.rect())
+        xs, ys = [], []
+        for y in range(box.top(), box.bottom() + 1):
+            for x in range(box.left(), box.right() + 1):
+                a, b = before.pixel(x, y), after.pixel(x, y)
+                if a != b and ink(b) and not ink(a):
+                    xs.append(x)
+                    ys.append(y)
+        return QRect(min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1) if xs else QRect()
+
+    def press_and_move(self, at) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        QTest.mousePress(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at[0])
+        for p in at[1:]:
+            QTest.mouseMove(self.window, p)
+            self.tq.wait(5)
+
+    def release(self, at) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        QTest.mouseRelease(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at)
+
+    def preview_then_kept(self, view, at, hold_ms=0):
+        """Draw through window points `at`: the pixels the live preview changed with the
+        pen still down, then those the kept stroke changed once the page drew it."""
+        surface = self.pens(view).surface
+        region = QRect(QRectF(min(p.x() for p in at), min(p.y() for p in at), 0, 0).toRect().topLeft(),
+                       QRectF(max(p.x() for p in at), max(p.y() for p in at), 0, 0).toRect().topLeft())
+        region = region.adjusted(-60, -60, 60, 60)
+        before = self.window.grabWindow()
+        count = len(self.pending("StrokeAdd"))
+        self.press_and_move(at)
+        if hold_ms:
+            self.tq.wait(hold_ms)
+        self.tq.wait(30)
+        mid = self.window.grabWindow()
+        live = self.changed(before, mid, region)
+        # The same paint as Qt asks for it at device pixel ratios of 1 and 2: the second
+        # must be the first, doubled, in the same place.
+        single = self.hidpi_preview(view, region, ratio=1.0)
+        hidpi = self.hidpi_preview(view, region)
+        self.assert_doubled(hidpi, single, 1.0, ("ratio 1 against 2", single, hidpi))
+        self.release(at[-1])
+        where = (view.property("pageId"), view._tiles._get("scale"), [p.toTuple() for p in at[:1] + at[-1:]])
+        self.assertTrue(self.wait_for(lambda: len(self.pending("StrokeAdd")) == count + 1), (where, self.notices))
+        self.assertTrue(self.wait_for(lambda: not surface._previews), where)     # the page draws it now
+        self.tq.wait(400)
+        after = self.window.grabWindow()
+        kept = self.changed(before, after, region)
+        return live, kept, hidpi
+
+    def assert_doubled(self, hidpi: QRect, box: QRect, dpr: float, where) -> None:
+        """`hidpi` (device pixels at a ratio of 2) shows what `box` (device pixels at
+        `dpr`) does, at the same place: centres within 1.5 window pixels, sizes within 2."""
+        self.assertFalse(hidpi.isEmpty(), where)
+        for a, b, size_a, size_b in ((hidpi.left(), box.left(), hidpi.width(), box.width()),
+                                     (hidpi.top(), box.top(), hidpi.height(), box.height())):
+            centre_2, centre = (a + size_a / 2) / 2, (b + size_b / 2) / dpr
+            self.assertLessEqual(abs(centre_2 - centre), 1.5, where)
+            self.assertLessEqual(abs(size_a / 2 - size_b / dpr), 2, where)
+
+    def hidpi_preview(self, view, region: QRect, ratio: float = 2.0, ink=None) -> QRect:
+        """The preview as a screen of `ratio` device pixels per pixel shows it, in
+        window coordinates x ratio: PenSurface painted as Qt paints a QQuickPaintedItem
+        there, into a texture `ratio` times its size through a painter already scaled by
+        `ratio`, the texture then placed where the item is. (Offscreen Qt cannot show
+        this window at a ratio of 2: the page transition's effect source comes out black.)"""
+        from PySide6.QtGui import QImage
+        surface = self.pens(view).surface
+        image = QImage(round(self.window.width() * ratio), round(self.window.height() * ratio),
+                       QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor("white"))
+        blank = image.copy()
+        painter = QPainter(image)
+        painter.scale(ratio, ratio)
+        corner = surface.mapToScene(QPointF(0, 0))
+        painter.translate(corner)
+        painter.scale(surface.mapToScene(QPointF(1, 0)).x() - corner.x(),
+                      surface.mapToScene(QPointF(0, 1)).y() - corner.y())   # the viewport's own scale
+        surface.paint(painter)
+        painter.end()
+        blank.setDevicePixelRatio(1.0)
+        self.window_ratio = ratio
+        try:
+            return self.changed(blank, image, region, ink)
+        finally:
+            del self.window_ratio
+
+    def test_the_live_preview_is_drawn_on_the_pixels_the_kept_stroke_takes(self):
+        """Mid-drag (before release) the preview must cover the same device pixels the
+        kept stroke then does: on a notebook-like inserted page and on A4, Letter
+        landscape and slide pages, fitted, zoomed out and in, scrolled away from the page's
+        centre, and as a screen with a device pixel ratio of 2 shows it (hidpi_preview).
+        The outline of the lasso and the straightened line held still are checked too."""
+        from ui import pen as pens
+        from ui.quick.bridge.pen import HOLD_MS
+        for page_id in (BLANK, A4, LETTER, SLIDE):
+            view = self.open_document(PDF_DOC, page_id)
+            self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
+            tools = self.pens(view).tools
+            fitted = float(view._tiles._get("scale"))
+            tools.chooseTool("fineliner")                   # in hand (choosing it again puts it down)
+            tools.setSize(max(pens.SIZES))                  # thick enough to be dark when zoomed out
+            for scale, focus in ((fitted, (0.0, 600.0)), (0.35, (-300.0, 1150.0)), (1.6, (250.0, 420.0))):
+                self.assertTrue(tools.property("active"))
+                view._tiles.setFocalPoint(QPointF(*focus), scale)
+                self.tq.wait(400)
+                fx, fy = focus
+                # An L: across, then down (both axes), around the focus, clear of the red squares
+                # and of the strokes already on the Letter page.
+                path = [(fx - 120 / scale + 20 * n / scale, fy - 60 / scale) for n in range(13)] \
+                    + [(fx + 120 / scale, fy - 60 / scale + 20 * n / scale) for n in range(1, 7)]
+                at = [self.window_point(view, x, y) for x, y in path]
+                live, kept, hidpi = self.preview_then_kept(view, at)
+                dpr = self.window.devicePixelRatio()
+                where = (page_id, scale, dpr, live, kept, hidpi)
+                self.assertFalse(live.isEmpty(), where)
+                self.assertFalse(kept.isEmpty(), where)
+                # Where the pointer went, in device pixels (the stroke's ends lie on it).
+                self.assertLess(abs(live.center().x() - (at[0].x() + at[-1].x()) / 2 * dpr), 3 * dpr, where)
+                for edge in ("left", "top", "right", "bottom"):
+                    self.assertLessEqual(abs(getattr(live, edge)() - getattr(kept, edge)()), 1, where)
+                self.assert_doubled(hidpi, live, dpr, where)        # at a device pixel ratio of 2
+
+            # Hold-to-straighten: the straightened preview, still held, against the kept line.
+            view._tiles.setFocalPoint(QPointF(100.0, 700.0), 0.5)
+            self.tq.wait(400)
+            wobbly = [(-300.0 + 30 * n, 700.0 + (6 if n % 2 else -4)) for n in range(21)]
+            at = [self.window_point(view, x, y) for x, y in wobbly]
+            live, kept, hidpi = self.preview_then_kept(view, at, hold_ms=HOLD_MS + 250)
+            dpr = self.window.devicePixelRatio()
+            where = (page_id, "straight", dpr, live, kept, hidpi)
+            self.assertFalse(live.isEmpty(), where)
+            for edge in ("left", "top", "right", "bottom"):
+                self.assertLessEqual(abs(getattr(live, edge)() - getattr(kept, edge)()), 1, where)
+
+            # The lasso's outline runs through the pointer, not up and to the left of it.
+            tools.chooseLasso()
+            view._tiles.setFocalPoint(QPointF(-200.0, 800.0), 0.8)
+            self.tq.wait(400)
+            loop = [(-400.0 + 40 * n, 700.0) for n in range(11)] + [(0.0, 700.0 + 40 * n) for n in range(1, 6)]
+            at = [self.window_point(view, x, y) for x, y in loop]
+            before = self.window.grabWindow()
+            self.press_and_move(at)
+            self.tq.wait(30)
+            region = QRect(at[0], at[-1]).normalized().adjusted(-40, -40, 40, 40)
+            outline = self.changed(before, self.window.grabWindow(), region, self.blue)
+            single = self.hidpi_preview(view, region, ratio=1.0, ink=self.blue)
+            hidpi = self.hidpi_preview(view, region, ink=self.blue)
+            self.assert_doubled(hidpi, single, 1.0, ("lasso, ratio 1 against 2", single, hidpi))
+            self.release(at[-1])
+            self.tq.wait(100)
+            dpr = self.window.devicePixelRatio()
+            where = (page_id, "lasso", dpr, outline, hidpi)
+            self.assertLessEqual(abs(outline.left() - at[0].x() * dpr), 3 * dpr, where)
+            self.assertLessEqual(abs(outline.top() - at[0].y() * dpr), 3 * dpr, where)
+            self.assertLessEqual(abs(outline.right() - at[-1].x() * dpr), 3 * dpr, where)
+            self.assertLessEqual(abs(outline.bottom() - at[-1].y() * dpr), 3 * dpr, where)
+            tools.deactivate()
+            self.tq.EditingTests.close_document(self)
+        self.assertEqual(self.notices, [])
+        self.assertEqual(self.tq.real_warnings(self.app.warnings), [])
+
