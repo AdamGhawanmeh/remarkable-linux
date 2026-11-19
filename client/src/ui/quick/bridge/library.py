@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Any, Callable
 
-from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QObject, QPointF, QSizeF, Qt, QTimer, Signal, Slot,
+from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QObject, QPointF, QSizeF, Qt, QThreadPool, QTimer, Signal, Slot,
                             QEnum)
 
 from core.auth import CERTIFICATE_TIME_ERROR, HANDSHAKE_FAILED, http_error_name
@@ -32,6 +32,7 @@ from core.models import (ROOT_ID, TRASH_ID, Document as DocumentNode, DocumentTr
                          unique_name)
 
 from ...library import PageRef, document_pages, document_tags, has_page_list, pdf_name
+from ...workers import _Job, emit_from_worker
 
 log = logging.getLogger("rm.ui.quick.library")
 
@@ -619,6 +620,20 @@ class DocumentWrapper(EntryWrapper):
         super().__init__(node, library)
         self._refs: list[PageRef] | None = None
         self._pdf_pages: tuple[str, int] | None = None     # (PDF blob hash, pages the viewer found)
+        self._toc_running = 0                               # tables of contents being loaded
+
+    def toc_started(self) -> None:
+        self._toc_running += 1
+        if self._toc_running == 1:
+            self.tocRunningChanged.emit()
+
+    def toc_loaded(self, chapters: list) -> None:
+        """LibraryController.loadTableOfContents is done: tableOfContentsUpdated, then
+        tocRunning goes false (the app's LoadToCTask emits the list when its job ends)."""
+        self.tableOfContentsUpdated.emit(chapters)
+        self._toc_running = max(self._toc_running - 1, 0)
+        if self._toc_running == 0:
+            self.tocRunningChanged.emit()
 
     def _page_layout(self) -> list[tuple]:
         """What the viewport builds its pages from: their ids, PDF pages and templates
@@ -734,6 +749,9 @@ class DocumentWrapper(EntryWrapper):
     viewBackgroundFilter = Property(str, lambda self: str(_content(self._node, "viewBackgroundFilter", "")),
                                     notify=viewBackgroundFilterChanged)
     isImported = Property(bool, lambda self: FILE_TYPES.get(self._node.file_type) in (2, 3), constant=True)
+    # Not in the app's moc metadata (only its notify signal is): whether a table of
+    # contents is being loaded.
+    tocRunning = Property(bool, lambda self: self._toc_running > 0, notify=tocRunningChanged)
 
     # -- pages --
     def _pages(self) -> list[PageRef]:
@@ -1212,17 +1230,30 @@ def _ids(ids: Any) -> list[str]:
     return [str(i) for i in (ids if isinstance(ids, (list, tuple)) else [ids])]
 
 
+_toc_pool: QThreadPool | None = None
+
+
+def _toc_jobs() -> QThreadPool:
+    global _toc_pool
+    if _toc_pool is None:
+        _toc_pool = QThreadPool()
+        _toc_pool.setMaxThreadCount(1)
+    return _toc_pool
+
+
 class LibraryController(QObject):
     """xofm::libs::library::LibraryController: changes from the QML, run as cloud
     commits (Module 6) by `submit(what, change, done)`. Page and notebook editing is not
     part of this client: those calls are accepted and logged."""
 
     entryMoved = Signal(str)
+    _tocLoaded = Signal(str, "QVariantList")        # document id, its DocumentChapters (from a worker)
 
     def __init__(self, library: Library, submit: Callable[[str, Callable, str], None],
                  parent: QObject | None = None,
                  inherit_editing: Callable[[str, str], bool] | None = None) -> None:
         super().__init__(parent)
+        self._tocLoaded.connect(self._toc_done)
         self.library = library
         self.submit = submit
         # (source id, copy id) after a copy is made: a copy of a notebook that may be
@@ -1398,7 +1429,48 @@ class LibraryController(QObject):
 
     @Slot(str)
     def loadTableOfContents(self, document_id: str) -> None:
-        pass
+        """The document's table of contents (ui/docsearch.py table_of_contents), loaded
+        on a worker thread as the app's DocumentWorker LoadTableOfContents job is, and
+        handed to the open document as tableOfContentsUpdated(QList<DocumentChapter>):
+        {name, path, page, level} per entry, `page` a document page (the PDF's page
+        mapped through the page list, so inserted and moved pages are allowed for), -1
+        when it cannot be placed. A document without one gets an empty list. The
+        desktop QML never asks for it (no table of contents panel in reMarkable.exe's
+        QML); the app answers the call all the same."""
+        entry = self.library.entryForId(document_id)
+        if not isinstance(entry, DocumentWrapper):
+            log.info("loadTableOfContents: no document %s", document_id)
+            return
+        node, source = entry.node, self.source()
+        pdf_pages = [p.pdf_page for p in entry._pages()]
+        entry.toc_started()
+
+        def job() -> None:
+            chapters: list = []
+            pdf = None
+            try:
+                from ...docsearch import table_of_contents
+                from ...pages import PdfFile
+                path = source.pdf_path(node) if source is not None else None
+                pdf = PdfFile(path) if path else None
+                epub_name = f"{node.id}.epub"
+                epub = None
+                if source is not None and node.file_type is FileType.EPUB and epub_name in node.files:
+                    epub = lambda: source.blob(node, epub_name)     # noqa: E731
+                chapters = table_of_contents(pdf.doc if pdf is not None else None, pdf_pages, epub)
+            except Exception as err:        # a document without a readable one has none
+                log.warning("table of contents of %s not loaded: %s", node.id, err)
+                chapters = []
+            finally:
+                if pdf is not None:
+                    pdf.close()
+            emit_from_worker(self, lambda: self._tocLoaded.emit(document_id, chapters))
+        _toc_jobs().start(_Job(job))
+
+    def _toc_done(self, document_id: str, chapters) -> None:
+        entry = self.library._entries.get(document_id)
+        if isinstance(entry, DocumentWrapper):
+            entry.toc_loaded(list(chapters or []))
 
     @Slot(str, int)
     def setLastOpenedPage(self, document_id: str, page: int) -> None:

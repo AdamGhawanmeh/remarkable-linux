@@ -139,8 +139,9 @@ undefined: the code page showed "Service environment: Prod" and the sort order w
   — get every member from the spec; behaviour classes implement what this client does
   (SceneView renders the page with `ui/pages.py` through the tile manager's transform;
   the tile manager maps view ↔ scene, zooms and clamps scrolling to the paper;
-  `linkAt` returns the PDF's links). Editing and handwriting conversion members exist
-  and do nothing.
+  `linkAt` returns the PDF's links; `DocumentSearchController` and
+  `PageSearchResultOverlayItem` search and highlight, §5.7). Handwriting conversion
+  members exist and do nothing.
 
 **Behaviour recovered from the binary**, where the QML does not define it:
 `LibraryView::Filter` flags (`NativeDocuments=1, Collections=2, PDFs=4, Ebooks=8,
@@ -1875,6 +1876,120 @@ own, not marked opened**), then three tasks on the new document's worker, the se
   each page's `.rm` (with pending edits), images and page files copied, the pages deleted
   from the source as a pending `PageDelete`; note pages only (a PDF page is refused).
 - Deviation, unchanged: the client does not bump `lastModified` on a page turn (§5.5).
+
+### 5.7 In-document search and tables of contents
+
+Traced in reMarkable.exe 3.29 (`xochitl/src/search/src/documentsearchcontroller.cpp`,
+log category `rm.search`; moc `DocumentSearchController` 0x140cfcc50, static metacall
+0x1405f8230; `PageSearchResultOverlayItem` 0x140cfcc10, metacall 0x1405f7d00, vtable
+0x140cfd2c0) [O]. Client: `client/src/ui/docsearch.py` (finding), `bridge/scene.py`
+(`_SearchController`, `_SearchOverlay`), `bridge/library.py`
+(`LibraryController.loadTableOfContents`).
+
+**QML.** `SearchResultsHeader.qml` (in `DocumentView.qml`; Ctrl+F toggles it, Escape
+hides it) owns a `DocumentSearchController` bound to `document` and
+`currentPageNumber: documentViewport.currentPage`. Typing cancels and, with "Page
+only" ticked (its default), searches `documentView.currentPage` at once; Return in the
+field (`onAccepted`) searches; the `Return` / `Shift+Return` shortcuts (enabled once
+`totalResults > 0`) call `incrementCurrentResultIndex` / `decrementCurrentResultIndex`;
+the label is `currentResultIndex + 1 / totalResults`; the progress bar is
+`lastSearchedPage / pageCount`; `openPage(n)` → `documentViewport.setCurrentPage(n)`;
+`resultLocationChanged(r)` → `tileManager.scrollToMakeSceneRectangleVisible(r, 0, 100,
+0, 100)`. The overlay is `PageSearchResultOverlayItem { visibleResults:
+filteredResults; activeResultIndex: filteredResultIndex; tileManager;
+highlightColor: Colors.searchHighlightBlue (#4034A7FF); activeResultColor:
+Colors.searchActiveBlue (#8035A7FF); highlightMode: ColorHighlights; anchors.fill:
+parent }` inside `DocumentViewport` (so in device pixels on HiDPI screens, §2.1).
+
+**Types** (moc + RTTI strings): `PageSearchResult {page, metrics:
+QList<PageSearchResultMetrics>}` (0x28 bytes), `PageSearchResultMetrics {boundingRect:
+QRectF, baseline}` (0x28 bytes); `HighlightDetails {hasDetails, currentSearchText,
+hasHandwritingOnPage, pageNumber, hasDigitalOnPage}`; `DocumentChapter {name, path,
+page, level}`.
+
+**Controller state** (object offsets): `+0x80` currentResultIndex (global, counted in
+page order over a `std::map<int page, vector<PageSearchResult>>` at `+0xc0`), `+0x88`
+filteredResultIndex, `+0x90` filteredResults, `+0xa8` currentPageNumber, `+0xac`
+running, `+0xb0` lastSearchedPage, `+0xb8` the search's start page, `+0xd8`
+totalResults, `+0xe0`/`+0xe8` cursor (global index, placed flag).
+- `hasNextResult` = `index + 1 < total`; `hasPreviousResult` = `index > 0`.
+- increment (case 0xd): `index + 1 < total` → +1; else if running → nothing; else 0.
+  decrement (0xe): `index < 1` → if running nothing, else `total - 1`; else −1. Both
+  emit `currentResultIndexChanged`, which shows the hit (`focusOnActiveResult`
+  0x1405f4cb0): `getPageAndResultIndex` (0x1405f54e0/0x1405f3fd0, walks pages 0..max)
+  → filteredResults = that page's hits, filteredResultIndex = index on it; a page
+  other than `+0xa8` is stored there and `openPage` emitted (not
+  `currentPageNumberChanged`); then `resultLocationChanged(resultLocation())`.
+- `resultLocation()` (0x1405f6600) = `filteredResults[filteredResultIndex].metrics[0]
+  .boundingRect`, an empty QRectF when there is none.
+- setting `currentPageNumber` (0x1405f4850): filteredResults = that page's hits,
+  filteredResultIndex = the active one if it is there, else −1.
+- `search(term, page = 0, pageOnly = false)` (0x1405f6710): logs "Search: {} for page:
+  {} in doc {} {}"; no document → "Can't search without a documentWrapper"; empty
+  term, or only white space → nothing. Otherwise the start page is stored and a
+  worker searches (0x1405f68e0 → 0x1405f70e0: results arrive per page through
+  `acceptSearchResults` 0x1405f36d0, which stores them, places the cursor when the
+  start page arrives — first hit of the last page ≤ start page with any, else 0
+  (0x1405f3a90) — shows it (`focusOnPageOfInterest` 0x1405f4ff0), emits
+  `totalResultsChanged` and `lastSearchedPageChanged(page)`; the finish handler
+  0x1405f4ba0 places the cursor if that never happened).
+- `cancel()` (0x1405f3d70): drops all results, total 0, filteredResults empty,
+  currentPageNumber −1, lastSearchedPage −1, currentResultIndex 0,
+  filteredResultIndex −1, the worker released. Setting another `document` cancels.
+- `forwardHighlightDetails(page, details)` (0x1405f51b0): a valid details' text is
+  searched on that page only. Neither it nor `forwardLibrarySearcher` is called by the
+  desktop QML.
+
+**Overlay paint** (0x1405f9d70): for every metric of every visible result, `rect =
+tileManager.sceneToView(boundingRect)` (0x1403fd740) `.toRect()`; the page's tile
+image under it is drawn first (SourceOver, 0x1403fca80), then ColorHighlights fills
+with `activeResultColor` for `i == activeResultIndex` else `highlightColor` in
+CompositionMode_Darken (16); InvertAndGrayHighlights fills the active one with white in
+Difference (22) and the others with dark gray in Darken. `setTileManager` (0x1405fa120)
+connects the tile manager's `transformChanged` to `updateIfVisible` (0x1405fa400: `update()`
+if visible). `setVisibleResults` (0x1405fa300) repaints only when the list changed.
+
+**Where the hits come from.** `PdfRenderer::search` (PDFium, run out of process) for
+PDF pages and the EPUB's PDF; `searchPageScene` / `accumulateTypedHighlights` for typed
+text (glyph metrics of the text layout); handwriting through the library's
+`LibrarySearcher` (hws). The client: QtPdf (PDFium too) `getAllText` and
+`getSelectionAtIndex(...).bounds()` per character, merged per line, at 226/72 px per
+point with the page centred on x = 0 (§5.2, §5.4); typed text through
+`renderer.layout_text` with the app's fonts (the caret's x at both ends of the hit on
+each line, so the box is the editor's selection box); case-insensitive (casefold),
+white space runs alike. Each document page is searched through its own `redir`
+(`PageRef.pdf_page`): inserted pages have no PDF text, moved and duplicated pages
+theirs. Corpus (`client/tools/search_toc_corpus.py`, read-only): PDFium boxes are tight
+to the outlines, the rendered glyphs' anti-aliasing reaches ≤ 0.4 pt past them (as in
+the app, which uses the same boxes); some PDFs give zero-height or zero-width boxes
+(made 1 pt thick here) and the tablet's EPUB renditions set running text above the
+page's top (not found here: it is never seen).
+
+**Deviations.** The app re-shows the cursor's hit each time another page's results
+arrive while it searches (`focusOnPageOfInterest` with the flag set), pulling the view
+back if one has stepped on; the client shows it once. The page's tile image is not
+redrawn under the boxes: the overlay draws over the page instead (same tint on white
+paper). Handwriting is not searched.
+
+**Tables of contents.** `LibraryController.loadTableOfContents(entry::Id)` (moc slot;
+the document worker's `LoadTableOfContents` job, `requestLoadTableOfContents`
+0x14056c7d0 → `doLoadTableOfContents` 0x14055e090, `LoadToCTask`) ends in the
+document's `tableOfContentsUpdated(QList<DocumentChapter>)`, with `tocRunningChanged`
+around it. `PdfRenderer::chapters` reads the outline (out of process); `EpubRenderer`
+reads the book's navigation (its metadata dump logs "[%d]: title='%s', target='%s',
+level=%d") and `xofm::libs::epub::ChapterPositionTracker` (QML element, `toc`,
+`pageCount`) places chapters on its own layout. No desktop QML calls
+`loadTableOfContents` or shows the list: there is no table of contents panel in
+reMarkable.exe 3.29's QML. The client answers it all the same: the PDF's outline
+(QPdfBookmarkModel, depth first, `level` from 0 — the app's base level is not traced),
+each PDF page mapped to the first document page showing it, else the first showing a
+later PDF page (a deleted chapter page lands on what follows), else −1; for an EPUB
+without an outline in its rendition, the EPUB 3 `nav` (`epub:type="toc"`) or the EPUB 2
+NCX, `path` = the entry's target in the book, each entry placed on the first page at or
+after the previous entry's whose rendition text holds its title (the client has no EPUB
+layout engine), else on the previous entry's page. The cached library: 6 of 75 PDFs and
+EPUBs with a cached rendition have an outline (111 entries); no cached EPUB has its
+`.epub` blob (fetched on demand), and their renditions have no outline.
 
 ## 6. Implications for the Linux client
 

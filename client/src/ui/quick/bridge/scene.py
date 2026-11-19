@@ -39,6 +39,7 @@ manager's view coordinates are the SceneView item's.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from enum import IntEnum
 from typing import Callable
@@ -59,6 +60,7 @@ from viewer import rm_text
 from viewer.rm_stroke import rotation_of as s_rotation_of
 from viewer.renderer import qt_measure
 
+from ... import docsearch
 from ... import editing
 from ... import selection as selecting
 from ... import textedit
@@ -331,13 +333,85 @@ def pdf_links(pdf, pdf_page: int, frame: QRectF, page_of_pdf: dict[int, int]) ->
 PAGE_NONE, PAGE_READY, PAGE_LOAD_ERROR = (Page.StatusCode[k].value for k in ("None", "Ready", "LoadError"))
 
 
-class _PaintedNothing:
+class _SearchOverlay:
+    """PageSearchResultOverlayItem: the search hits on the page shown, drawn over it
+    (DocumentView.qml puts it in DocumentViewport, filling it, above the page).
+
+    As the app's paint (0x1405f9d70): every metric of every visible result is mapped
+    through the tile manager (sceneToView) and rounded to whole pixels (QRectF::toRect),
+    then filled with activeResultColor for the result at activeResultIndex, else
+    highlightColor; ColorHighlights fills with CompositionMode_Darken,
+    InvertAndGrayHighlights the active one with Difference against white and the others
+    with Darken against dark gray. The app first copies the page's tile image under each
+    rectangle (the item's own buffer is transparent), so Darken blends with the page;
+    here the item is drawn over the page instead, which gives the same tint on white
+    paper. A transform change of the tile manager repaints it (updateIfVisible), as the
+    app connects them in setTileManager (0x1405fa120).
+
+    Coordinates: the item's own, which are DocumentViewport's (device pixels on a HiDPI
+    screen: DocumentView lays the viewport out at dpr x its size, scaled by 1/dpr) and so
+    the tile manager's view coordinates. The painter arrives already carrying the item's
+    scene graph scale; it is only ever added to, never replaced (bridge/pen.py PenSurface
+    learned that the hard way)."""
+
+    _DEFAULTS = {"activeResultIndex": -1, "visibleResults": []}
+
+    def __init__(self, parent: QQuickItem | None = None) -> None:
+        QQuickPaintedItem.__init__(self, parent)
+        self._watched_tiles = None
+
+    def _property_changed(self, name: str) -> None:
+        if name == "tileManager":
+            self._watch(self._get("tileManager"))
+        self.update()
+
+    def _watch(self, tiles) -> None:
+        old, self._watched_tiles = self._watched_tiles, None
+        if old is not None and shiboken6.isValid(old):
+            try:
+                old.transformChanged.disconnect(self.updateIfVisible)
+            except (RuntimeError, TypeError):
+                pass
+        if tiles is not None and shiboken6.isValid(tiles):
+            tiles.transformChanged.connect(self.updateIfVisible)
+            self._watched_tiles = tiles
+
+    @Slot()
+    def updateIfVisible(self) -> None:
+        if self.isVisible():
+            self.update()
+
+    def view_rects(self) -> list[tuple[int, QRect]]:
+        """(result index, rectangle in item coordinates) for every metric drawn."""
+        tiles = self._get("tileManager")
+        if tiles is None or not shiboken6.isValid(tiles):
+            return []
+        out = []
+        for index, found in enumerate(_js(self._get("visibleResults")) or []):
+            for m in (found or {}).get("metrics") or []:
+                rect = m.get("boundingRect") if isinstance(m, dict) else None
+                if not isinstance(rect, QRectF):
+                    continue
+                out.append((index, tiles.sceneToView(QRectF(rect)).toRect()))
+        return out
+
     def paint(self, painter: QPainter) -> None:
-        pass
+        active = int(self._get("activeResultIndex"))
+        invert = int(self._get("highlightMode")) == 1
+        for index, rect in self.view_rects():
+            if invert and index == active:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Difference)
+                color = QColor(Qt.GlobalColor.white)
+            elif invert:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Darken)
+                color = QColor(Qt.GlobalColor.darkGray)
+            else:
+                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Darken)
+                color = QColor(self._get("activeResultColor" if index == active else "highlightColor"))
+            painter.fillRect(QRectF(rect), color)
 
 
-# Search highlights: nothing to show without search.
-PageSearchResultOverlayItem = qml_class("PageSearchResultOverlayItem", QQuickPaintedItem, _PaintedNothing)
+PageSearchResultOverlayItem = qml_class("PageSearchResultOverlayItem", QQuickPaintedItem, _SearchOverlay)
 
 
 class _SelectionImage:
@@ -381,7 +455,293 @@ class _SelectionImage:
 
 
 SelectionImage = qml_class("SelectionImage", QQuickPaintedItem, _SelectionImage)
-DocumentSearchController = qml_class("DocumentSearchController")
+
+
+# -- in-document search -----------------------------------------------------------------
+
+_search_pool: QThreadPool | None = None
+
+
+def _searches() -> QThreadPool:
+    """One search runs at a time; a cancelled one stops at its next page (it checks
+    before and after each), so the next one queued behind it starts at once."""
+    global _search_pool
+    if _search_pool is None:
+        _search_pool = QThreadPool()
+        _search_pool.setMaxThreadCount(1)
+    return _search_pool
+
+
+class _SearchController:
+    """DocumentSearchController (SearchResultsHeader.qml, Ctrl+F): finds a term in the
+    document and steps through the hits; ui/docsearch.py does the finding.
+
+    As the app's (xochitl src/search/documentsearchcontroller.cpp, metacall 0x1405f8230):
+    results are kept per document page; a hit's global index counts in page order;
+    currentResultIndex is that index, filteredResults the hits on one page (the active
+    hit's page, or currentPageNumber's after the view turned to another page) and
+    filteredResultIndex the active hit among them (-1 when it is on another page).
+    search(term, page, pageOnly) searches every page in order, 0 first (lastSearchedPage
+    is the progress bar), or with pageOnly just `page`; an empty or blank term, or no
+    document, searches nothing. When `page` has been searched the cursor is placed
+    (0x1405f3a90): on the first hit of the last page at or before `page` that has any,
+    else on hit 0; it is shown: openPage(page) if the hit is on another page, then
+    resultLocationChanged(its first rectangle), which DocumentView scrolls into view.
+    incrementCurrentResultIndex/decrementCurrentResultIndex step by one and wrap around,
+    except while the search is still running (0x1405f8230 cases 0xd, 0xe). cancel()
+    (0x1405f3d70) drops everything: no results, currentPageNumber and lastSearchedPage
+    -1, currentResultIndex 0, filteredResultIndex -1. Changing `document` cancels.
+
+    Not as the app: the app shows the cursor's hit again each time another page's
+    results come in while it searches, which pulls the view back if one has stepped
+    on meanwhile; here it is shown once, as soon as there is one. The search runs on a
+    worker thread; each search has a generation and results of an older one are
+    dropped, so typing never leaves stale hits."""
+
+    _DEFAULTS = {"currentResultIndex": 0, "filteredResultIndex": -1, "lastSearchedPage": -1,
+                 "currentPageNumber": -1, "filteredResults": []}
+
+    _pageSearched = Signal(int, int, "QVariantList")        # generation, page, results
+    _searchFinished = Signal(int)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        QObject.__init__(self, parent)
+        self._generation = 0
+        self._cancelled = None
+        self._by_page: dict[int, list] = {}
+        self._start = 0
+        self._placed = False
+        self._shown = False
+        self._cursor = 0
+        self._library_searcher = None
+        self._pageSearched.connect(self._on_page)
+        self._searchFinished.connect(self._on_finished)
+
+    def _property_changed(self, name: str) -> None:
+        if name == "document":
+            self.cancel()
+        elif name == "currentPageNumber":
+            self._filter(int(self._get("currentPageNumber")))
+
+    # -- results --
+    def _total(self) -> int:
+        return int(self._get("totalResults"))
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        """(page, index on the page) of global hit `index`, (-1, -1) if there is none."""
+        if index < 0:
+            return -1, -1
+        seen = 0
+        for page in sorted(self._by_page):
+            count = len(self._by_page[page])
+            if index < seen + count:
+                return page, index - seen
+            seen += count
+        return -1, -1
+
+    def _first_at_or_before(self, page: int) -> int:
+        seen, cursor = 0, 0
+        for p in sorted(self._by_page):
+            if p > page:
+                break
+            if self._by_page[p]:
+                cursor = seen
+            seen += len(self._by_page[p])
+        return cursor
+
+    def _nav(self) -> None:
+        index, total = int(self._get("currentResultIndex")), self._total()
+        self._set("hasNextResult", index + 1 < total)
+        self._set("hasPreviousResult", index > 0)
+
+    def _filter(self, page: int) -> None:
+        """currentPageNumber changed (0x1405f4850): that page's hits; the active one
+        among them if it is there."""
+        active_page, active = self._locate(int(self._get("currentResultIndex")))
+        self._set("filteredResults", list(self._by_page.get(page, [])))
+        self._set("filteredResultIndex", active if active_page == page and page >= 0 else -1)
+
+    def _focus(self) -> None:
+        """focusOnActiveResult (0x1405f4cb0)."""
+        page, active = self._locate(int(self._get("currentResultIndex")))
+        self._set("filteredResults", list(self._by_page.get(page, [])))
+        self._set("filteredResultIndex", active)
+        if page != -1 and page != int(self._get("currentPageNumber")):
+            self._values["currentPageNumber"] = page       # as the app: no notify, openPage
+            self.openPage.emit(page)
+        if active != -1 and self._get("filteredResults"):
+            self.resultLocationChanged.emit(self.resultLocation())
+        self._nav()
+
+    def _place(self) -> None:
+        self._placed = True
+        self._cursor = self._first_at_or_before(self._start)
+        self._show()
+
+    def _show(self) -> None:
+        if self._placed and not self._shown and self._total() > 0:
+            self._shown = True
+            self._set("currentResultIndex", self._cursor)
+            self._focus()
+
+    def _on_page(self, generation: int, page: int, results) -> None:
+        if generation != self._generation:
+            return
+        results = list(results or [])
+        self._by_page[page] = results
+        if results:
+            self._set("totalResults", self._total() + len(results))
+        if page == self._start and not self._placed:
+            self._place()
+        else:
+            self._show()
+        if page == int(self._get("currentPageNumber")) and not self._shown:
+            self._filter(page)
+        self._set("lastSearchedPage", page)
+        self._nav()
+
+    def _on_finished(self, generation: int) -> None:
+        if generation != self._generation:
+            return
+        self._cancelled = None
+        if not self._placed:
+            self._place()
+        self._set("running", False)
+        self._nav()
+        self.totalResultsCountUpdated.emit(self._total())
+
+    # -- QML API --
+    @Slot(str)
+    @Slot(str, int)
+    @Slot(str, int, bool)
+    def search(self, term: str, page: int = 0, page_only: bool = False) -> None:
+        document = self._get("document")
+        node = getattr(document, "node", None) if document is not None and shiboken6.isValid(document) else None
+        log.info("Search: %r for page: %d in doc %s %s", term, page, getattr(node, "id", None), page_only)
+        if node is None:
+            log.info("Can't search without a documentWrapper")
+            return
+        if not term:
+            log.info("empty search term..")
+            return
+        if not term.strip():
+            log.info("search term contains only whitespace")
+            return
+        source = _source()
+        if source is None:
+            return
+        self._reset(keep_page=True)     # the app's search keeps the page it was told of
+        self._start = max(int(page), 0)
+        self._generation += 1
+        generation, cancelled = self._generation, threading.Event()
+        self._cancelled = cancelled
+        self._set("running", True)
+        start, only = self._start, bool(page_only)
+
+        def report(index: int, results: list) -> None:
+            emit_from_worker(self, lambda: self._pageSearched.emit(generation, index, results))
+
+        def job() -> None:
+            pages = None
+            try:
+                if cancelled.is_set():
+                    return
+                pages = DocumentPages(source, node)
+                count = len(pages.pages)
+                indices = ([start] if start < count else []) if only else range(count)
+                docsearch.search_pages(pages, term, indices, report, cancelled)
+            except Exception as err:
+                if not isinstance(err, EXPECTED_ERRORS):
+                    log.exception("searching %s", node.id)
+                else:
+                    log.warning("cannot search %s: %s", node.id, err)
+            finally:
+                if pages is not None:
+                    pages.close()
+                emit_from_worker(self, lambda: self._searchFinished.emit(generation))
+        _searches().start(_Job(job))
+
+    def _reset(self, keep_page: bool = False) -> None:
+        if self._cancelled is not None:
+            self._cancelled.set()
+            self._cancelled = None
+        self._generation += 1
+        self._by_page = {}
+        self._start = 0
+        self._placed = self._shown = False
+        self._cursor = 0
+        self._set("totalResults", 0)
+        self._set("filteredResults", [])
+        if not keep_page:
+            self._set("currentPageNumber", -1)
+        self._set("lastSearchedPage", -1)
+        self._set("currentResultIndex", 0)
+        self._set("filteredResultIndex", -1)
+        self._set("running", False)
+        self._nav()
+
+    @Slot()
+    def cancel(self) -> None:
+        log.debug("Cancel: %s %s", getattr(getattr(self._get("document"), "node", None), "id", None),
+                  self._get("running"))
+        self._reset()
+
+    @Slot()
+    def incrementCurrentResultIndex(self) -> None:
+        index, total = int(self._get("currentResultIndex")), self._total()
+        if index + 1 < total:
+            index += 1
+        elif self._get("running") or total == 0:
+            return
+        else:
+            index = 0
+        self._set("currentResultIndex", index)
+        self._shown = True
+        self._focus()
+
+    @Slot()
+    def decrementCurrentResultIndex(self) -> None:
+        index, total = int(self._get("currentResultIndex")), self._total()
+        if index < 1:
+            if self._get("running") or total == 0:
+                return
+            index = total
+        self._set("currentResultIndex", index - 1)
+        self._shown = True
+        self._focus()
+
+    @Slot(result=QRectF)
+    def resultLocation(self) -> QRectF:
+        """The active hit's first rectangle, if it is among filteredResults."""
+        found = _js(self._get("filteredResults")) or []
+        index = int(self._get("filteredResultIndex"))
+        if 0 <= index < len(found):
+            metrics = (found[index] or {}).get("metrics") or []
+            if metrics and isinstance(metrics[0].get("boundingRect"), QRectF):
+                return QRectF(metrics[0]["boundingRect"])
+        return QRectF()
+
+    @Slot(int, "QVariant")
+    def forwardHighlightDetails(self, page: int, details) -> None:
+        """A document opened from a library search shows that search's hits on the page
+        (0x1405f51b0): the details' currentSearchText searched on `page` only."""
+        details = _js(details)
+        get = details.get if isinstance(details, dict) else (lambda key, default=None: getattr(details, key, default))
+        log.info("forwardHighlightDetails: intended page is #%d", page)
+        if not get("hasDetails", True):
+            return
+        text = get("currentSearchText", "") or ""
+        if text.strip():
+            self.search(str(text), int(page), True)
+
+    @Slot(QObject)
+    def forwardLibrarySearcher(self, searcher) -> None:
+        """The library's handwriting searcher, which the app asks for handwritten hits;
+        this client has no handwriting search, so it is only kept."""
+        self._library_searcher = searcher
+
+
+DocumentSearchController = qml_class("DocumentSearchController", behaviour=_SearchController)
 
 
 # -- tile manager ---------------------------------------------------------------------
