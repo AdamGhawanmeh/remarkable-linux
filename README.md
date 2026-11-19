@@ -144,7 +144,7 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 838 offline tests use a fake cloud and synthetic documents; they need no account
+The 846 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
 `client/tools/rm_roundtrip.py` checks the page writer against your own cached pages:
 every page must come back byte for byte, and take an image, a move and a delete without

@@ -2043,11 +2043,21 @@ root group item). Real cached pages show up to 8 root group items with 6 detache
   groups) are moved to `dst` via `SceneTree::moveNode` (`0x1408de730`, adding a group item
   in `dst` and appending a `SceneTreeMove` to `dst`); non-group items (lines, images, etc.)
   are cloned (`id = 0:0, parent = 0:0, moveId = 0:0`, timestamps kept; shader `sourceId`s
-  renamed via `0x1408cb8d0`), appended to `dst`, and deleted from `src`. `src` is then
-  detached via `SceneTree::deleteNode`, and if `srcIdx <= oldCur` then
-  `currentLayer = oldCur - 1`. Undo deletes the clones from `dst`, re-attaches `src`,
+  renamed via `0x1408cb8d0`), appended to `dst`, and deleted from `src`, groups and
+  clones going to `dst` in `src`'s sequence order (so a group between two strokes stays
+  between their clones). `src` is then detached via `SceneTree::deleteNode`, and if
+  `srcIdx <= oldCur` then `currentLayer = oldCur - 1`. A real cached merge confirms the
+  id allocation: clones take contiguous ids appended at `dst`'s tail with no `moveId`,
+  then `deleteNode` takes the next id and `SceneInfo` field 1 the one after. Undo deletes the clones from `dst`, re-attaches `src`,
   restores `src`'s deleted items right after their deleted slots (`0x1408cbd60`), moves
   the child groups back to `src`, and restores `oldCur`.
+- **Re-attach position (client deviation):** re-attaching (redo of add, undo of delete,
+  undo of merge) reuses the layer's old root `CrdtGroupItem`. Every reorder deletes a
+  layer's root group item and inserts a new one at the target, so after another layer
+  moved (and was moved back by undo) the reused slot can sit on the wrong side of it,
+  and the layer would come back at another z-position. The client records the layer's
+  index with the undo step and, when the re-attached layer is elsewhere, reorders it
+  there with the same delete + insert `reorderNode` writes (no new block shapes).
 - **SceneInfo (0x0D) flags (`setCurrentLayer` 0x140958470 → 0x1408aa470;
   `setBackgroundVisible` 0x1409583c0 → 0x1408aa340; `setRootDocumentVisible` 0x14095e5e0 →
   0x1408aad70):** field 1 (`currentLayer`, LWW id), field 2 (`backgroundVisible`, LWW bool),
@@ -2066,7 +2076,13 @@ root group item). Real cached pages show up to 8 root group items with 6 detache
   `layerSelected = (i == currentLayer)`, `layerMoveUpEnabled = (i < n - 1)`,
   `layerMoveDownEnabled = (i > 0)`, `layerMergeEnabled = (i > 0)`,
   `layerTrashEnabled = (n > 1)`). `LayersFoldout.qml` rotates the repeater 180° so index
-  `n - 1` sits at the top and index `0` at the bottom.
+  `n - 1` sits at the top and index `0` at the bottom. Keyboard focus (client): every
+  layer change resets the model, destroying the clicked row button, and the rename
+  field / New layer row keep or drop focus inside the foldout; Undo/Redo are
+  ProxyActions resolved from the focused item (`main.qml` `actionHandler`, which skips
+  the window's root item), so Ctrl+Z / Ctrl+Y went nowhere until the page was clicked.
+  `SceneView.refocus_viewport` hands focus back to `DocumentViewport` after a model reset
+  or a rename when focus fell to the root item or a non-text control of the foldout.
 
 ## 6. Implications for the Linux client
 

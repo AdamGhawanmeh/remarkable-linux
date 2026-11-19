@@ -80,6 +80,16 @@ def pixel_rgb(scene, x_scene: float, y_scene: float) -> tuple[int, int, int]:
     return c.red(), c.green(), c.blue()
 
 
+def two_layer_page() -> bytes:
+    """Layer 1 with a thick blue horizontal stroke, Layer 2 with a thick red vertical one
+    crossing it at (0, 500): the crossing shows the top layer's colour."""
+    page = s.append_stroke(w.blank_page(TABLET), author=TABLET,
+                           line=stroke_line(-150.0, 500.0, 150.0, 500.0, color=int(Color.BLUE)), layer=w.LAYER_1)
+    page, l2 = ly.add_layer(page, author=TABLET)
+    return s.append_stroke(page, author=TABLET, line=stroke_line(0.0, 350.0, 0.0, 650.0, color=int(Color.RED)),
+                           layer=l2)
+
+
 def layer_cloud(page_bytes: bytes | None = None, template: str = TEMPLATE) -> FakeCloud:
     content = te.notebook_content(PAGE1, PAGE2)
     for entry in content["cPages"]["pages"]:
@@ -87,8 +97,7 @@ def layer_cloud(page_bytes: bytes | None = None, template: str = TEMPLATE) -> Fa
     cloud = FakeCloud()
     files = {f"{THROWAWAY}/{PAGE1}.rm": page_bytes} if page_bytes is not None else {}
     cloud.put_item(THROWAWAY, te.meta("throwaway"), content, files)
-    cloud.put_item(OTHER, te.meta("ReadOnly"), content,
-                   {f"{OTHER}/{PAGE1}.rm": w.blank_page(TABLET)})
+    cloud.put_item(OTHER, te.meta("ReadOnly"), content, {f"{OTHER}/{PAGE1}.rm": two_layer_page()})
     return cloud
 
 
@@ -221,6 +230,37 @@ class RmLayerTests(unittest.TestCase):
         self.assertEqual((len(back.layers[0].strokes), len(back.layers[0].images)), (0, 0))
         self.assertEqual((len(back.layers[1].strokes), len(back.layers[1].images)), (2, 1))
         self.assertEqual(len(restored_map), 2)
+
+    def test_merge_down_keeps_groups_between_strokes_in_z_order(self):
+        # Layer 2 holds stroke A, then a child group G (a text-anchored group, say), then
+        # stroke B. The app walks src in sequence order (0x14095d840), so dst must get
+        # A', G, B' in that order: G stays above A and below B.
+        page, l2 = ly.add_layer(w.blank_page(TABLET), author=DESKTOP)
+        page = s.append_stroke(page, author=DESKTOP, line=stroke_line(-90, 300, 90, 300), layer=l2)
+        header, blocks = w.split(page)
+        clock = w.highest_counter(blocks)
+        grp, grp_item = (2, clock + 1), (2, clock + 2)
+        ly._insert_tree_move(blocks, w.new_block(w.BLOCK_TREE_MOVE, w.encode_tree_move(grp, w.ZERO_ID, 1, l2)))
+        ly._insert_tree_node(blocks, w.new_block(
+            w.BLOCK_TREE_NODE, w.f_id(1, grp) + w.f_sub(2, w.lww(w.ZERO_ID, w.string_value("")))
+            + w.f_sub(3, w.f_id(1, w.ZERO_ID) + w.f_u8(2, 1))))
+        node = sel._Node(blocks, l2)
+        node.append(grp_item, b"\x02" + w.f_id(2, grp), (w.BLOCK_GROUP_ITEM, *w.BLOCK_VERSIONS[w.BLOCK_GROUP_ITEM]))
+        page = w.join(header, node.write(blocks))
+        page = s.append_stroke(page, author=DESKTOP, line=stroke_line(-90, 700, 90, 700), layer=l2)
+
+        merged = ly.merge_layer_down(page, author=DESKTOP, layer=l2)
+        blocks = w.split(merged.page)[1]
+        kinds = []
+        for _, block in w.sequence(blocks, w.LAYER_1):
+            item = w.decode_item(block.payload)
+            if item.value is not None and not item.deleted_length:
+                kinds.append("group" if block.type == w.BLOCK_GROUP_ITEM else "line")
+        self.assertEqual(kinds, ["line", "group", "line"])
+        self.assertEqual(merged.moved_groups, (grp,))
+        self.assertEqual(w.tree_parents(blocks)[grp], w.LAYER_1)
+        ys = [st.points[0].y for st in parse(merged.page).layers[0].strokes]
+        self.assertEqual([round(y) for y in ys], [300, 700])
 
     def test_delete_layer_and_reattach_and_refuse_last(self):
         page = w.blank_page(TABLET)
@@ -368,6 +408,129 @@ class LayerEditsLibraryTests(unittest.TestCase):
         self.assertEqual([l.name for l in reloaded.layers], ["Layer 1", "Ink"])
         self.assertFalse(reloaded.background_visible)
         self.assertEqual((len(reloaded.layers[1].strokes), len(reloaded.layers[1].images)), (1, 1))
+
+    def snapshot(self):
+        """What the page shows: layers bottom to top (name, visible, strokes in z-order,
+        images), and the SceneInfo flags."""
+        sc = self.scene()
+        return ([(l.name, l.visible, [tuple((round(p.x, 2), round(p.y, 2)) for p in st.points) for st in l.strokes],
+                  [i.image_ref for i in l.images]) for l in sc.layers], sc.background_visible, sc.root_document_visible)
+
+    def test_multi_step_undo_all_then_redo_all_restores_every_state(self):
+        # One mutation of each kind, chained, then Ctrl+Z all the way down and Ctrl+Y all
+        # the way back up: every intermediate page must come back exactly (layer order,
+        # names, visibility, each layer's strokes in z-order, images, flags).
+        steps = [
+            lambda t: self.source.add_stroke(self.doc, PAGE1, stroke_line(-100, 300, 100, 300, int(Color.BLUE)), t,
+                                             layer_index=0),
+            lambda t: self.source.add_layer(self.doc, PAGE1, t),
+            lambda t: self.source.add_stroke(self.doc, PAGE1, stroke_line(0, 200, 0, 400, int(Color.RED)), t,
+                                             layer_index=1),
+            lambda t: self.source.rename_layer(self.doc, PAGE1, 1, "Ink", t),
+            lambda t: self.source.add_layer(self.doc, PAGE1, t),
+            lambda t: self.source.insert_image(self.doc, PAGE1, te.png(), "png", te.box(), t, layer_index=2),
+            lambda t: self.source.move_layer(self.doc, PAGE1, 2, 0, t),
+            lambda t: self.source.set_layer_visible(self.doc, PAGE1, 1, False, t),
+            lambda t: self.source.erase_strokes(self.doc, PAGE1, s.eraser_line([(-0.5, 150.0), (-0.5, 450.0)], s.MEDIUM),
+                                                t, layer_index=2),
+            lambda t: self.source.merge_layer_down(self.doc, PAGE1, 2, t),
+            lambda t: self.source.set_background_visible(self.doc, PAGE1, False, t),
+            lambda t: self.source.set_root_document_visible(self.doc, PAGE1, False, t),
+            lambda t: self.source.delete_layer(self.doc, PAGE1, 0, t),
+        ]
+        states = [self.snapshot()]
+        t = NOW
+        for step in steps:
+            t += 1
+            self.assertIsNotNone(step(t))
+            states.append(self.snapshot())
+            self.assertNotEqual(states[-1], states[-2])
+        for n in range(len(steps), 0, -1):
+            t += 1
+            self.assertTrue(self.source.undo(self.doc, PAGE1, t))
+            self.assertEqual(self.snapshot(), states[n - 1], f"undo of step {n}")
+        self.assertEqual(self.source.history_state(self.doc, PAGE1), (False, True))
+        for n in range(1, len(steps) + 1):
+            t += 1
+            self.assertTrue(self.source.redo(self.doc, PAGE1, t))
+            self.assertEqual(self.snapshot(), states[n], f"redo of step {n}")
+        self.assertEqual(self.source.history_state(self.doc, PAGE1), (True, False))
+
+    def test_reattached_layers_come_back_where_they_were_after_other_layers_moved(self):
+        # Re-attaching reuses the layer's old root group item; a layer moved since (each
+        # move puts a new group item for it in the root) can leave that slot above or below
+        # the wrong neighbours. Redo of an add, undo of a delete and undo of a merge must
+        # put the layer back at its own index anyway.
+        t = NOW
+        script = [("add",), ("move", 0, 1), ("move", 0, 1), ("del", 0), ("add",), ("del", 0), ("add",)]
+        states = [[l.name for l in self.scene().layers]]
+        for op in script:
+            t += 1
+            if op[0] == "add":
+                self.source.add_layer(self.doc, PAGE1, t)
+            elif op[0] == "move":
+                self.source.move_layer(self.doc, PAGE1, op[1], op[2], t)
+            else:
+                self.source.delete_layer(self.doc, PAGE1, op[1], t)
+            states.append([l.name for l in self.scene().layers])
+        for n in range(len(script), 0, -1):
+            t += 1
+            self.source.undo(self.doc, PAGE1, t)
+            self.assertEqual([l.name for l in self.scene().layers], states[n - 1])
+        for n in range(1, len(script) + 1):
+            t += 1
+            self.source.redo(self.doc, PAGE1, t)
+            self.assertEqual([l.name for l in self.scene().layers], states[n], f"redo of {script[n - 1]}")
+
+        # Undo of a merge after a layer below it moved away and back.
+        self.source.add_layer(self.doc, PAGE1, t + 1)                    # Layer 3 / 2 / 3 on top
+        names = [l.name for l in self.scene().layers]
+        self.source.add_stroke(self.doc, PAGE1, stroke_line(-50, 900, 50, 900), t + 2, layer_index=2)
+        self.source.merge_layer_down(self.doc, PAGE1, 2, t + 3)
+        self.source.move_layer(self.doc, PAGE1, 0, 1, t + 4)
+        self.source.undo(self.doc, PAGE1, t + 5)                       # the move
+        self.source.undo(self.doc, PAGE1, t + 6)                       # the merge
+        sc = self.scene()
+        self.assertEqual([l.name for l in sc.layers], names)
+        self.assertEqual(len(sc.layers[2].strokes), 1)
+
+    def test_redone_merge_takes_the_place_of_the_clones_later_steps_name(self):
+        # Merge, then erase a clone the merge made; undo both, redo both: the erase must
+        # find the redone merge's clone (the first merge's clones were deleted by undo).
+        self.source.add_layer(self.doc, PAGE1, NOW)
+        self.source.add_stroke(self.doc, PAGE1, stroke_line(-100, 500, 100, 500, int(Color.RED)), NOW + 1,
+                               layer_index=1)
+        self.source.merge_layer_down(self.doc, PAGE1, 1, NOW + 2)
+        eraser = s.eraser_line([(0.25, 400.0), (0.25, 600.0)], s.MEDIUM)
+        self.assertIsNotNone(self.source.erase_strokes(self.doc, PAGE1, eraser, NOW + 3, layer_index=0))
+        erased = self.snapshot()
+        self.assertEqual(len(erased[0][0][2]), 2)                   # cut in two
+        for n in range(2):
+            self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 4 + n))
+        for n in range(2):
+            self.assertTrue(self.source.redo(self.doc, PAGE1, NOW + 6 + n))
+        self.assertEqual(self.snapshot(), erased)
+        self.assertTrue(self.source.undo(self.doc, PAGE1, NOW + 8))
+        self.assertEqual(len(self.snapshot()[0][0][2]), 1)          # the whole clone is back
+
+    def test_layer_targeted_edits_leave_overlapping_strokes_on_other_layers_alone(self):
+        # The same line on Layer 1 and Layer 2: erasing, selecting and moving on Layer 2
+        # must not touch Layer 1's copy, point for point.
+        line = stroke_line(-100, 300, 100, 300, int(Color.BLUE))
+        self.source.add_stroke(self.doc, PAGE1, line, NOW, layer_index=0)
+        self.source.add_layer(self.doc, PAGE1, NOW + 1)
+        self.source.add_stroke(self.doc, PAGE1, line, NOW + 2, layer_index=1)
+        layer1 = self.snapshot()[0][0]
+        self.assertEqual(self.snapshot()[0][1][2], layer1[2])       # identical strokes, both kept
+        eraser = s.eraser_line([(0.25, 250.0), (0.25, 350.0)], s.MEDIUM)
+        self.source.erase_strokes(self.doc, PAGE1, eraser, NOW + 3, layer_index=1)
+        self.assertEqual(self.snapshot()[0][0], layer1)
+        self.assertEqual(len(self.snapshot()[0][1][2]), 2)
+        # Drawing the very same line again on Layer 1 is a new stroke there, not a match
+        # for Layer 2's (the uploaded-already check in _draw is per layer).
+        self.source.add_stroke(self.doc, PAGE1, line, NOW + 4, layer_index=0)
+        self.assertEqual(len(self.snapshot()[0][0][2]), 2)
+        self.assertEqual(len(self.snapshot()[0][1][2]), 2)
 
     def test_draw_erase_paste_and_current_layer_persistence_on_layer_2(self):
         # Stroke on Layer 1
@@ -528,6 +691,13 @@ class LayersQmlTests(unittest.TestCase):
     def test_draw_select_move_and_paste_target_active_layer_2(self):
         view = self.open_doc(THROWAWAY)
         ctrl = view._controller
+        # Layer 1 strokes inside every region Layer 2 is about to select, move, paste on,
+        # straighten on and erase: none of it may touch them.
+        for n, y in enumerate((600.0, 700.0, 900.0, 1100.0, 1300.0)):
+            view.pen_commit("draw", stroke_line(-150.0, y, 150.0, y, color=int(Color.BLUE)), 10 + n)
+            self.wait_for(lambda k=n: len(view._content.scene.layers[0].strokes) == k + 1)
+        layer1 = lambda: [[(p.x, p.y) for p in st.points] for st in view._content.scene.layers[0].strokes]  # noqa: E731
+        kept = layer1()
         ctrl.addLayer()
         self.wait_for(lambda: ctrl.property("layerCount") == 2 and ctrl.property("currentLayer") == 1)
 
@@ -585,6 +755,216 @@ class LayersQmlTests(unittest.TestCase):
         ctrl.insertImageFileAsSceneItem(QUrl.fromLocalFile(str(img_path)), QPointF(0.0, 1300.0))
         self.wait_for(lambda: len(view._content.scene.layers[1].images) == 1)
         self.assertEqual(len(view._content.scene.layers[0].images), 0)
+        self.assertEqual(layer1(), kept)
+        # Back on Layer 1, a rect selection over the same area takes Layer 1's strokes only.
+        ctrl.setCurrentLayer(0)
+        self.wait_for(lambda: ctrl.property("currentLayer") == 0)
+        ctrl.addSelectionRect(QRect(-200, 550, 400, 800), 0)
+        self.wait_for(lambda: ctrl.property("selectionItemCount") == 5)
+        tq.wait(100)
+        self.assertEqual(ctrl.property("selectionItemCount"), 5)
+        ctrl.clearSelectedItems()
+        self.close_document()
+
+    # -- the app's own LayersFoldout, driven by mouse and keyboard --
+
+    def walk(self, root):
+        todo = [root]
+        while todo:
+            item = todo.pop()
+            yield item
+            todo.extend(item.childItems())
+
+    def foldout(self):
+        """(the Foldout popup item, its LayersFoldout) of the document view."""
+        content = next((i for i in self.walk(self.window.contentItem())
+                        if i.metaObject().className().startswith("LayersFoldout")), None)
+        self.assertIsNotNone(content, "no LayersFoldout")
+        popup = content
+        while popup is not None and not popup.metaObject().className().startswith("Foldout"):
+            popup = popup.parentItem()
+        self.assertIsNotNone(popup, "no Foldout around LayersFoldout")
+        return popup, content
+
+    def show_foldout(self, shown: bool = True):
+        popup, content = self.foldout()
+        popup.setProperty("visible", shown)       # as the toolbar's Layers button does
+        tq.wait(120)
+        return content
+
+    def row(self, content, name: str):
+        rows = [i for i in self.walk(content) if i.metaObject().className().startswith("LayerComponent")
+                and i.property("text") == name and i.isVisible()]
+        self.assertEqual(len(rows), 1, f"layer row {name!r}")
+        return rows[0]
+
+    def press(self, item, hold_ms: int = 0) -> None:
+        from PySide6.QtTest import QTest
+        at = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
+        if not hold_ms:
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at)
+        else:
+            QTest.mousePress(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at)
+            tq.wait(hold_ms)
+            QTest.mouseRelease(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at)
+        tq.wait(60)
+
+    def action(self, row, key: str):
+        found = [i for i in self.walk(row) if i.property("actionKey") == key]
+        self.assertEqual(len(found), 1, f"{key} button of {row.property('text')!r}")
+        return found[0]
+
+    def eye(self, row):
+        found = [i for i in self.walk(row) if i.property("actionKey") is None
+                 and "eye" in str(i.property("iconSource") or "")]
+        self.assertTrue(found, f"eye of {row.property('text')!r}")
+        return found[0]
+
+    def key(self, key, modifiers=Qt.KeyboardModifier.ControlModifier) -> None:
+        from PySide6.QtTest import QTest
+        self.window.requestActivate()
+        QTest.keyClick(self.window, key, modifiers)
+        tq.wait(40)
+
+    def ink(self, view, x: float, y: float, r: int = 2) -> str:
+        """'red', 'blue' or 'paper': what the window shows around scene point (x, y)."""
+        image = self.window.grabWindow()
+        dpr = image.devicePixelRatio() or 1.0
+        at = view.mapToScene(view._tiles.to_view(QPointF(x, y)))
+        red = blue = 0
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                c = QColor(image.pixel(round((at.x() + dx) * dpr), round((at.y() + dy) * dpr)))
+                if c.red() > 150 and c.red() > c.blue() + 60 and c.green() < 140:
+                    red += 1
+                elif c.blue() > 120 and c.blue() > c.red() + 40:
+                    blue += 1
+        return "red" if red > blue and red > 2 else "blue" if blue > red and blue > 2 else "paper"
+
+    def test_foldout_rows_drive_layers_with_rendered_z_order_visibility_and_keyboard_undo(self):
+        view = self.open_doc(THROWAWAY)
+        ctrl = view._controller
+        cross = (300.0, 1300.0)
+        base = len(view._content.scene.layers[0].strokes)          # the fixture's own strokes
+        view.pen_commit("draw", stroke_line(150.0, 1300.0, 450.0, 1300.0, color=int(Color.BLUE)), 1)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.layers[0].strokes) == base + 1))
+
+        # New layer row -> Layer 2 on top and active; red stroke on it covers the blue one.
+        content = self.show_foldout()
+        new_row = next(i for i in self.walk(content) if i.property("label") == "New layer")
+        self.press(new_row)
+        self.assertTrue(self.wait_for(lambda: ctrl.property("layerCount") == 2 and ctrl.property("currentLayer") == 1))
+        self.show_foldout(False)
+        view.pen_commit("draw", stroke_line(300.0, 1150.0, 300.0, 1450.0, color=int(Color.RED)), 2)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.layers[1].strokes) == 1))
+        self.assertTrue(self.wait_for(lambda: self.ink(view, *cross) == "red"))
+
+        # Layer 2's down arrow: blue now on top at the crossing.
+        content = self.show_foldout()
+        self.press(self.action(self.row(content, "Layer 2"), "down"))
+        self.assertTrue(self.wait_for(lambda: ctrl.layerName(0) == "Layer 2" and ctrl.property("currentLayer") == 0))
+        self.show_foldout(False)
+        self.assertTrue(self.wait_for(lambda: self.ink(view, *cross) == "blue"))
+
+        # Layer 1's eye: hidden -> only red left, and the blue line away from it is gone.
+        content = self.show_foldout()
+        self.press(self.eye(self.row(content, "Layer 1")))
+        self.assertTrue(self.wait_for(lambda: not ctrl.isLayerVisible(1)))
+        self.show_foldout(False)
+        self.assertTrue(self.wait_for(lambda: self.ink(view, *cross) == "red"))
+        self.assertEqual(self.ink(view, 200.0, 1300.0), "paper")
+
+        # Ctrl+Z with the foldout open: visibility back; again: the move undone. Ctrl+Y redoes.
+        content = self.show_foldout()
+        self.key(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: ctrl.isLayerVisible(1)))
+        self.key(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: ctrl.layerName(1) == "Layer 2"))
+        self.key(Qt.Key.Key_Y)
+        self.assertTrue(self.wait_for(lambda: ctrl.layerName(0) == "Layer 2"))
+        self.show_foldout(False)
+        self.assertTrue(self.wait_for(lambda: self.ink(view, *cross) == "blue"))
+
+        # Rename through the row's own text input (press and hold, type, Enter), then
+        # Ctrl+Z from the keyboard must undo the rename (focus back on the page).
+        content = self.show_foldout()
+        row = self.row(content, "Layer 2")
+        name_area = next(i for i in self.walk(row) if i.metaObject().className() == "QQuickMouseArea"
+                         and i.parentItem() is not None and i.parentItem().property("text") == "Layer 2")
+        self.press(name_area, hold_ms=1000)
+        text_input = next(i for i in self.walk(row) if i.metaObject().className() == "QQuickTextInput")
+        self.assertTrue(text_input.isVisible())
+        text_input.forceActiveFocus()
+        from PySide6.QtCore import QMetaObject
+        from PySide6.QtTest import QTest
+        QMetaObject.invokeMethod(text_input, "selectAll")
+        for c in "inked":
+            QTest.keyClick(self.window, Qt.Key(ord(c.upper())))
+        QTest.keyClick(self.window, Qt.Key.Key_Return)
+        self.assertTrue(self.wait_for(lambda: ctrl.layerName(0) == "inked"))
+        tq.wait(80)
+        self.key(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: ctrl.layerName(0) == "Layer 2", 3000),
+                        "Ctrl+Z after renaming a layer did not reach the page")
+        self.key(Qt.Key.Key_Y)
+        self.assertTrue(self.wait_for(lambda: ctrl.layerName(0) == "inked", 3000))
+
+        # Merge (top row's merge button) and trash, each undone by Ctrl+Z.
+        self.press(self.action(self.row(content, "Layer 1"), "merge"))
+        self.assertTrue(self.wait_for(lambda: ctrl.property("layerCount") == 1))
+        self.assertEqual(len(view._content.scene.layers[0].strokes), base + 2)
+        self.key(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: ctrl.property("layerCount") == 2))
+        self.press(self.action(self.row(content, "inked"), "delete"))
+        self.assertTrue(self.wait_for(lambda: ctrl.property("layerCount") == 1))
+        self.key(Qt.Key.Key_Z)
+        self.assertTrue(self.wait_for(lambda: ctrl.property("layerCount") == 2))
+        self.assertEqual(sorted(len(l.strokes) for l in view._content.scene.layers), sorted([1, base + 1]))
+        self.show_foldout(False)
+        self.assertTrue(self.wait_for(lambda: self.ink(view, *cross) == "blue"))
+        self.assertEqual(tq.real_warnings(self.app.warnings), [])
+        self.close_document()
+
+    def test_drawing_and_erasing_on_a_hidden_active_layer(self):
+        # As the app (Scene::addLine / Scene::erase never read the layer's visible flag):
+        # the stroke goes to the active layer even while it is hidden, unseen until shown;
+        # the eraser works on that layer only.
+        view = self.open_doc(THROWAWAY)
+        ctrl = view._controller
+        base = len(view._content.scene.layers[0].strokes)
+        view.pen_commit("draw", stroke_line(150.0, 1300.0, 450.0, 1300.0, color=int(Color.BLUE)), 1)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.layers[0].strokes) == base + 1))
+        ctrl.addLayer()
+        self.assertTrue(self.wait_for(lambda: ctrl.property("currentLayer") == 1))
+        ctrl.setLayerVisible(1, False)
+        self.assertTrue(self.wait_for(lambda: not ctrl.isLayerVisible(1)))
+        view.pen_commit("draw", stroke_line(300.0, 1150.0, 300.0, 1450.0, color=int(Color.RED)), 2)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.layers[1].strokes) == 1))
+        tq.wait(200)
+        self.assertEqual(self.ink(view, 300.0, 1400.0), "paper")
+        self.assertEqual(self.ink(view, 200.0, 1300.0), "blue")
+        view.pen_commit("erase", s.eraser_line([(250.0, 1300.0), (350.0, 1300.0)], s.MEDIUM), 3)
+        self.assertTrue(self.wait_for(lambda: len(view._content.scene.layers[1].strokes) == 2))
+        self.assertEqual(len(view._content.scene.layers[0].strokes), base + 1)
+        ctrl.setLayerVisible(1, True)
+        self.assertTrue(self.wait_for(lambda: self.ink(view, 300.0, 1400.0) == "red"))
+        self.close_document()
+
+    def test_readonly_layer_toggle_leaves_the_cached_scene_alone(self):
+        ro_view = self.open_doc(OTHER)
+        ro_ctrl = ro_view._controller
+        self.assertEqual(ro_ctrl.property("layerCount"), 2)
+        self.assertTrue(self.wait_for(lambda: self.ink(ro_view, 0.0, 500.0) == "red"))
+        ro_ctrl.setLayerVisible(1, False)
+        self.wait_for(lambda: not ro_ctrl.isLayerVisible(1))
+        self.assertTrue(self.wait_for(lambda: self.ink(ro_view, 0.0, 500.0) == "blue"))
+        doc = self.source.sync.tree.get(OTHER)
+        cached = self.source.page_scene(doc, document_pages(doc)[0])
+        self.assertTrue(cached.layers[1].visible, "the live toggle leaked into the cached page")
+        self.assertEqual(self.source.sync.edits.of(OTHER), [])
+        ro_view = self.open_doc(OTHER)                       # opened again: as stored
+        self.assertTrue(ro_view._controller.isLayerVisible(1))
+        self.assertTrue(self.wait_for(lambda: self.ink(ro_view, 0.0, 500.0) == "red"))
         self.close_document()
 
     def test_background_visible_persists_on_editable_and_stays_live_on_readonly(self):

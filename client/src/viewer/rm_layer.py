@@ -370,15 +370,34 @@ def detach_layer(page: bytes, *, author: bytes, layer: tuple[int, int],
     return w.join(header, blocks), active
 
 
+def _restore_index(page: bytes, author: bytes, layer: tuple[int, int], index: int | None) -> bytes:
+    """`page` with live `layer` back at `index` (0 = bottom) when re-attaching it reused a
+    root group item that no longer sits there: another layer moved since (each move
+    re-inserts that layer's group item), so the old slot can now be above or below the
+    wrong neighbours. Uses move_layer, the same CrdtGroupItem delete + insert the app's
+    reorderNode writes; a no-op when the layer is already at `index`."""
+    if index is None:
+        return page
+    live = w.layers(w.split(page)[1])
+    if layer not in live:
+        return page
+    index = max(0, min(int(index), len(live) - 1))
+    if live.index(layer) == index:
+        return page
+    return move_layer(page, author=author, layer=layer, new_index=index)
+
+
 def reattach_layer(page: bytes, *, author: bytes, layer: tuple[int, int],
-                   set_current: tuple[int, int] | None = None) -> bytes:
+                   set_current: tuple[int, int] | None = None, index: int | None = None) -> bytes:
     """Re-attach a previously detached layer under ROOT_NODE (SceneTreeMove is_update=1,
-    parent=0:1), as delete-layer-crdt::undo (0x14095ef80) and add-layer-crdt::redo do."""
+    parent=0:1), as delete-layer-crdt::undo (0x14095ef80) and add-layer-crdt::redo do,
+    reusing its root group item. `index`: where undo/redo must put it back (the root
+    group item it reuses can be out of place after other layers moved), see _restore_index."""
     header, blocks = w.split(page)
     layer = tuple(layer)
     live = w.layers(blocks)
     if layer in live:
-        return page
+        return _restore_index(page, author, layer, index)
     if len(live) >= MAX_LAYERS:
         raise LayerError(f"Limit of {MAX_LAYERS} layers reached")
     if _node_block_index(blocks, layer) is None:
@@ -396,7 +415,8 @@ def reattach_layer(page: bytes, *, author: bytes, layer: tuple[int, int],
     target_cur = tuple(set_current) if set_current is not None else layer
     if target_cur in w.layers(blocks):
         _update_scene_info(blocks, me, clock, current_layer=target_cur)
-    return w.join(header, blocks)
+    # move_layer keeps currentLayer on the node just made current.
+    return _restore_index(w.join(header, blocks), author, layer, index)
 
 
 def set_layer_name(page: bytes | None, *, author: bytes, layer: tuple[int, int], name: str) -> bytes:
@@ -542,9 +562,23 @@ def merge_layer_down(page: bytes, *, author: bytes, layer: tuple[int, int]) -> M
     src_chain = rs._Chain(blocks, layer)
     moved_groups: list[tuple[int, int]] = []
     new_moves: list[w.Block] = []
-    # Collect non-group clones first so shader sourceIds rename consistently per merge.
-    non_groups: list[tuple[w.ItemHeader, int, bytes, object]] = []
 
+    # Shader sourceIds are renamed over all the strokes merged, before any is appended
+    # (0x1408c2ae0), so the clones of one shader stroke keep sharing one new sourceId.
+    lines = []
+    for block, item in src_items:
+        if block.type == w.BLOCK_LINE_ITEM:
+            if block.version < 2:
+                raise LayerError("cannot merge a version 1 stroke")
+            lines.append(replace(rs.decode_line_value(item.value), move_id=None))
+    if lines:
+        lines, clock = rsel._fresh_sources(lines, me, clock)
+    it_lines = iter(lines)
+
+    # One pass in src's sequence order, as 0x14095d840 iterates it: groups and clones are
+    # appended to dst in the order src held them, so a text-anchored group between two
+    # strokes stays between their clones (z-order unchanged by the merge).
+    transferred: list[tuple[tuple[int, int], int, bytes, tuple[int, int]]] = []
     for block, item in src_items:
         if block.type == w.BLOCK_GROUP_ITEM:
             child = next((v for i, k, v in w.read_values(item.value[1:]) if (i, k) == (2, w.TAG_ID)), None)
@@ -557,44 +591,23 @@ def merge_layer_down(page: bytes, *, author: bytes, layer: tuple[int, int]) -> M
             clock += 1
             new_moves.append(w.new_block(w.BLOCK_TREE_MOVE, w.encode_tree_move((me, clock), child, 1, dst)))
             moved_groups.append(child)
-        elif block.type == w.BLOCK_LINE_ITEM:
-            if block.version < 2:
-                raise LayerError("cannot merge a version 1 stroke")
-            line = rs.decode_line_value(item.value)
-            cloned = replace(line, move_id=None)
-            non_groups.append((item, block.type, item.value, cloned))
-        elif block.type == w.BLOCK_IMAGE_ITEM:
-            img = w.decode_image_value(item.value)
-            cloned = w.ImageValue(img.ref, img.ref_timestamp, img.bounds_timestamp,
-                                  list(img.vertices), img.indices, None)
-            non_groups.append((item, block.type, item.value, cloned))
-        else:
-            non_groups.append((item, block.type, item.value, None))
-
-    # Rename distinct shader sourceIds before appending clones to dst (0x1408c2ae0).
-    line_vals = [obj for _, kind, _, obj in non_groups if kind == w.BLOCK_LINE_ITEM]
-    if line_vals:
-        renamed_lines, clock = rsel._fresh_sources(line_vals, me, clock)
-        it_lines = iter(renamed_lines)
-    else:
-        it_lines = iter(())
-
-    transferred: list[tuple[tuple[int, int], int, bytes, tuple[int, int]]] = []
-    for item, kind, raw_value, obj in non_groups:
+            continue
         clock += 1
         new_id = (me, clock)
-        if kind == w.BLOCK_LINE_ITEM:
+        if block.type == w.BLOCK_LINE_ITEM:
             encoded = next(it_lines).encode()
             bkind = (w.BLOCK_LINE_ITEM, *w.BLOCK_VERSIONS[w.BLOCK_LINE_ITEM])
-        elif kind == w.BLOCK_IMAGE_ITEM:
-            encoded = obj.encode()
+        elif block.type == w.BLOCK_IMAGE_ITEM:
+            img = w.decode_image_value(item.value)
+            encoded = w.ImageValue(img.ref, img.ref_timestamp, img.bounds_timestamp,
+                                   list(img.vertices), img.indices, None).encode()
             bkind = (w.BLOCK_IMAGE_ITEM, *w.BLOCK_VERSIONS[w.BLOCK_IMAGE_ITEM])
         else:
-            encoded = raw_value
-            bkind = (kind, *w.BLOCK_VERSIONS.get(kind, (1, 1)))
+            encoded = item.value
+            bkind = (block.type, *w.BLOCK_VERSIONS.get(block.type, (1, 1)))
         dst_node.append(new_id, encoded, bkind)
         src_chain.delete(item.item)
-        transferred.append((item.item, kind, raw_value, new_id))
+        transferred.append((item.item, block.type, item.value, new_id))
 
     blocks = dst_node.write(blocks)
     blocks = src_chain.write(blocks)
@@ -615,11 +628,13 @@ def unmerge_layer(page: bytes, *, author: bytes, src: tuple[int, int], dst: tupl
                   moved_groups: tuple[tuple[int, int], ...],
                   restore_items: tuple[tuple[tuple[int, int], int, bytes, tuple[int, int] | None], ...],
                   remove_from_dst: tuple[tuple[int, int], ...],
-                  old_current: tuple[int, int] | None = None
+                  old_current: tuple[int, int] | None = None,
+                  src_index: int | None = None
                   ) -> tuple[bytes, dict[tuple[int, int], tuple[int, int]]]:
     """Undo a merge_layer_down (matching 0x14095f180): deletes the cloned items from dst,
     re-attaches src under ROOT_NODE, restores src's deleted items right after themselves,
-    moves moved_groups back to src, and restores old_current.
+    moves moved_groups back to src, and restores old_current. `src_index`: where src
+    stood before the merge (see _restore_index).
     Returns (new page, {deleted_src_id: newly_restored_id})."""
     header, blocks = w.split(page)
     src, dst = tuple(src), tuple(dst)
@@ -700,7 +715,7 @@ def unmerge_layer(page: bytes, *, author: bytes, src: tuple[int, int], dst: tupl
     # 5. Restore old_current.
     if old_current is not None and tuple(old_current) in w.layers(blocks):
         _update_scene_info(blocks, me, clock, current_layer=tuple(old_current))
-    return w.join(header, blocks), restored
+    return _restore_index(w.join(header, blocks), author, src, src_index), restored
 
 
 def clear_lines_in_layer(page: bytes, *, author: bytes,

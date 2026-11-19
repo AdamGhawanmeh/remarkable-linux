@@ -1631,6 +1631,40 @@ class _SceneView:
         source, node, page_id = target
         now_ms = _now_ms()
         self._run_layer_edit("rename layer", lambda: source.rename_layer(node, page_id, index, name, now_ms))
+        # LayersFoldout accepts the name, then clears its text input's focus: see
+        # refocus_viewport.
+        QTimer.singleShot(0, self.refocus_viewport)
+
+    def refocus_viewport(self) -> None:
+        """Give keyboard focus back to the page after the Layers foldout dropped it, so
+        Ctrl+Z / Ctrl+Y (ProxyActions resolved from the focused item, main.qml
+        actionHandler) reach this page again. The foldout loses it two ways: its rows
+        are rebuilt on every layer change (SceneLayersModel reset), destroying the
+        clicked button and leaving the window's root item focused, which main.qml
+        ignores, so actionHandler pointed at nothing; and its New layer row, or the
+        rename field once cleared, keep or leave focus inside the foldout, which handles
+        no actions. Only then: focus the user moved elsewhere, or a text field being
+        typed in, is left alone."""
+        if not shiboken6.isValid(self):
+            return
+        # The window recorded by _window_changed, never self.window() (see there).
+        window, viewport = getattr(self, "_shown_window", None), self.parentItem()
+        if window is not None and not shiboken6.isValid(window):
+            return
+        if window is None or viewport is None or not viewport.isVisible():
+            return
+        focused = window.activeFocusItem()
+        if focused is None or focused.parentItem() is None:
+            viewport.forceActiveFocus()
+            return
+        if any(word in focused.metaObject().className() for word in ("TextInput", "TextEdit", "TextField")):
+            return
+        item = focused
+        while item is not None:
+            if item.metaObject().className().startswith("LayersFoldout"):
+                viewport.forceActiveFocus()
+                return
+            item = item.parentItem()
 
     def set_layer_visible(self, index: int, visible: bool) -> None:
         if not 0 <= index < len(self._controller.layers):
@@ -1641,12 +1675,20 @@ class _SceneView:
             self._run_layer_edit("change layer visibility",
                                  lambda: source.set_layer_visible(node, page_id, index, visible, now_ms))
             return
-        # Read-only page: toggle visibility live in memory without writing.
+        # Read-only page: toggle visibility live in memory without writing. On copies: the
+        # Layer objects belong to the PageScene LibrarySource.page_scene caches, which
+        # thumbnails, exports and the next opening of the page share.
+        from dataclasses import replace
         layer = self._controller.layers[index]
         if layer.visible != bool(visible):
-            layer.visible = bool(visible)
-            if self._content is not None and self._content.scene is not None and index < len(self._content.scene.layers):
-                self._content.scene.layers[index].visible = bool(visible)
+            layers = list(self._controller.layers)
+            layers[index] = replace(layer, visible=bool(visible))
+            self._controller.layers = layers
+            content = self._content
+            if content is not None and content.scene is not None and index < len(content.scene.layers):
+                scene_layers = list(content.scene.layers)
+                scene_layers[index] = replace(scene_layers[index], visible=bool(visible))
+                self._content = replace(content, scene=replace(content.scene, layers=scene_layers))
             self._controller.layerStatesChanged.emit()
             self._render()
 
@@ -2418,6 +2460,7 @@ class _SceneView:
         # SceneView that DocumentViewport is destroying (nukeView) took the app's
         # window down with it (PySide 6.10).
         self._device_ratio = window.effectiveDevicePixelRatio() if window is not None else 1.0
+        self._shown_window = window
 
     def _dpr(self) -> float:
         return self._device_ratio
@@ -2621,6 +2664,12 @@ class _Layers:
         self.beginResetModel()
         self.endResetModel()
         self._set("count", len(self._layers()))
+        # The rows were rebuilt: a row button that had focus is gone (see
+        # SceneView.refocus_viewport), once QML has settled.
+        controller = self._get("controller")
+        view = getattr(controller, "view", None) if controller is not None and shiboken6.isValid(controller) else None
+        if view is not None and shiboken6.isValid(view):
+            QTimer.singleShot(0, view.refocus_viewport)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._layers())

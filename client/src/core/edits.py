@@ -545,21 +545,26 @@ class LayerDelete:
 
 @dataclass(frozen=True)
 class LayerReattach:
-    """A detached layer re-attached under ROOT_NODE (rm_layer.reattach_layer)."""
+    """A detached layer re-attached under ROOT_NODE (rm_layer.reattach_layer), back at
+    `index` (0 = bottom) when known."""
 
     doc_id: str
     page_id: str
     layer: ItemRef
     created_ms: int
     set_current: ItemRef | None = None
+    index: int | None = None
 
     @classmethod
-    def new(cls, doc_id: str, page_id: str, layer, created_ms: int, set_current=None) -> "LayerReattach":
-        return cls(str(doc_id), str(page_id), _ref(layer), int(created_ms), _opt_ref(set_current))
+    def new(cls, doc_id: str, page_id: str, layer, created_ms: int, set_current=None,
+            index: int | None = None) -> "LayerReattach":
+        return cls(str(doc_id), str(page_id), _ref(layer), int(created_ms), _opt_ref(set_current),
+                   None if index is None else int(index))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "LayerReattach":
-        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["created_ms"], raw.get("set_current"))
+        return cls.new(raw["doc_id"], raw["page_id"], raw["layer"], raw["created_ms"], raw.get("set_current"),
+                       raw.get("index"))
 
 
 @dataclass(frozen=True)
@@ -659,20 +664,22 @@ class LayerUnmerge:
     old_current: ItemRef | None
     created_ms: int
     uid: str = ""
+    src_index: int | None = None    # where src stood before the merge (0 = bottom)
 
     @classmethod
     def new(cls, doc_id: str, page_id: str, src, dst, moved_groups, restore_items, remove_from_dst,
-            old_current, created_ms: int, uid: str | None = None) -> "LayerUnmerge":
+            old_current, created_ms: int, uid: str | None = None, src_index: int | None = None) -> "LayerUnmerge":
         restored = tuple((_ref(r), int(k), bytes.fromhex(str(v)).hex(), _opt_ref(o)) for r, k, v, o in restore_items)
         return cls(str(doc_id), str(page_id), _ref(src), _ref(dst),
                    tuple(_ref(g) for g in moved_groups), restored, tuple(_ref(r) for r in remove_from_dst),
-                   _opt_ref(old_current), int(created_ms), uuid.uuid4().hex if uid is None else str(uid))
+                   _opt_ref(old_current), int(created_ms), uuid.uuid4().hex if uid is None else str(uid),
+                   None if src_index is None else int(src_index))
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "LayerUnmerge":
         return cls.new(raw["doc_id"], raw["page_id"], raw["src"], raw["dst"], raw.get("moved_groups") or (),
                        raw.get("restore_items") or (), raw.get("remove_from_dst") or (),
-                       raw.get("old_current"), raw["created_ms"], raw.get("uid") or "")
+                       raw.get("old_current"), raw["created_ms"], raw.get("uid") or "", raw.get("src_index"))
 
 
 @dataclass(frozen=True)
@@ -1214,7 +1221,8 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                     target = done.resolve(edit.layer)
                     set_cur = done.resolve(edit.set_current) if edit.set_current is not None else None
                     if page is not None and target is not None:
-                        page = rm_layer.reattach_layer(page, author=author, layer=target, set_current=set_cur)
+                        page = rm_layer.reattach_layer(page, author=author, layer=target, set_current=set_cur,
+                                                       index=edit.index)
                 elif isinstance(edit, LayerRename):
                     target = done.resolve(edit.layer)
                     if target is not None:
@@ -1254,7 +1262,8 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                         old_cur = done.resolve(edit.old_current) if edit.old_current is not None else None
                         page, restored = rm_layer.unmerge_layer(
                             page, author=author, src=src, dst=dst, moved_groups=groups,
-                            restore_items=tuple(rest_items), remove_from_dst=rem_dst, old_current=old_cur)
+                            restore_items=tuple(rest_items), remove_from_dst=rem_dst, old_current=old_cur,
+                            src_index=edit.src_index)
                         for n, item_id in rest_indices:
                             if edit.uid and item_id in restored:
                                 made[f"{edit.uid}/{n}"] = restored[item_id]
@@ -1600,6 +1609,7 @@ class LayerAttachChange:
     current_when_attached: ItemRef | None
     current_when_detached: ItemRef | None
     attached: bool
+    index: int | None = None        # where the layer stands while attached (0 = bottom)
 
 
 @dataclass(frozen=True)
@@ -1642,6 +1652,7 @@ class LayerMergeChange:
     dst_items: tuple[ItemRef, ...]
     old_current: ItemRef | None
     merged: bool = True
+    src_index: int | None = None    # where src stood before the merge (0 = bottom)
 
 
 @dataclass(frozen=True)
@@ -1679,8 +1690,9 @@ def swapped(changes: tuple, doc_id: str, page_id: str, now_ms: int,
             if change.attached:
                 edits.append(LayerDelete.new(doc_id, page_id, layer, now_ms, new_current=cur_det))
             else:
-                edits.append(LayerReattach.new(doc_id, page_id, layer, now_ms, set_current=cur_att))
-            back.append(LayerAttachChange(layer, cur_att, cur_det, not change.attached))
+                edits.append(LayerReattach.new(doc_id, page_id, layer, now_ms, set_current=cur_att,
+                                               index=change.index))
+            back.append(LayerAttachChange(layer, cur_att, cur_det, not change.attached, change.index))
             continue
         if isinstance(change, LayerRenameChange):
             layer = name(change.layer)
@@ -1705,7 +1717,8 @@ def swapped(changes: tuple, doc_id: str, page_id: str, now_ms: int,
                 src_items = tuple((name(r), k, v, name(o) if o is not None else None)
                                   for r, k, v, o in change.src_items)
                 dst_items = tuple(name(r) for r in change.dst_items)
-                unmerge = LayerUnmerge.new(doc_id, page_id, src, dst, groups, src_items, dst_items, old_cur, now_ms)
+                unmerge = LayerUnmerge.new(doc_id, page_id, src, dst, groups, src_items, dst_items, old_cur, now_ms,
+                                           src_index=change.src_index)
                 edits.append(unmerge)
                 restored_src = []
                 for n, (ref, kind, raw_hex, orig) in enumerate(src_items):
@@ -1713,14 +1726,22 @@ def swapped(changes: tuple, doc_id: str, page_id: str, now_ms: int,
                     if aliases is not None:
                         aliases[ref] = made_ref
                     restored_src.append((made_ref, kind, raw_hex, orig or ref))
-                back.append(LayerMergeChange(src, dst, groups, tuple(restored_src), (), old_cur, merged=False))
+                # dst_items: the clones' names, so a redo can point later steps at the new clones.
+                back.append(LayerMergeChange(src, dst, groups, tuple(restored_src), dst_items, old_cur, merged=False,
+                                             src_index=change.src_index))
             else:
                 merge = LayerMergeDown.new(doc_id, page_id, src, now_ms)
                 edits.append(merge)
                 src_items = tuple((name(r), k, v, name(o) if o is not None else None)
                                   for r, k, v, o in change.src_items)
                 new_dst = tuple(("edit", f"{merge.uid}/{n}") for n in range(len(src_items)))
-                back.append(LayerMergeChange(src, dst, groups, src_items, new_dst, old_cur, merged=True))
+                if aliases is not None:
+                    # Steps above this one (an erase, a move...) name the clones the
+                    # merge undone made; the redo's clones take their place.
+                    for old, new in zip(change.dst_items, new_dst):
+                        aliases[old] = new
+                back.append(LayerMergeChange(src, dst, groups, src_items, new_dst, old_cur, merged=True,
+                                             src_index=change.src_index))
             continue
         if isinstance(change, SceneFlagChange):
             edits.append(SceneFlags.new(doc_id, page_id, now_ms, **{change.field: change.old_value}))

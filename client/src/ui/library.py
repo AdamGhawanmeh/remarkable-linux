@@ -1197,7 +1197,7 @@ class LibrarySource:
             edit = LayerAdd.new(doc.id, page_id, name, now_ms)
             self._add_edit(doc, edit)
             new_ref = ("edit", edit.uid)
-            history.push([LayerAttachChange(new_ref, new_ref, old_cur, attached=True)])
+            history.push([LayerAttachChange(new_ref, new_ref, old_cur, attached=True, index=len(infos))])
             history.seen = self._seen(doc.id, page_id)
         return edit
 
@@ -1227,7 +1227,7 @@ class LibrarySource:
             new_cur_ref = before.ref(new_cur_node)
             edit = LayerDelete.new(doc.id, page_id, target_ref, now_ms, new_current=new_cur_ref)
             self._add_edit(doc, edit)
-            history.push([LayerAttachChange(target_ref, old_cur_ref, new_cur_ref, attached=False)])
+            history.push([LayerAttachChange(target_ref, old_cur_ref, new_cur_ref, attached=False, index=idx)])
             history.seen = self._seen(doc.id, page_id)
         return edit
 
@@ -1319,7 +1319,7 @@ class LibrarySource:
             dst_items = tuple(("edit", f"{edit.uid}/{n}") for n in range(len(src_items)))
             groups = tuple(before.ref(g) for g in merged.moved_groups)
             history.push([LayerMergeChange(src_ref, dst_ref, groups, src_items, dst_items,
-                                           before.ref(merged.old_current), merged=True)])
+                                           before.ref(merged.old_current), merged=True, src_index=idx)])
             history.seen = self._seen(doc.id, page_id)
         return edit
 
