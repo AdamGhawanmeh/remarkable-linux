@@ -29,7 +29,7 @@ from core.auth import HttpResponse  # noqa: E402
 from liveview import rfb  # noqa: E402
 from liveview.rfb import (CursorMoved, Framebuffer, FramebufferUpdate, Ping, ProtocolError, Rect,  # noqa: E402
                           Rotated, ServerHello, Shutdown, StreamDecoder, client_handshake)
-from liveview.session import (Connected, Connecting, Disconnected, LiveViewService, NoActiveSession,  # noqa: E402
+from liveview.session import (CloudUpdated, Connected, Connecting, Disconnected, LiveViewService, NoActiveSession,  # noqa: E402
                               NotificationsState, RoomOffered, _mid)
 from liveview.signaling import (Room, RoomClient, RoomNotFound, SignalingError, notifications_url,  # noqa: E402
                                 parse_notification)
@@ -283,8 +283,9 @@ class SessionTests(ServiceCase):
     def test_tablet_room_is_offered_then_accepted(self):
         self.start([bytes([103])])
         self.push(self.rooms.room_created(source=DESKTOP))                      # from ourselves: ignored
-        self.push(notification("SyncComplete", TABLET))                         # not Screen Share
+        self.push(notification("SyncComplete", TABLET))                         # the library's
         self.push(self.rooms.room_created("r7"))
+        self.assertEqual(self.next_event(), CloudUpdated(TABLET))
         self.assertEqual(self.next_event(), RoomOffered("r7", TABLET))
         self.service.accept("r7")
         self.assertEqual(self.events_until(Connected)[0], Connecting())

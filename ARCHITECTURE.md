@@ -379,6 +379,9 @@ Safety:
 
 - `wss://{gateway}/notifications/ws/json/1` — Qt `QWebSocket`; events `updateNotificationReceived`,
   `integrationsUpdated`, `searchIndexUpdated`, `roomNotification`, `resetPasscode*`. Ping/pong keepalive.
+  (Those are the `Notifications` object's Qt signals. The wire events behind them are
+  `SyncComplete`, `IntegrationsUpdated`, `SearchIndexUpdated`, `PasscodeReset*` and the
+  Screen Share events of §4; live incoming sync is §3.6.)
 - `POST /convert/v1/handwriting` — `application/vnd.myscript.jiix`.
 - Screen-share broker: see §4.
 
@@ -525,6 +528,98 @@ taken (try-lock 0x1406621e0). Open documents handle their own conflicts (see bel
 the server's current `.rm`/`.content`/`.metadata`. That yields what the app's open-document
 CRDT merge would. For `.metadata` it keeps the server's other fields, as the app's default
 `Theirs` does.
+
+### 3.6 Live incoming sync: notifications to syncs
+
+Traced in reMarkable.exe 3.29 [O unless marked]:
+- `notifications/src/notifications.cpp`: `Notifications::onNotificationReceived`
+- `xofm/libs/syncinterface`: `DocumentSyncInterface`, including `slumberinhibit.cpp`
+
+Strings were tied to code by the rip-relative scan of §3.5. The handler and the
+scheduler were read in `objdump` disassembly.
+
+**Receiving** (`onNotificationReceived`, around 0x1402e94a0):
+1. The handler logs `Notification originated from "{}"` with the `sourceDeviceID`.
+2. If that id equals this device's, it logs "Notification originated from ourself!" and
+   drops the event (0x1402e9545).
+3. Otherwise it compares the `event` attribute with `"SyncComplete"`
+   (`QString::compare`, case-sensitive, 0x1402e95db). On a match it emits signal index 5
+   (0x1402ef380). By moc order that index is `updateNotificationReceived`.
+4. Other events go to their own signals: `PasscodeReset*`, `IntegrationsUpdated`,
+   `SearchIndexUpdated`, Screen Share's `roomNotification`. Anything else logs "Received
+   an unknown notification from server".
+5. The socket keeps a ping timer ("Restarting notification timer", " - socket failed to
+   reply, reopening") and reconnects by itself ("Something changed, checking if we need to
+   connect").
+6. `DocumentSyncInterface` has the slots `onUpdateNotification` and
+   `onConnectedNotification`. They are the receivers of `updateNotificationReceived` and
+   of the socket's `connected` [I: wired at runtime, not traced to a `connect` call].
+
+**Scheduling** (`DocumentSyncInterface`, 0x140136bb0):
+- A sync request goes through one `QTimer` at +0x60.
+- The interval is 100 ms when a full sync was requested (flag +0xb8, set by
+  `requestSync`, "full sync requested", 0x140137f26) and 10 ms otherwise.
+- If the timer already runs and its remaining time is within the interval, it is left
+  running. Otherwise it is (re)started with the interval. So the first request of a
+  burst sets the time, and later ones join it.
+- `execute()` checks first that sync is not suspended ("Ignoring sync, suspended") and
+  that the app is online ("Ignoring sync; we are not online").
+
+**Suspend and resume** (0x140138066, 0x1401380d6):
+- `suspend()` logs " - suspending sync", sets flag +0xc0, stops the timer and aborts
+  the running sync through the sync engine's vtable (+0x80).
+- `resume()` logs " - resuming sync" and only clears the flag. Nothing pending is
+  replayed: the app catches up on its next periodic or notification-driven sync.
+- `slumberinhibit.cpp` refuses to suspend while a sync runs or is about to ("Can't
+  suspend, sync is running"). That is the tablet's sleep, not this client's concern.
+
+**This client** (`ui/quick/bridge/library.py` `DocumentSync`, `liveview/session.py`,
+`ui/quick/app.py`):
+- **The socket.** It is the one the Screen Share service keeps open whenever the client
+  is online (§4). `LiveViewService` drops events from its own device id. It passes
+  `SyncComplete` on as `CloudUpdated`, and each (re)connection as
+  `NotificationsState(True)`.
+- **Hand-off.** `ScreenShareClient` emits `cloudUpdated` and `notificationsConnected`.
+  QuickApp connects them to `DocumentSync.onUpdateNotification` and
+  `onConnectedNotification`.
+- **One timer.** As in the app it is single-shot and not restarted while it runs. The
+  interval is ours: `REQUEST_DELAY_MS`, 1000 ms. A sync here starts with a root GET and
+  shows "Syncing", so bursts are gathered for longer than the app's 100 ms.
+- **During a running sync.** A request while a sync runs, whether the user's own, Check
+  sync's, or one `request_sync()` finds busy, leaves exactly one follow-up. It starts
+  when that sync ends, successful or failed: the running sync may have read the root
+  before the change.
+- **Reconnects.** Every (re)connection of the socket asks for a sync, because changes
+  made while it was down were never announced. At start-up this adds one root GET,
+  which costs nothing when the hash is unchanged.
+- **Suspend and resume.** `suspend()` holds requests while logged out, cached-only, not
+  started, shutting down, or while the network backend reports the link down.
+  `resume()` syncs once if anything asked meanwhile. This differs from the app on
+  purpose: this client has no periodic sync to catch up with. With no network backend
+  at all, the link is treated as up.
+- **Applying a sync.** A sync replaces the tree (`Library.set_tree`). Entry wrappers
+  are updated in place, so the library view keeps its folder, scroll and selection.
+  - `DocumentWrapper.update` emits `pageMapChanged`, `redirectionPageMapChanged` and
+    `templatesChanged` only when the page list changed (ids, PDF pages, templates).
+    `DocumentViewport` rebuilds its page views on `pageMapChanged`. Before this change,
+    every newer version of an open document replaced its `SceneView`, losing an open
+    text session, a selection, or a stroke being drawn.
+  - The open `SceneView` follows its document's `nodeReplaced`. When the files its page
+    is drawn from changed (its `.rm`, its `<doc>/<page>/…` images, the PDF), it reloads
+    the page in place (`_load(quiet=True)`, no loading dots).
+  - While a selection or a text session is open, the reload waits until it ends.
+    Closing either one reloads the page anyway.
+- **Pending edits.** They are never touched by a sync. They live in
+  `core.edits.PendingEdits`, apart from the synced files, and `LibrarySource.staged`
+  replays them over whatever version was synced last. So the reloaded page shows the
+  other device's changes with this client's edits on top, as `commit` would upload
+  them (§3.5).
+  - The page's undo history starts again, because the page changed under it
+    (`PageHistory.seen`).
+  - Uploading stays manual: `tools/push_edits.py`, behind `--edit-notebook`.
+
+Tests: `client/tests/test_live_sync_offline.py` mocks the socket with
+`liveview_fakes.FakeNotifications` over the fake cloud.
 
 ## 4. LiveView / Screen Share
 

@@ -435,6 +435,11 @@ class LinkProvider(QObject):
 
     isOnline = Property(bool, lambda self: self._availability() == 2, notify=availabilityChanged)
     availability = Property(int, lambda self: self._availability(), notify=availabilityChanged)
+
+    @property
+    def known_offline(self) -> bool:
+        """The backend says the network is down (with no backend, nothing is known)."""
+        return self._information is not None and not self.isOnline
     connectionIsMetered = Property(bool, lambda self: False, constant=True)
 
 

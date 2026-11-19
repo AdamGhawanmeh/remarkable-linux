@@ -7,6 +7,10 @@ session), opens the Screen Share window when `active` turns true, and shows
 ScreenShareDisconnectDialog on disconnected. ScreenShare.qml feeds framebufferUpdated /
 cursorUpdated / rotationChanged to ScreenSharePainter, the QQuickPaintedItem it sizes and
 rotates, which draws the framebuffer and the 15 px hover cursor.
+
+The service's notifications socket is also the app's Notifications object for the library:
+ScreenShareClient passes its "SyncComplete" events on as cloudUpdated and each
+(re)connection as notificationsConnected (QuickApp feeds both to DocumentSync).
 """
 
 from __future__ import annotations
@@ -18,8 +22,8 @@ from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtQuick import QQuickPaintedItem
 
 from liveview.rfb import CursorMoved, Framebuffer, FramebufferUpdate, Rotated, ServerHello
-from liveview.session import (Connected, Connecting, Disconnected, LiveViewService, NoActiveSession,
-                              RoomOffered)
+from liveview.session import (CloudUpdated, Connected, Connecting, Disconnected, LiveViewService,
+                              NoActiveSession, NotificationsState, RoomOffered)
 
 from ...workers import emit_from_worker
 
@@ -37,6 +41,9 @@ class ScreenShareClient(QObject):
     disconnected = Signal(int)
     connectionFailed = Signal()
     roomNotFound = Signal()
+    # Not the app's ClientFacade: the library's side of the notifications socket.
+    cloudUpdated = Signal(str)              # "SyncComplete" from another device (sourceDeviceID)
+    notificationsConnected = Signal(bool)   # the socket (re)connected, or was lost
     _event = Signal(object)
 
     def __init__(self, service_factory: Callable[[Callable[[object], None]], LiveViewService] | None,
@@ -144,6 +151,10 @@ class ScreenShareClient(QObject):
             self.connected.emit(0)
         elif isinstance(event, Connecting):
             pass
+        elif isinstance(event, CloudUpdated):
+            self.cloudUpdated.emit(event.source)
+        elif isinstance(event, NotificationsState):
+            self.notificationsConnected.emit(event.connected)
 
 
 class ScreenSharePainter(QQuickPaintedItem):

@@ -15,6 +15,11 @@ as it creates its room. A session then:
   5. on the "screenshare" data channel: writes the handshake, then decodes the stream
 
 It ends with one of the app's disconnect reasons (DisconnectReason in clientfacade.cpp).
+
+The same socket carries the library's "SyncComplete" events: they are passed on as
+CloudUpdated (live incoming sync, DocumentSync.onUpdateNotification), and each
+(re)connection as NotificationsState(True) (DocumentSync.onConnectedNotification).
+Events from this client's own device are dropped, as the app drops them.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from core.auth import AuthClient, AuthError, user_agent
 from . import dtls
 from .rfb import (FramebufferUpdate, Ping, ProtocolError, Shutdown, StreamDecoder, client_handshake,
                   PING_TIMEOUT_S)
-from .signaling import (REQUEST_OFFER, ROOM_CREATED, ROOM_MESSAGE, WEBRTC, Room, RoomClient,
+from .signaling import (REQUEST_OFFER, ROOM_CREATED, ROOM_MESSAGE, SYNC_COMPLETE, WEBRTC, Room, RoomClient,
                         RoomNotFound, SignalingError, notifications_url, parse_notification)
 
 log = logging.getLogger("rm.liveview.session")
@@ -88,6 +93,12 @@ class Disconnected:
 @dataclass(frozen=True)
 class NotificationsState:
     connected: bool
+
+
+@dataclass(frozen=True)
+class CloudUpdated:
+    """Another device synced ("SyncComplete"): the library in the cloud changed."""
+    source: str                     # its sourceDeviceID
 
 
 # -- notifications ----------------------------------------------------------------------
@@ -411,7 +422,10 @@ class LiveViewService:
         note = parse_notification(raw)
         if note is None or (self.device_id and note.source == self.device_id):
             return                                               # not ours, or from ourselves
-        if note.event == ROOM_CREATED:
+        if note.event == SYNC_COMPLETE:
+            log.debug("library updated by %s", note.source or "the cloud")
+            self.emit(CloudUpdated(note.source))
+        elif note.event == ROOM_CREATED:
             room_id = str(note.attributes.get("roomId") or "")
             if self.session is not None:
                 log.info("ongoing session: not offering room %s", room_id)

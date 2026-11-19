@@ -15,7 +15,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 from PySide6.QtWidgets import QWidget
 
 from liveview.rfb import CursorMoved, Framebuffer, FramebufferUpdate, Rotated, ServerHello
-from liveview.session import (Connected, Connecting, Disconnected, LiveViewService, NoActiveSession,
+from liveview.session import (CloudUpdated, Connected, Connecting, Disconnected, LiveViewService, NoActiveSession,
                               NotificationsState, RoomOffered)
 
 from .theme import Colors, Fonts, font
@@ -44,6 +44,7 @@ class LiveViewController(QObject):
     disconnected = Signal(object)        # Disconnected
     noActiveSession = Signal()
     notificationsChanged = Signal(bool)
+    cloudUpdated = Signal(str)           # another device synced (its sourceDeviceID)
 
     def __init__(self, service_factory: Callable[[Callable[[object], None]], LiveViewService],
                  parent: QObject | None = None) -> None:
@@ -63,6 +64,8 @@ class LiveViewController(QObject):
             self.noActiveSession.emit()
         elif isinstance(event, NotificationsState):
             self.notificationsChanged.emit(event.connected)
+        elif isinstance(event, CloudUpdated):
+            self.cloudUpdated.emit(event.source)
         else:
             self.streamEvent.emit(event)
 

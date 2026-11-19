@@ -24,6 +24,12 @@ WebRTC signals (libdatachannel): {"type": "offer"|"answer", "description": <SDP>
 
 Flow: join the room, broadcast {"type": "request-offer"}, receive the tablet's offer as
 a ScreenshareMessage, answer it by direct message to the tablet's sourceDeviceID.
+
+Library events: "SyncComplete" says another device committed a new root (the app's
+Notifications::onNotificationReceived compares the event with it, 0x1402e95db, and emits
+updateNotificationReceived, which DocumentSyncInterface::onUpdateNotification takes).
+Like every event, the app drops it when sourceDeviceID is its own device ("Notification
+originated from ourself!").
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ BASE_PATH = "/screenshare/v1"
 NOTIFICATIONS_PATH = "/notifications/ws/json/1"
 ROOM_CREATED = "ScreenshareRoomCreated"
 ROOM_MESSAGE = "ScreenshareMessage"
+SYNC_COMPLETE = "SyncComplete"       # another device synced: the library changed
 REQUEST_OFFER = "request-offer"
 WEBRTC = "webtrc"                    # sic: the app's own spelling of the message type
 

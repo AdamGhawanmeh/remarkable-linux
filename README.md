@@ -144,7 +144,7 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 438 offline tests use a fake cloud and synthetic documents; they need no account
+The 795 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
 `client/tools/rm_roundtrip.py` checks the page writer against your own cached pages:
 every page must come back byte for byte, and take an image, a move and a delete without
@@ -164,6 +164,7 @@ when you use them.
 | Interface | The official desktop app's own QML, fonts, icons and translations, unmodified (1:1 UI) |
 | Log in | The app's log-in wizard with a one-time code from my.remarkable.com; **Log out** removes this computer from your account |
 | Cloud sync | Your library from reMarkable's cloud (sync v3/v4); documents download on demand |
+| Live sync | Changes from your tablet or phone appear on their own, as in the official app: the cloud's notifications socket announces each sync of another device ("SyncComplete"), and the client syncs shortly after (a burst of announcements makes one sync; one that arrives during a sync makes one more after it; a reconnection of the socket syncs what it may have missed). Its own announcements are ignored. Nothing syncs on its own while logged out, offline (`--offline`) or while the network is down; it catches up once the network is back. Where you are stays as it is: the library keeps its folder and selection, and an open page that changed is redrawn in place (while you select or type on it, once you finish). Edits not uploaded yet are kept and drawn over the new version of the page, never dropped |
 | Sync status | Settings > Cloud > **Check sync** runs the official app's checks (network, log-in, internet, then a full sync) with its messages; sync progress ("Syncing (3 of 10)"), "No cloud connection" while the network is down, and "Unable to sync" when a sync fails |
 | Offline cache | The cached library opens at once, also without a network; `--offline` never connects or writes |
 | Library | My files and folders, Notebooks, PDFs, Ebooks, Favorites, Trash, sort orders, grid and list views, thumbnails |
@@ -200,7 +201,9 @@ client/.venv/bin/python client/run.py --edit-notebook NAME
 turns the app's own editing interface on for the one notebook, PDF or ebook with that
 name (not in the trash, and no other notebook, PDF or ebook may share the name). Edits
 are kept on this computer and drawn over the page until you upload them yourself (see
-Upload below).
+Upload below). When another device changes a page you have edits on, live sync redraws
+it with the other device's changes and your edits over them; the edits stay pending
+(and that page's undo history starts again, as when it changes on another device).
 
 | Feature | Status |
 |---|---|

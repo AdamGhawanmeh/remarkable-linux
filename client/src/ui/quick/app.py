@@ -10,6 +10,14 @@ pairs in the background (AuthClient.login) and, once paired, syncs the library i
 window. Log out (LogoutConfirmDialog) deletes this device on the server, the tokens and the
 cached library, and shows the wizard again; so does the cloud rejecting the device token.
 
+Live incoming sync: while online, the notifications socket (kept by the Screen Share
+service) announces each sync of another device ("SyncComplete") and its own
+reconnections; DocumentSync turns them into syncs, gathered and one at a time, and is
+suspended while logged out, offline or without a network. A sync replaces the tree
+in place (Library.set_tree): the view stays where it is, an open page that changed is
+loaded again with the pending edits replayed over the new version, and pending edits
+are never dropped (they are kept apart from the synced files, core.edits.PendingEdits).
+
 Everything on screen is the official QML from the app's resources (qrc:/qml/main.qml and
 what it imports, unmodified), over Python implementations of the app's C++ types
 (bridge/); pages are drawn by this client's renderer inside the app's SceneView
@@ -154,6 +162,14 @@ class QuickApp:
         checker.check_internet = self.internet.start
         checker.request_sync = self._sync_for_check
         self.internet.finished.connect(checker.internet_checked)
+        # Live incoming sync (DocumentSync): suspended until this client is online.
+        sync = s.document_sync
+        sync.request_sync = self._live_sync
+        sync.suspend()
+        s.screen_share.cloudUpdated.connect(lambda source: sync.onUpdateNotification())
+        s.screen_share.notificationsConnected.connect(
+            lambda connected: sync.onConnectedNotification() if connected else None)
+        s.link.availabilityChanged.connect(lambda _: self._update_suspended())
 
     def _save_reading_position(self, doc_id: str, page: int, opened_ms: int | None) -> None:
         """Library.save_reading_position: lastOpenedPage/lastOpened to the cloud, as the app
@@ -225,6 +241,7 @@ class QuickApp:
         if not self._online:
             self._online = True
             self.singletons.screen_share.start()
+        self._update_suspended()
         if sync:
             self.syncer.refresh()
 
@@ -232,6 +249,22 @@ class QuickApp:
         if self._online:
             self._online = False
             self.singletons.screen_share.shutdown()
+        self._update_suspended()
+
+    def _update_suspended(self) -> None:
+        """Syncs asked for by the notifications socket run while this client is online
+        (logged in, not offline-only) and the network is not known to be down."""
+        sync = self.singletons.document_sync
+        if self._online and not self.closing and not self.singletons.link.known_offline:
+            sync.resume()
+        else:
+            sync.suspend()
+
+    def _live_sync(self) -> bool:
+        """DocumentSync.request_sync: a sync for live incoming sync; False when one runs."""
+        if self.closing or not self.logged_in or self.source.cached_only:
+            return True
+        return self.syncer.refresh()
 
     def _synced(self, tree: DocumentTree) -> None:
         self.set_tree(tree)
@@ -332,6 +365,7 @@ class QuickApp:
 
     def shutdown(self) -> None:
         self.closing = True
+        self.singletons.document_sync.suspend()
         self.library.save_reading_positions(include_open=True)
         self.singletons.screen_share.shutdown()
         self.account.wait(60000)

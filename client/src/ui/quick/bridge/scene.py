@@ -909,6 +909,13 @@ class _SceneView:
         self._pen_done.connect(self._on_pen_done)
         self._pen_loading = 0
         self._pen_rendering = 0
+        # Live incoming sync: the document whose node changes this view follows, what
+        # the page shown was loaded from, and a reload put off until the selection or
+        # the text session ends.
+        self._watched = None
+        self._loading_key: tuple | None = None
+        self._shown_key: tuple | None = None
+        self._stale = False
 
     # -- loading --
     def componentComplete(self) -> None:
@@ -916,6 +923,7 @@ class _SceneView:
         inherited = _viewport_transforms.get(_viewport_key(self))
         if inherited is not None:
             self._tiles.setFocalPoint(*inherited)
+        self._watch_document()
         self._load()
         pen_bridge.attach(self)
 
@@ -925,6 +933,7 @@ class _SceneView:
             self.stop_text()
             self._load()
             if name == "document":
+                self._watch_document()
                 pen_bridge.attach(self)
         elif name == "textModeEnabled" and not self._get("textModeEnabled"):
             self.stop_text()
@@ -939,6 +948,8 @@ class _SceneView:
         node = getattr(document, "node", None)
         if node is None or source is None:
             return
+        self._stale = False
+        self._loading_key = self._page_key(node, page_id)
         if not quiet:
             self._set("status", 1)  # Updating
 
@@ -980,6 +991,8 @@ class _SceneView:
         if self._pages is not None:
             self._pages.close()
         self._pages, self._content, self._bounds, self._page_id = pages, content, bounds, shown
+        node = getattr(self._get("document"), "node", None)
+        self._shown_key = self._page_key(node, shown) if node is not None else self._loading_key
         if self._pen_loading:
             self._pen_rendering, self._pen_loading = self._pen_loading, 0
         layers = content.scene.layers if content.scene is not None else []
@@ -1019,6 +1032,51 @@ class _SceneView:
         learn = getattr(self._get("document"), "learn_pdf_page_count", None)
         if learn is not None and pages.pdf is not None:
             learn(pages.pdf.page_count)
+
+    # -- live incoming sync --
+    def _watch_document(self) -> None:
+        document = self._get("document")
+        if document is self._watched:
+            return
+        old, self._watched = self._watched, None
+        if old is not None and shiboken6.isValid(old) and hasattr(old, "nodeReplaced"):
+            try:
+                old.nodeReplaced.disconnect(self._node_replaced)
+            except (RuntimeError, TypeError):
+                pass
+        if hasattr(document, "nodeReplaced"):
+            document.nodeReplaced.connect(self._node_replaced)
+            self._watched = document
+
+    @staticmethod
+    def _page_key(node, page_id: str) -> tuple:
+        """What page `page_id` of `node` is drawn from: its .rm and image files, and the
+        PDF under it (the pending edits are another part, which the library tracks)."""
+        prefix = f"{node.id}/{page_id}"
+        files = tuple(sorted((name, digest) for name, digest in node.files.items()
+                             if name == prefix + ".rm" or name.startswith(prefix + "/")))
+        return files, node.files.get(pdf_name(node) or "")
+
+    def _node_replaced(self) -> None:
+        """The document was synced anew (or its .content/.metadata changed): when the page
+        shown changed, load it again in place, the pending edits replayed over the new
+        version (LibrarySource.page_scene). While something is selected or typed, that
+        waits until it ends: those load the page again themselves."""
+        node = getattr(self._get("document"), "node", None)
+        if node is None or self._content is None or not self._page_id:
+            return
+        if self._page_key(node, self._page_id) == self._shown_key:
+            return
+        if self._sel is not None or self.text_session is not None or self._text_opening:
+            log.info("page %s changed in the cloud: reloading once the edit ends", self._page_id)
+            self._stale = True
+            return
+        log.info("page %s changed in the cloud: reloading it", self._page_id)
+        self._load(quiet=True)
+
+    def _reload_if_stale(self) -> None:
+        if self._stale and self._sel is None and self.text_session is None and not self._text_opening:
+            self._load(quiet=True)
 
     # -- editing --
     def _insertion_target(self, what: str):
@@ -1127,6 +1185,8 @@ class _SceneView:
                                                           else rsel.IDENTITY)))
         if changed and self._content is not None:
             self._render()
+        if selection is None and self._stale:
+            self._reload_if_stale()
 
     def _select(self, layer: int, ids, merge=None) -> bool:
         """Select the items `ids` of a layer (dropping those the layer does not hold) and
@@ -1576,6 +1636,7 @@ class _SceneView:
         self._controller._set("keyActionRunning", False)
         if error is not None:
             _notify(error)
+            self._reload_if_stale()
             return
         if not self._get("textModeEnabled") and not self._text_then:
             # Text mode ended while the page's text was read: still keep the box made.

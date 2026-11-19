@@ -611,24 +611,39 @@ class DocumentWrapper(EntryWrapper):
     redirectionPageMapChanged = Signal()
     pageTagsChanged = Signal()
     viewBackgroundFilterChanged = Signal()
+    # Not the app's: the document's node was replaced by another version (a sync, an
+    # edit of its .content/.metadata); its open page views check whether to reload.
+    nodeReplaced = Signal()
 
     def __init__(self, node: Node, library: "Library") -> None:
         super().__init__(node, library)
         self._refs: list[PageRef] | None = None
         self._pdf_pages: tuple[str, int] | None = None     # (PDF blob hash, pages the viewer found)
 
+    def _page_layout(self) -> list[tuple]:
+        """What the viewport builds its pages from: their ids, PDF pages and templates
+        (not their strokes)."""
+        return [(p.page_id, p.pdf_page, p.template) for p in self._pages()]
+
     def update(self, node: Node) -> None:
-        old = self._page_count()
+        old, layout = self._page_count(), self._page_layout()
         self._refs = None
         super().update(node)
         self.pageCountChanged.emit(self._page_count(), old)
         for signal in (self.lastOpenedChanged, self.layoutPropertiesChanged, self.orientationChanged,
-                       self.zoomModeChanged, self.customZoomChanged, self.templatesChanged, self.pageMapChanged,
-                       self.documentMetadataChanged, self.sizeInBytesChanged, self.redirectionPageMapChanged,
-                       self.pageTagsChanged, self.viewBackgroundFilterChanged):
+                       self.zoomModeChanged, self.customZoomChanged, self.documentMetadataChanged,
+                       self.sizeInBytesChanged, self.pageTagsChanged, self.viewBackgroundFilterChanged):
             signal.emit()
+        # DocumentViewport builds its page views anew on pageMapChanged: only when the
+        # pages are others. A sync that changed what is drawn on a page (live incoming
+        # sync from the tablet) leaves the page view, which reloads it in place
+        # (nodeReplaced): an open text session, selection or stroke on it stays.
+        if self._page_layout() != layout:
+            for signal in (self.templatesChanged, self.pageMapChanged, self.redirectionPageMapChanged):
+                signal.emit()
         self.lastOpenedPageChanged.emit(self._page())
         self.coverPageNumberChanged.emit(node.content.cover_page_number)
+        self.nodeReplaced.emit()
 
     def _page(self) -> int:
         """lastOpenedPage, kept to an existing page: the tablet writes -1 for a notebook
@@ -1729,7 +1744,28 @@ class SyncChecker(QObject):
 
 class DocumentSync(QObject):
     """DocumentSync (xofm::libs::syncinterface::DocumentSyncInterface): sync state from
-    this client's Syncer."""
+    this client's Syncer, and live incoming sync.
+
+    Live incoming sync, as reMarkable.exe 3.29 does it: the notifications socket's
+    "SyncComplete" from another device (onUpdateNotification) and each (re)connection of
+    that socket (onConnectedNotification) ask for a sync. Requests go through one
+    single-shot timer that is not restarted while it runs (the app's scheduler,
+    0x140136bb0, keeps a running QTimer whose remaining time is within the interval), so
+    a burst of notifications makes one sync. Its interval is ours: the app waits 100 ms
+    before a full sync; a sync here starts with GET /sync/v4/root and shows "Syncing",
+    so requests are gathered for REQUEST_DELAY_MS.
+
+    A request that comes while a sync runs (one the user asked for, or Check sync's)
+    leaves one follow-up sync for when that one ends: the running sync may have read
+    the root before the change. suspend() (offline, logged out) stops the timer;
+    resume() then syncs once if anything asked for a sync meanwhile. The app's resume
+    only clears the flag (0x1401380d6), and catches up by its own periodic syncs, which
+    this client does not have.
+
+    QuickApp provides `request_sync()`: start a sync, False when one is already running.
+    """
+
+    REQUEST_DELAY_MS = 1000
 
     syncStatusChanged = Signal(int, str)
     syncProtocolChanged = Signal()
@@ -1745,6 +1781,14 @@ class DocumentSync(QObject):
         self._checker = SyncChecker(self)
         self.syncStatusChanged.connect(self._checker.sync_status_changed)
         self.progressCountsChanged.connect(self._checker.progress_changed)
+        self._suspended = False
+        self._missed = False        # a sync was asked for while suspended
+        self._queued = False        # a sync was asked for while one ran
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(self.REQUEST_DELAY_MS)
+        self._timer.timeout.connect(self._start_requested)
+        self.request_sync: Callable[[], bool] = lambda: True
 
     def set_status(self, status: SyncStatus, detail: str = "") -> None:
         """A sync started (Syncing), ended (Completed) or failed (any status above Aborted)."""
@@ -1754,6 +1798,9 @@ class DocumentSync(QObject):
                         else ProgressCounts(progress=1.0))
         self.syncStatusChanged.emit(int(status), detail)
         self.progressCountsChanged.emit(dict(self._counts))
+        if not self._syncing and self._queued:
+            self._queued = False
+            self._request("follow-up")
 
     def set_progress(self, transferred: int, scheduled: int, throttled: bool = False) -> None:
         """The running sync's progress (onSyncProgressChanged, 0x140120780): entries
@@ -1777,13 +1824,48 @@ class DocumentSync(QObject):
     def requestProtocol(self, flag: int, account_created_at: int) -> None:
         pass
 
+    # -- live incoming sync --
+    @property
+    def suspended(self) -> bool:
+        return self._suspended
+
+    @property
+    def pending(self) -> bool:
+        """A sync has been asked for and not started yet (timer, follow-up or suspended)."""
+        return self._timer.isActive() or self._queued or self._missed
+
+    def _request(self, why: str) -> None:
+        if self._suspended:
+            log.debug("sync request (%s) while suspended: once resumed", why)
+            self._missed = True
+        elif not self._timer.isActive():
+            log.debug("sync requested (%s)", why)
+            self._timer.start()
+
+    def _start_requested(self) -> None:
+        if self._suspended:
+            self._missed = True
+        elif self._syncing or not self.request_sync():
+            log.debug("a sync is running: one more after it")
+            self._queued = True
+
     @Slot()
     def suspend(self) -> None:
-        pass
+        if not self._suspended:
+            log.info(" - suspending sync")
+            self._suspended = True
+            if self._timer.isActive():
+                self._timer.stop()
+                self._missed = True
 
     @Slot()
     def resume(self) -> None:
-        pass
+        if self._suspended:
+            log.info(" - resuming sync")
+            self._suspended = False
+            if self._missed:
+                self._missed = False
+                self._request("missed while suspended")
 
     @Slot(bool)
     def onDiskSpaceAvailableChangedSignificantly(self, available: bool) -> None:
@@ -1795,11 +1877,14 @@ class DocumentSync(QObject):
 
     @Slot()
     def onConnectedNotification(self) -> None:
-        pass
+        """The notifications socket (re)connected: whatever changed while it was down
+        was not announced."""
+        self._request("notifications connected")
 
     @Slot()
     def onUpdateNotification(self) -> None:
-        pass
+        """Another device synced ("SyncComplete")."""
+        self._request("update notification")
 
     @Slot("QVariantMap")
     def onSyncProgressChanged(self, stats: dict) -> None:

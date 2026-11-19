@@ -44,7 +44,10 @@ def rect_update(rects: list[tuple[int, int, int, int, bytes]], finish: bool = Fa
 
 
 class FakeNotifications:
-    """The notifications socket: yields None when connected, then queued messages."""
+    """The notifications socket: yields None when connected, then queued messages.
+    drop() ends the connection as a lost socket does (the service reconnects)."""
+
+    DROP = object()
 
     def __init__(self) -> None:
         self.queue: asyncio.Queue | None = None
@@ -53,8 +56,9 @@ class FakeNotifications:
         self.end_first = 0           # connections that end cleanly right after connecting
 
     async def messages(self):
-        if self.queue is None:
-            self.queue = asyncio.Queue()
+        if self.queue is None or self._loop is not asyncio.get_running_loop():
+            # A service started again runs a new loop: the queue must belong to it.
+            self.queue, self._loop = asyncio.Queue(), asyncio.get_running_loop()
         self.connections += 1
         if self.fail_first:
             self.fail_first -= 1
@@ -64,10 +68,16 @@ class FakeNotifications:
             self.end_first -= 1
             return
         while True:
-            yield await self.queue.get()
+            message = await self.queue.get()
+            if message is self.DROP:
+                raise OSError("connection lost")
+            yield message
 
     def push(self, raw: str) -> None:
         self.queue.put_nowait(raw)
+
+    def drop(self) -> None:
+        self.queue.put_nowait(self.DROP)
 
 
 class FakeTablet:
