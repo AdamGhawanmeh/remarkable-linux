@@ -40,11 +40,19 @@ PDF_PX_PER_PT = 226 / 72
 
 
 class PdfFile:
-    """A PDF opened from a local file."""
+    """A PDF opened from a local file, with the password unlocked for it if it needs
+    one (ui.pdflock); PdfLocked when it needs one that is not known."""
 
     def __init__(self, path: str | Path) -> None:
+        from .pdflock import PdfLocked, password_for
         self.doc = QPdfDocument()
+        password = password_for(path)
+        if password:
+            self.doc.setPassword(password)
         error = self.doc.load(str(path))
+        if error == QPdfDocument.Error.IncorrectPassword:
+            self.doc.close()
+            raise PdfLocked(f"the PDF {Path(path).name} needs a password")
         if error != QPdfDocument.Error.None_ or self.doc.status() != QPdfDocument.Status.Ready:
             raise ValueError(f"cannot open PDF {path}: {error}")
 

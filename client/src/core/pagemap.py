@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 FIRST, LAST, MIDDLE = "a", "z", "n"     # the key alphabet a..z (0x140d54270) and its middle
 JUMP_FLOOR, JUMP_GROW = "n", "r"
@@ -413,6 +413,38 @@ def upgrade(content: dict, author_uuid: bytes | str, templates: list[str] | None
         pagemap.insert(len(pagemap.live), page_id, template, redirect)
     if original > 0:
         _set(cpages, "original", original, pagemap.author)
+    pagemap.save()
+    out["formatVersion"] = 2
+    return out
+
+
+# ------------------------------------------------------------------ a clean copy's page list
+
+def clean(content: dict, author_uuid: bytes | str, count: int, new_id: Callable[[], str]) -> dict:
+    """The .content of a clean copy (LibraryController::cloneEntry(..., clean = true) ->
+    Document::clone 0x14065a590 with the clean option), as a new dict: the page list is
+    not copied but made afresh for `author_uuid` (an empty PageMap, 0x1406502a0 ->
+    0x140876c70), then setPageCount(`count`, the source's PDF page count; 0x140668240 ->
+    0x140876fd0) appends `count` new pages in the normal insert mode with no template
+    and PDF page i (`redir` i: the copy's type is still Undefined then, not a notebook),
+    then setFileType (0x140667aa0 -> 0x140875c40) sets `original` to the page count
+    (the author's next tick, A:1) and writes every page's redirection again
+    (0x1408775e0: one more tick, A:3). `lastOpened` is not set. Every other key is the
+    source's, except the page tags (their pages are gone) and the formatVersion 1 page
+    list (`pages`, `redirectionPageMap`, `originalPageCount`): formatVersion is 2."""
+    if count < 1:
+        raise PageMapError("a clean copy needs the document's page count")
+    out = {k: v for k, v in content.items()
+           if k not in ("cPages", "pages", "redirectionPageMap", "originalPageCount", "pageTags")}
+    cpages: dict = {"lastOpened": {"timestamp": "0:0", "value": ""},
+                    "original": {"timestamp": "0:0", "value": -1}, "pages": [], "uuids": []}
+    out["cPages"] = cpages
+    pagemap = PageMap(out, author_uuid)
+    for i in range(int(count)):
+        pagemap.insert(len(pagemap.live), new_id(), "", i)
+    _set(cpages, "original", int(count), pagemap.author)
+    for i, entry in enumerate(pagemap.live):
+        _set(entry, "redir", i, pagemap.author)
     pagemap.save()
     out["formatVersion"] = 2
     return out

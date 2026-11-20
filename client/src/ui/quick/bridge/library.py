@@ -688,10 +688,30 @@ class DocumentWrapper(EntryWrapper):
         return tr("Document", "Page %1 of %2").replace("%1", str(self._page() + 1)).replace("%2", str(pages))
 
     def _subtext(self) -> str:
-        """Document::subtext: the reading progress (downloads and password-protected
-        PDFs, which this client does not have, read "Transferring" and
-        "Password protected PDF")."""
+        """Document::subtext: the reading progress; "Password protected PDF" for a
+        locked one (downloads, which this client does not show, read "Transferring")."""
+        if self._locked():
+            return tr("Document", "Password protected PDF")
         return self._progress_text()
+
+    def _locked(self) -> bool:
+        """Document::lockedByPassword: its PDF needs a password not given yet."""
+        if self._node.file_type is not FileType.PDF:
+            return False
+        try:
+            return bool(self._library.pdf_locked(self._node))
+        except Exception as err:          # never take the library view down
+            log.warning("could not tell whether %s is password protected: %s", self._node.id, err)
+            return False
+
+    def unlocked(self, ok: bool) -> None:
+        """unlockWithPassword's answer (PasswordTask): loadingSucceeded, or invalidPassword."""
+        if ok:
+            self.lockedByPasswordChanged.emit(False)
+            self.subtextChanged.emit()
+            self.loadingSucceeded.emit()
+        else:
+            self.invalidPassword.emit()
 
     def _metadata(self) -> dict:
         value = self._node.content.raw.get("documentMetadata")
@@ -711,7 +731,7 @@ class DocumentWrapper(EntryWrapper):
                                                                   Qt.AlignmentFlag.AlignJustify).value),
                              notify=layoutPropertiesChanged)
     layoutProgress = Property(float, lambda self: 1.0, notify=layoutProgressChanged)
-    lockedByPassword = Property(bool, lambda self: False, notify=lockedByPasswordChanged)
+    lockedByPassword = Property(bool, lambda self: self._locked(), notify=lockedByPasswordChanged)
     coverPageNumber = Property(int, lambda self: self._node.content.cover_page_number, notify=coverPageNumberChanged)
     orientation = Property(int, lambda self: int((Qt.Orientation.Horizontal
                                                   if self._node.content.orientation == "landscape"
@@ -915,6 +935,8 @@ class Library(QObject):
         self.save_reading_position: Callable[[str, int, int | None], None] | None = None
         # EntryWrapper.abortExport (the app sets its DocumentExporter's abort).
         self.abort_export: Callable[[str], None] = lambda entry_id: None
+        # Whether a document's PDF needs a password not given yet (the app sets it: ui.pdflock).
+        self.pdf_locked: Callable[[DocumentNode], bool] = lambda node: False
 
     def reading_position(self, doc_id: str) -> dict[str, int]:
         return self._reading.get(doc_id, {})
@@ -1248,12 +1270,14 @@ class LibraryController(QObject):
 
     entryMoved = Signal(str)
     _tocLoaded = Signal(str, "QVariantList")        # document id, its DocumentChapters (from a worker)
+    _unlocked = Signal(str, bool)                   # document id, whether the password opened it (worker)
 
     def __init__(self, library: Library, submit: Callable[[str, Callable, str], None],
                  parent: QObject | None = None,
                  inherit_editing: Callable[[str, str], bool] | None = None) -> None:
         super().__init__(parent)
         self._tocLoaded.connect(self._toc_done)
+        self._unlocked.connect(self._unlock_done)
         self.library = library
         self.submit = submit
         # (source id, copy id) after a copy is made: a copy of a notebook that may be
@@ -1377,13 +1401,17 @@ class LibraryController(QObject):
         document in `collection_id`, named as the app names it (tr "%1 copy", made unique
         among all entries), committed like an import (SyncClient.clone_document). Returns
         the copy's id. As in the app, only documents are copied (a folder is not a valid
-        source); a "clean" copy (without annotations) is not made yet."""
+        source). `clean` (the tablet's copy without annotations; the desktop QML never
+        passes it): a PDF or ebook copied with a fresh page list and none of its page
+        files (core.clone); a notebook "cannot be cleaned" (0x1404dc640) and nothing is
+        made."""
         node = self.library.tree.get(str(entry_id))
-        if clean:
-            self._unavailable(f"cloneEntry({entry_id!r}, {collection_id!r}, clean=True)", "Not available on Linux yet")
-            return ""
         if not isinstance(node, DocumentNode):
             self._unavailable(f"cloneEntry({entry_id!r}, {collection_id!r}) of a folder", "Only documents can be copied")
+            return ""
+        if clean and node.file_type not in (FileType.PDF, FileType.EPUB):
+            self._unavailable(f"Cannot clean {entry_id!r} of type {node.file_type.name}",
+                              "Only PDFs and ebooks can be copied without annotations")
             return ""
         from core.clone import copy_name
         target = collection_id or ROOT_ID
@@ -1391,9 +1419,10 @@ class LibraryController(QObject):
                            {n.name for n in self.library.tree.nodes.values()})
         copy_id = str(uuid.uuid4())
         inherit = self.inherit_editing
+        log.info("%s %s to %s", "Cleaning" if clean else "Cloning", node.id, copy_id)
 
         def copy(sync, _):
-            sync.clone_document(node.id, target, name, copy_id)
+            sync.clone_document(node.id, target, name, copy_id, clean=bool(clean))
             inherit(node.id, copy_id)
         self.submit(f"Copying {node.name}", copy, f"Copied {node.name}")
         return copy_id
@@ -1524,7 +1553,34 @@ class LibraryController(QObject):
 
     @Slot(str, str)
     def unlockWithPassword(self, document_id: str, password: str) -> None:
-        self._unsupported("unlockWithPassword")
+        """PasswordDialog's "Open" (LibraryController::unlockWithPassword 0x1404e3c90 ->
+        PasswordTask): the password is tried on the document's PDF on a worker thread;
+        the document then emits loadingSucceeded (the dialog accepts and the document
+        opens) or invalidPassword (the dialog says "Incorrect password"). A right
+        password is kept in memory only (ui.pdflock); nothing is written, or logged."""
+        entry = self.library.entryForId(str(document_id))
+        source = self.source()
+        if not isinstance(entry, DocumentWrapper) or source is None:
+            log.warning("unlockWithPassword: no document specified (%r)", document_id)
+            return
+        node = entry.node
+        log.info("Setting password for %s", node.id)
+
+        def job() -> None:
+            from ...pdflock import unlock
+            ok = False
+            try:
+                path = source.pdf_path(node)
+                ok = path is not None and unlock(path, str(password or ""))
+            except Exception as err:            # offline, not cached, unreadable: not unlocked
+                log.warning("could not set password for %s: %s", node.id, type(err).__name__)
+            emit_from_worker(self, lambda: self._unlocked.emit(str(document_id), ok))
+        _toc_jobs().start(_Job(job))
+
+    def _unlock_done(self, document_id: str, ok: bool) -> None:
+        entry = self.library._entries.get(document_id)
+        if isinstance(entry, DocumentWrapper):
+            entry.unlocked(bool(ok))
 
     @Slot(str, int, float)
     def setScrollPosition(self, document_id: str, page: int, position: float) -> None:

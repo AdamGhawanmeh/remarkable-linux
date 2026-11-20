@@ -195,8 +195,11 @@ class Exporter(QObject):
         self.running = False
         self._cancel = threading.Event()
 
-    def export(self, kind: str, doc: Document, path: str, pages: list[int] | None = None) -> bool:
-        """Export `doc` (only the pages at indexes `pages`, for PDF, PNG or SVG, if given)."""
+    def export(self, kind: str, doc: Document, path: str, pages: list[int] | None = None,
+               password: str = "", keep_password: bool = False) -> bool:
+        """Export `doc` (only the pages at indexes `pages`, for PDF, PNG or SVG, if given).
+        `password`: the one ExportDialog asked for a password-protected PDF (given to
+        ui.pdflock first, in memory); `keep_password`: a PDF export is protected with it."""
         if self.running:
             return False
         self.running = True
@@ -212,10 +215,16 @@ class Exporter(QObject):
                 if cancel.is_set():
                     raise ExportCancelled()
                 if kind in WRITERS:
+                    if password:
+                        from .pdflock import unlock
+                        pdf = self.source.pdf_path(doc)
+                        if pdf is not None and not unlock(pdf, password):
+                            raise ValueError("Incorrect password")
                     document = DocumentPages(self.source, doc)     # own PDF handle for this thread
                     write = WRITERS[kind]
+                    extra = {"password": password} if kind == "pdf" and password and keep_password else {}
                     try:
-                        result = write(document, path, progress=report, indexes=pages)
+                        result = write(document, path, progress=report, indexes=pages, **extra)
                     finally:
                         document.close()
                 elif kind == "rmdoc":

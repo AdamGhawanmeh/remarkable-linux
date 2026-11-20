@@ -22,6 +22,15 @@ tr("%1 copy") with the source's name (context xofm::libs::library::LibraryContro
 
 The cloud stores files by content, so the files a copy shares with its source are
 not uploaded again; only .content and .metadata are new.
+
+A clean copy (cloneEntry(..., clean = true): the tablet's copy without annotations;
+the desktop QML never asks for one) is made of PDFs and ebooks only ("Cannot clean {}
+of type {}" for an Undefined document or a notebook, 0x1404dc640) and logged
+"Cleaning" instead of "Cloning". Document::clone then copies no page at all
+(DocumentCopyHelper pairs no pages, 0x1406b2640): no .rm, no page folder, no
+-metadata.json, highlights or thumbnails; the page list is made afresh from the PDF's
+page count (core.pagemap.clean). The document's other files (the PDF, the EPUB,
+.pagedata, ...) are copied as they are, and its pending edits are not part of it.
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ import uuid
 from typing import Callable, Iterable
 
 from .models import json_bytes
-from .pagemap import PageMap, format_stamp
+from .pagemap import PageMap, PageMapError, clean as clean_pages, format_stamp
 
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 COPY_NAME = "%1 copy"           # tr() source text, context xofm::libs::library::LibraryController
@@ -87,20 +96,62 @@ def _rename(name: str, source_id: str, copy_id: str, pages: dict[str, str], drop
     return copy_id + rest
 
 
+CLEANABLE = ("pdf", "epub")     # .content fileType of the documents a clean copy is made of
+
+
+class CloneError(ValueError):
+    """The copy cannot be made (a clean copy of a notebook)."""
+
+
+def clean_page_count(content: dict, pdf_pages: Callable[[], int] | None = None) -> int:
+    """The page count a clean copy starts from: the PDF's (cPages `original`, or
+    formatVersion 1 `originalPageCount`; else `pdf_pages()`, the rendition counted)."""
+    cpages = content.get("cPages")
+    value = cpages.get("original") if isinstance(cpages, dict) else None
+    count = value.get("value") if isinstance(value, dict) else content.get("originalPageCount")
+    count = int(count) if isinstance(count, (int, float)) and not isinstance(count, bool) else -1
+    if count < 1 and pdf_pages is not None:
+        count = int(pdf_pages())
+    return count
+
+
+def _page_ids(content: dict) -> set[str]:
+    """Every page id a .content lists (live and deleted; formatVersion 1 `pages` too)."""
+    cpages = content.get("cPages")
+    if isinstance(cpages, dict):
+        return {e.get("id") for e in cpages.get("pages") or [] if isinstance(e, dict) and isinstance(e.get("id"), str)}
+    pages = content.get("pages")
+    return {p for p in pages if isinstance(p, str)} if isinstance(pages, list) else set()
+
+
 def clone_files(source_id: str, names: Iterable[str], read: Callable[[str], bytes], *, copy_id: str,
                 name: str, parent: str, now_ms: int, author: bytes,
-                new_page_id: Callable[[], str] | None = None) -> tuple[dict[str, str], dict[str, bytes]]:
+                new_page_id: Callable[[], str] | None = None, clean: bool = False,
+                pdf_pages: Callable[[], int] | None = None) -> tuple[dict[str, str], dict[str, bytes]]:
     """The copy of document `source_id` (its files `names`, `read(name)` their bytes;
     only .content and .metadata are read): (source file -> copy's name, for files copied
-    as they are; copy's .content and .metadata, new bytes)."""
+    as they are; copy's .content and .metadata, new bytes). `clean`: a copy without
+    annotations (see the module); CloneError when the document is not a PDF or ebook or
+    its page count is unknown (`pdf_pages()` counts the PDF's pages if needed)."""
     new_page_id = new_page_id or (lambda: str(uuid.uuid4()))
     names = list(names)
     content_name, metadata_name = f"{source_id}.content", f"{source_id}.metadata"
     content = json.loads(read(content_name))
-    known = {e.get("id") for e in (content.get("cPages") or {}).get("pages") or [] if isinstance(e, dict)} \
-        if isinstance(content.get("cPages"), dict) else set()
-    content, pages = _clone_content(content, author, new_page_id)
-    dropped = {p for p in known if p not in pages}
+    if clean:
+        kind = content.get("fileType")
+        if kind not in CLEANABLE:
+            raise CloneError(f"Cannot clean {source_id} of type {kind or 'undefined'}")
+        try:
+            content = clean_pages(content, author, clean_page_count(content, pdf_pages), new_page_id)
+        except PageMapError as err:
+            raise CloneError(str(err)) from err
+        pages: dict[str, str] = {}
+        dropped = _page_ids(json.loads(read(content_name)))
+    else:
+        known = {e.get("id") for e in (content.get("cPages") or {}).get("pages") or [] if isinstance(e, dict)} \
+            if isinstance(content.get("cPages"), dict) else set()
+        content, pages = _clone_content(content, author, new_page_id)
+        dropped = {p for p in known if p not in pages}
     metadata = json.loads(read(metadata_name))
     metadata.update(visibleName=name, parent=parent, createdTime=str(now_ms), lastModified=str(now_ms),
                     lastOpened="0", lastOpenedPage=0, pinned=False)

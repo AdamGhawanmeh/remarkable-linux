@@ -225,8 +225,22 @@ class QuickApp:
         self.source.forget()
         shutil.rmtree(self.cache_dir / "thumbnails", ignore_errors=True)
 
+    def _pdf_locked(self, node) -> bool:
+        """Library.pdf_locked: whether the document's PDF, when cached here, needs a
+        password not given yet (ui.pdflock). An uncached PDF is not fetched to see."""
+        from ..library import pdf_name
+        from ..pdflock import locked
+        name = pdf_name(node)
+        if name is None:
+            return False
+        blobs = self.source.sync.blobs
+        blob = node.files[name]
+        return blobs.has(blob) and locked(blobs.path(blob))
+
     def _logged_out(self) -> None:
         log.info("logged out")
+        from ..pdflock import forget
+        forget()
         self.library.set_tree(DocumentTree(), reset=True)
         self.singletons.authentication.logged_out()
 
@@ -311,6 +325,7 @@ class QuickApp:
         library_controller = self.singletons.controller
         library_controller.source = lambda: self.source
         library_controller.refresh = lambda: self.set_tree(self.source.sync.tree)
+        self.library.pdf_locked = self._pdf_locked
         set_clipboard(self.singletons.clipboard)
         self.translator = QTranslator()
         self._translate(self.singletons.language.languageCode)

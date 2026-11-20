@@ -551,7 +551,10 @@ class PlatformHelpers(QObject):
             self.errorMessage.emit("This export format is not available on Linux")
             return False
         path = QUrl(file_path).toLocalFile() if str(file_path).startswith("file:") else str(file_path)
-        return bool(self._export(path, document_id, kind, [int(p) for p in pages] if pages else None))
+        pages = [int(p) for p in pages] if pages else None
+        if password:            # a password-protected PDF: the password the dialog asked for
+            return bool(self._export(path, document_id, kind, pages, str(password), bool(keep_password)))
+        return bool(self._export(path, document_id, kind, pages))
 
     @Slot(result=int)
     def topLevelWindowCount(self) -> int:
@@ -974,21 +977,66 @@ class DocumentController(QObject):
                                                 paper_size_from_page: int = -1, callback=None) -> bool:
         return self._add_page(document_id, insert_index, template, callback)
 
+    def _external(self, document_id: str, target_id: str, what: str, run, callback=None, moved: bool = False) -> bool:
+        """Pages of `document_id` copied (or moved) into another document `target_id`,
+        as the app's CopyExternalPagesTask does (LibrarySource.import_pages /
+        move_pages_to): `run(source, source node, target node)` returns the PageImport;
+        then the library is shown again, the target emits pagesAdded with the new
+        pages' indices (and the source pagesRemoved, for a move), and the QML callback
+        runs. False (and the user told why) when not made."""
+        source = self.source()
+        library = self._library
+        node = library.tree.get(str(document_id)) if library is not None else None
+        target = library.tree.get(str(target_id)) if library is not None else None
+        if source is None or node is None or target is None:
+            log.warning("%s: invalid source and/or target (%r -> %r)", what, document_id, target_id)
+            self.notify(f"Unable to {what}")
+            return False
+        from core.edits import EditError
+        from core.sync import SyncError
+        try:
+            edit = run(source, node, target)
+        except (EditError, SyncError) as err:
+            log.warning("%s of %s into %s: %s", what, document_id, target_id, err)
+            self.notify(str(err))
+            return False
+        self.refresh()
+        ids = source.page_ids(source.synced(target.id) or target)
+        added = [ids.index(n) for n in edit.new_ids if n in ids]
+        entry = library.entryForId(str(target_id))
+        if entry is not None:
+            entry.pagesAdded.emit(added)
+        if moved:
+            gone = library.entryForId(str(document_id))
+            if gone is not None:
+                gone.pagesRemoved.emit()
+        if callback is not None and callable(getattr(callback, "call", None)) and not callback.isUndefined():
+            QTimer.singleShot(0, self, lambda: callback.call([]))
+        return True
+
     @Slot(str, "QVariantList", str, int, result=bool)
     @Slot(str, "QVariantList", str, int, "QJSValue", result=bool)
     def movePages(self, document_id: str, pages: list, target_id: str, position: int, callback=None) -> bool:
+        """Pages moved within a document (doMovePages), or into another one: copied in
+        (CopyExternalPagesTask) and then deleted from `document_id` (DeletePagesTask), as
+        the app's task group does (0x140491b70)."""
         if target_id and target_id != document_id:
-            self._unsupported(f"movePages({document_id!r}, pages {list(pages)}, to another document {target_id!r}, at {position})", tell=True)
-            return False
+            return self._external(document_id, target_id, "move pages",
+                                  lambda source, node, target: source.move_pages_to(
+                                      target, node, list(pages), int(position), self._now_ms())[0],
+                                  callback, moved=True)
         return self._edit(document_id, "move pages",
                           lambda source, node: source.move_pages(node, list(pages), position, self._now_ms()),
                           callback, lambda entry, _: entry.pagesMoved.emit())
 
     @Slot(str, "QVariantList", str, int, result=bool)
     def copyPages(self, document_id: str, pages: list, target_id: str, position: int) -> bool:
+        """Pages duplicated within a document (CopyPagesTask), or copied into another one
+        (CopyExternalPagesTask, 0x140490bb0 -> 0x14068ffb0)."""
         if target_id and target_id != document_id:
-            self._unsupported(f"copyPages({document_id!r}, pages {list(pages)}, to another document {target_id!r}, at {position})", tell=True)
-            return False
+            return self._external(document_id, target_id, "paste pages",
+                                  lambda source, node, target: source.import_pages(
+                                      target, node, list(pages), int(position), self._now_ms())[0])
 
         def run(source, node):
             edit = source.copy_pages(node, list(pages), position, self._now_ms())

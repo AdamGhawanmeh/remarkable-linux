@@ -2226,6 +2226,100 @@ SheetDialog, and closes the document); taking up a pen, eraser, lasso or text mo
 clears it. Inserted pages (no `redir`) have no PDF page and select nothing; the PDF page
 comes from the page list (`document_pages`), so moved and inserted pages are allowed for.
 
+### 5.10 Pages between documents, clean copies, password-protected PDFs
+
+Traced in reMarkable.exe 3.29 [O unless marked] (Ghidra headless decompilation of the
+functions named; moc static metacalls `DocumentController` 0x140472e80 and
+`LibraryController` 0x140473ef0 give the slots).
+
+**Pages copied or moved into another document.** The QML's page clipboard
+(`PageActions.qml` `moveTo`) calls `DocumentController::copyPages(source, pages,
+target, position)` (slot 16, 0x140490fc0 → 0x140490bb0) or `movePages(..., jsCallback)`
+(slots 14/15, 0x1404922e0 → 0x140491b70). Both log "Copy|Move pages {} in {} to {} at
+position {}", refuse an invalid source/target ("Invalid source and/or target while
+moving..") and ensure the format version of both documents first (0x14065e7e0,
+"Cannot copy|move pages, unable to ensure correct format version": the fv1 → cPages
+upgrade of §5.4). With source == target the same-document tasks run (`CopyPagesTask`
+0x1406904b0, keeps `redir`, §5.4). Otherwise:
+- copy = `CopyExternalPagesTask` (0x14068ffb0; RTTI `.?AVCopyExternalPagesTask@@`,
+  derived from `CopyPagesTask` → `DocumentTask` → `Task`), built with the source's page
+  ids (0x140663160) and templates (0x1406694b0: the page's raw template register,
+  0x140877a10, empty when it has none) and the position; it locks the source document
+  and runs `DocumentWorker::doCopyExternalPages` (0x140559b20) on the target: position
+  clamped to 0..pageCount; per source page a new QUuid (0x14084b930), its files copied
+  by `pagecopyhelper` (0x14057a4e0: copyPageFiles into a work area, renameEntries into
+  the target, a copy marker meanwhile; "Failed to copy source page {}" stops the loop),
+  then `insertPage(index, newId, template, -1, mode 0)` (0x140871e60): **no `redir`**,
+  so a PDF page arrives as its ink on plain paper; the target's own page map, `original`
+  and `redir` values are untouched. The target's `.content` is saved and `pagesAdded`
+  emitted with the new indices.
+- move = a task group of `RequestCompleteDeferredTask(source)` (the source wholly
+  downloaded), the same `CopyExternalPagesTask`, and `DeletePagesTask(source, pages)`
+  (control-block RTTI of 0x14068a690 / 0x140689e90).
+
+*Client:* `core.edits.PageImport` (kept on the target: source document, source page
+ids, new ids, templates, and the page files as (pattern, sha256, size), the bytes in
+the pending files by hash so that later edits of the source do not reach the copy),
+`LibrarySource.import_pages` / `move_pages_to` (import, then a `PageDelete` on the
+source; both must be editable here, a copy only needs the target), `Staged` origin
+`("import", edit, i)`, `DocumentController.copyPages/movePages` with another target. A
+page's files are taken as the viewer shows it: its `.rm` with pending edits replayed,
+its folder (pictures, pending inserted ones included), `-metadata.json`, highlights and
+thumbnail. Deviation: the app copies the target's page files at once; the client keeps
+them as pending edits of the target, uploaded with push_edits like any page edit.
+
+**Clean copies.** `LibraryController::cloneEntry(doc, collection, clean)` (slot 8,
+0x1404dc640; the desktop QML only ever calls slot 9, without `clean`) refuses to clean
+a document whose type (+0x238, `Document.FileType`) is Undefined (0) or Notebook (1):
+"Cannot clean {:?} of type {}". It logs "Cleaning" (else "Cloning") "{} {:?} to {:?}" and
+names the copy as a plain copy is named ("%1 copy", made unique). `Document::clone`
+(0x14065a590) with the clean option (options +0x30):
+- does not copy the page map (a plain copy does, 0x140551680) but makes an empty one for
+  the copying author (0x1406502a0 → 0x140876c70: author UUID and index; `original` -1),
+  then `setPageCount(source +0x200)` (0x140668240 → 0x140876fd0) appends that many
+  pages (0x14086f560 → insertPage, new QUuid, empty template, `redir` i since the new
+  Document's type is still Undefined, set in its constructor 0x14064f3c0), then
+  `setFileType(source type)` (0x140667aa0 → 0x140875c40) sets `original` to the page
+  count (A:1) and writes every page's redirection again (0x1408775e0, always a new tick:
+  A:3);
+- `DocumentCopyHelper` (0x1406b2640) pairs **no** pages, so no page file is copied (no
+  `.rm`, page folder, `-metadata.json`, highlights, thumbnails); the document's other
+  files are.
+[I] +0x200 is read as the PDF page count (the client uses cPages `original`, else
+fv1 `originalPageCount`, else the PDF counted). No cached document is a clean copy (no
+`redir` stamped A:3 among the cached PDFs), so the result is not compared with a real
+one. *Client:* `core.pagemap.clean`, `core.clone.clone_files(clean=True)`,
+`SyncClient.clone_document(clean=True)` (the source's pending edits left out),
+`LibraryController.cloneEntry(..., True)`; page tags are dropped with their pages
+(client choice).
+
+**Password-protected PDFs.** No cached `.content` has the `lockedByPassword` key the
+parser knows (§5.4): the state comes from the PDF. `PasswordDialog.qml` (shown by
+main.qml `requestOpenDocument` when `document.lockedByPassword`) calls
+`LibraryController::unlockWithPassword(docId, password)` (slot 19, 0x1404e3f50 →
+0x1404e3c90: "Setting password for", "no document specified", "could not set
+password"), which starts a `PasswordTask` (vtable 0x140d0a150). Its execute
+(0x14068ee50) calls 0x1406687a0: the password is stored **in memory** on the Document
+(+0x800, a QString) and a 30 000 ms QBasicTimer (+0x818) started; the Document's
+timerEvent (0x1406698f0) empties it when the timer fires. The worker gets a copy
+(0x14056f840, +0x48) to load the PDF. On a wrong password the task's handler
+(0x14068faa0) emits `Document::invalidPassword` (signal 16; the dialog shows "Incorrect
+password. Please try again."), empties the password and stops the timer; success comes
+as `loadingSucceeded`, on which the dialog accepts and runs the open call. Nothing
+writes the password anywhere. ("Bad password" in the binary is curl's.)
+
+*Client:* `ui/pdflock.py`: whether a cached PDF needs a password (only a file with
+`/Encrypt` near its start or end is opened to see; QtPdf's `IncorrectPassword`),
+passwords in process memory by PDF path; `PdfFile` uses them and raises `PdfLocked`;
+`DocumentWrapper.lockedByPassword` / subtext "Password protected PDF";
+`unlockWithPassword` tries the password on a worker and answers with `loadingSucceeded`
+or `invalidPassword`. Deviations: the password is kept until the app quits or logs out,
+not 30 s (the client opens a PDF again for every view, thumbnail and export job, where
+the app keeps its unlocked PDFium document); an uncached PDF is not downloaded to find
+out whether it is locked. Export: ExportDialog's password opens the source, and "keep
+password protection" encrypts the exported PDF with it (pypdf, AES-256) [I: the app's
+encryption scheme is not traced].
+
 ## 6. Implications for the Linux client
 
 1. **Auth**: implement device/new → user/new with discovery-based host resolution and

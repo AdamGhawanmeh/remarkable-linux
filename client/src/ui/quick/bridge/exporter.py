@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -61,6 +61,8 @@ class _Request:
     kind: str
     path: Path
     pages: list[int] | None
+    password: str = field(default="", repr=False)       # never logged, never written
+    keep_password: bool = False
 
 
 class DocumentExporter(QObject):
@@ -81,8 +83,10 @@ class DocumentExporter(QObject):
         node = self.library.tree.get(doc_id)
         return node.name if node is not None else doc_id
 
-    def export(self, target: str, document_id: str, kind: str = "pdf", pages: list[int] | None = None) -> bool:
-        """Queue an export; False (with a notification) if it cannot start."""
+    def export(self, target: str, document_id: str, kind: str = "pdf", pages: list[int] | None = None,
+               password: str = "", keep_password: bool = False) -> bool:
+        """Queue an export; False (with a notification) if it cannot start. `password`
+        and `keep_password`: ExportDialog's, for a password-protected PDF."""
         node = self.library.tree.get(document_id)
         if not isinstance(node, Document):
             self.notify("Unable to export: the document is no longer in your library")
@@ -93,7 +97,7 @@ class DocumentExporter(QObject):
             self.notify(f"Unable to export \"{node.name}\": {err}")
             return False
         pages = sorted({int(p) for p in pages}) if pages and kind != "rmdoc" else None
-        self._queue.append(_Request(document_id, kind, path, pages))
+        self._queue.append(_Request(document_id, kind, path, pages, str(password or ""), bool(keep_password)))
         log.info("exporting %s as %s to %s", document_id, kind, path)
         self.library.set_export_progress(document_id, 0.0)
         self._next()
@@ -119,7 +123,8 @@ class DocumentExporter(QObject):
                 self._settle(request, ok=False)
                 continue
             self._current = request
-            if not self.worker.export(request.kind, node, str(request.path), request.pages):
+            if not self.worker.export(request.kind, node, str(request.path), request.pages,
+                                      request.password, request.keep_password):
                 self._current = None                    # cannot happen: one job at a time
                 self._settle(request, ok=False)
 

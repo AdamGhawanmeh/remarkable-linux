@@ -70,10 +70,12 @@ class _Placed:
 
 
 def _open_source(path: Path) -> PdfReader | None:
-    """The source PDF for vector export, or None to rasterise its pages."""
+    """The source PDF for vector export, or None to rasterise its pages. A
+    password-protected one is opened with the password given for it (ui.pdflock)."""
+    from .pdflock import password_for
     try:
         reader = PdfReader(path)
-        if reader.is_encrypted and not reader.decrypt(""):
+        if reader.is_encrypted and not reader.decrypt(password_for(path) or ""):
             raise ValueError("it needs a password")
         len(reader.pages)
         return reader
@@ -285,7 +287,7 @@ def _stamp(writer: PdfWriter, page: PageObject, layers: list[tuple[PageObject, b
     ])
 
 
-def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO) -> None:
+def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO, password: str = "") -> None:
     overlay = PdfReader(io.BytesIO(layers))
     writer = PdfWriter()
     for index, item in enumerate(placed):
@@ -302,16 +304,19 @@ def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO) -
                if item.drawn[name]]
         _stamp(writer, page, ink, box, ctm, clip)
     writer.add_metadata({"/Title": title, "/Creator": "reMarkable for Linux"})
+    if password:                    # ExportDialog's "Keep password protection"
+        writer.encrypt(user_password=password, algorithm="AES-256")
     writer.write(out)
 
 
 def export_pdf(pages: DocumentPages, path: str | Path, *,
                progress: Callable[[int, int], None] | None = None,
                background_scale: float = BACKGROUND_SCALE,
-               indexes: Sequence[int] | None = None) -> Path:
+               indexes: Sequence[int] | None = None, password: str = "") -> Path:
     """Write every page of `pages`, or those at `indexes` in that order, to a PDF at
     `path`; returns the path. `progress(done, total)` follows each page drawn; whatever
-    it raises stops the export before anything is written."""
+    it raises stops the export before anything is written. `password`: the PDF written
+    is protected with it (AES-256), as the app keeps a protected PDF's protection."""
     path = Path(path)
     if not pages.pages:
         raise ValueError("document has no pages")
@@ -326,7 +331,7 @@ def export_pdf(pages: DocumentPages, path: str | Path, *,
     partial = path.with_name(path.name + ".part")
     try:
         with open(partial, "wb") as out:
-            _assemble(layers, placed, pages.doc.name, out)
+            _assemble(layers, placed, pages.doc.name, out, password)
         os.replace(partial, path)
     except BaseException:
         partial.unlink(missing_ok=True)

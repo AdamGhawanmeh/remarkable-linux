@@ -65,7 +65,7 @@ from viewer import rm_select, rm_stroke
 from viewer.rm_parser import Color, Tool
 
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, ItemsTransform, PageAdd,
-                    PageCopy, PageDelete, PageMove, PageTemplate, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
+                    PageCopy, PageDelete, PageImport, PageMove, PageTemplate, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
                     TextEdit, ToolSettings,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
@@ -426,6 +426,11 @@ def describe_edit(e) -> str:
     if isinstance(e, PageCopy):
         pairs = ", ".join(f"{s} -> {n}" for s, n in zip(e.sources, e.new_ids))
         return f"  duplicate pages {pairs}\n    at {e.index}, after page {e.after or '(front)'}"
+    if isinstance(e, PageImport):
+        pairs = ", ".join(f"{s} -> {n}" for s, n in zip(e.sources, e.new_ids))
+        count = sum(len(p) for p in e.files)
+        return (f"  pages copied in from document {e.source_doc}: {pairs}\n    at {e.index}, after page "
+                f"{e.after or '(front)'} (no PDF page; {count} page file(s) as they were when copied)")
     if isinstance(e, PageMove):
         return f"  move pages {', '.join(e.pages)}\n    to {e.index}, after page {e.after or '(front)'}"
     if isinstance(e, PageDelete):
@@ -1088,12 +1093,14 @@ class SyncClient:
         return doc_id
 
     def clone_document(self, doc_id: str, parent: str, name: str, copy_id: str | None = None,
-                       progress: Callable[[int, int], None] | None = None) -> str:
+                       progress: Callable[[int, int], None] | None = None, clean: bool = False) -> str:
         """Copy a document into folder `parent` under `name` (core.clone: Copy, then Paste,
         as reMarkable.exe makes it); returns the copy's id. The copy is of the document as
         shown here, with its pending edits. Files it shares with the source keep their
-        content hash, so only its .content and .metadata are uploaded."""
-        from .clone import clone_files
+        content hash, so only its .content and .metadata are uploaded. `clean`: a copy
+        of a PDF or ebook without its annotations (no page files, no pending edits, a
+        fresh page list); SyncError when the document cannot be cleaned."""
+        from .clone import CloneError, clone_files
         copy_id = copy_id or str(uuid.uuid4())          # fixed across commit retries
         now = int(ms_timestamp(self._clock()))
         author = self.author()
@@ -1105,7 +1112,7 @@ class SyncClient:
                 raise SyncError("the document to copy is no longer in the library")
             entries = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
             try:
-                staged = self.staged_files(node, cached_only=False) if self.edits.of(doc_id) else {}
+                staged = self.staged_files(node, cached_only=False) if self.edits.of(doc_id) and not clean else {}
             except EditError as err:
                 raise SyncError(f"its pending edits no longer fit: {err}") from err
             names = (set(entries) | {n for n, d in staged.items() if d is not None}) - \
@@ -1113,8 +1120,13 @@ class SyncClient:
 
             def read(name: str) -> bytes:
                 return staged[name] if name in staged else self.get_blob(entries[name].hash, name)
-            copied, written = clone_files(node.id, names, read, copy_id=copy_id, name=name, parent=parent,
-                                          now_ms=now, author=author)
+            pdf = f"{node.id}.pdf"
+            try:
+                copied, written = clone_files(node.id, names, read, copy_id=copy_id, name=name, parent=parent,
+                                              now_ms=now, author=author, clean=clean,
+                                              pdf_pages=lambda: pdf_page_count(read(pdf)) if pdf in names else 0)
+            except CloneError as err:
+                raise SyncError(str(err)) from err
             files: dict[str, IndexEntry] = {}
             data: dict[str, bytes] = {}
             for old, new in copied.items():
@@ -1323,7 +1335,7 @@ class SyncClient:
         if not edits:
             return {}
         return document_files(doc, edits, lambda name: self.get_blob(doc.files[name], name, cached_only=cached_only),
-                              self.edits.data, self.author())
+                              self.edits.data, self.author(), self.edits.file)
 
     def push_plan(self, doc_id: str) -> "PushPlan":
         """What push_edits(doc_id) would upload, worked out from the cached library

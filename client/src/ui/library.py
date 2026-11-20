@@ -23,12 +23,13 @@ from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.edits import (PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
+from core.edits import (IMPORT_FILES, PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
                         LayerAdd, LayerAttachChange, LayerDelete, LayerMergeChange, LayerMergeDown, LayerMove,
                         LayerMoveChange, LayerRename, LayerRenameChange, LayerVisibility, LayerVisibilityChange,
-                        PageAdd, PageCopy, PageDelete, PageHistory, PageMove, PageTemplate, SceneFlagChange, SceneFlags,
+                        PageAdd, PageCopy, PageDelete, PageHistory, PageImport, PageMove, PageTemplate, SceneFlagChange,
+                        SceneFlags,
                         Staged, StrokeAdd, StrokeChange, StrokeDelete, StrokeErase, StrokePart, StrokePaste,
-                        ToolSettings, document_files, page_images, swapped)
+                        ToolSettings, current_content, document_files, import_path, page_files, page_images, swapped)
 from core.sync import SyncClient, SyncError, build_index, file_entry, sha256_hex
 from core.config import atomic_write_json, read_json
 from viewer import rm_layer, rm_select, rm_stroke, rm_writer
@@ -543,25 +544,46 @@ class LibrarySource:
         files = notebook_files(doc_id, notebook_from_pages(self.sync.author(), [(n, t) for _, n, t in moved]),
                                notebook_metadata(name, parent or ROOT_ID, now_ms, opened=False))
         for old, new, _ in moved:
-            page = staged.page(old)
-            if page is not None:
-                files[f"{doc_id}/{new}.rm"] = page
-            for file_name in sorted(set(page_images(page).values())):
-                found = staged.image_source(old, file_name)
-                if found is not None:
-                    files[f"{doc_id}/{new}/{file_name}"] = (self.blob(source, found[1]) if found[0] == "doc"
-                                                           else self.sync.edits.data(found[1]))
-            if old in staged.origin:                     # added or copied here: its source's files
-                extra = staged.copied_files(old)
-            else:
-                extra = [(n, n) for n in page_files(source, old)
-                         if not n.endswith(".rm") and not n.startswith(f"{source.id}/{old}/")]
-            for from_name, as_name in extra:             # -metadata.json, highlights, thumbnail
-                files[doc_id + as_name[len(source.id):].replace(old, new)] = self.blob(source, from_name)
+            for pattern, data in self._page_snapshot(source, staged, old):
+                files[import_path(pattern, doc_id, new)] = data
         delete = PageDelete.new(source.id, pages, now_ms)
         node = self._add_created(doc_id, files, parent or ROOT_ID)
         self._add_edit(source, delete)
         return node, delete
+
+    def _page_snapshot(self, source: Document, staged: Staged, page_id: str) -> list[tuple[str, bytes]]:
+        """The files of page `page_id` of `source` as they are now, as the app's
+        pagecopyhelper copies them (copyPageFiles: the .rm, the page's folder,
+        -metadata.json, highlights, thumbnail, byte for byte): (pattern, bytes) with the
+        patterns of core.edits.IMPORT_FILES / "{doc}/{page}/<name>". The .rm is the page
+        with its pending edits; the folder has the files the document has there and the
+        pictures the page shows (pending inserted ones included)."""
+        out: dict[str, bytes] = {}
+        page = staged.page(page_id)
+        if page is not None:
+            out["{doc}/{page}.rm"] = page
+        folder = f"{source.id}/{page_id}/"
+        if page_id not in staged.origin:
+            for name in page_files(source, page_id):
+                if name.startswith(folder):
+                    out["{doc}/{page}/" + name[len(folder):]] = self.blob(source, name)
+        for file_name in sorted(set(page_images(page).values())):
+            found = staged.image_source(page_id, file_name)
+            if found is not None:
+                out["{doc}/{page}/" + file_name] = staged.image_data(found, self.sync.edits.data)
+        if page_id in staged.origin:                    # added, copied or imported here
+            extras = [(name, data()) for name, data in staged.page_extras(page_id)]
+        else:
+            extras = [(n, self.blob(source, n)) for n in page_files(source, page_id)
+                      if not n.endswith(".rm") and not n.startswith(folder)]
+        by_name = {p.format(doc=source.id, page=page_id): p for p in IMPORT_FILES}
+        for name, data in extras:                       # -metadata.json, highlights, thumbnail
+            pattern = by_name.get(name)
+            if pattern is not None:
+                out[pattern] = data
+            elif name.startswith(folder):
+                out["{doc}/{page}/" + name[len(folder):]] = data
+        return sorted(out.items())
 
     def change_created(self, doc_id: str, change: Callable[[dict, dict], bool]) -> bool:
         """Change a document made here before its upload has started: `change(content,
@@ -671,7 +693,8 @@ class LibrarySource:
             known = self._staged.get(doc.id)
             if known is not None and known[0] == key:
                 return known[1]
-        staged = Staged(base, edits, lambda name: self.blob(base, name), self.sync.author() if edits else b"")
+        staged = Staged(base, edits, lambda name: self.blob(base, name), self.sync.author() if edits else b"",
+                        self.sync.edits.file)
         staged.key = key
         with self._lock:
             self._staged[doc.id] = (key, staged)
@@ -844,6 +867,62 @@ class LibrarySource:
         edit = PageMove.new(doc.id, pages, index, after, now_ms)
         self._add_edit(doc, edit)
         return edit
+
+    def import_pages(self, target: Document, source: Document, indices, insert_index: int,
+                     now_ms: int) -> tuple[PageImport, dict[str, bytes]]:
+        """Copy the pages at `indices` of `source` (as shown here, with its pending
+        edits) into `target`, in a row at `insert_index` (out of range: at the end, as
+        doCopyExternalPages clamps it), as reMarkable.exe copies pages into another
+        document (DocumentWorker::doCopyExternalPages, 0x140559b20): new page ids, each
+        page's template as the source has it, no PDF page (redirection -1), the page's
+        files byte for byte as they are now. Only `target` is written (it must be
+        editable here); `source` is only read. The PageImport is kept as a pending edit
+        of `target`; returned with its files (by hash)."""
+        target = self._editable(target)
+        if source.id == target.id:
+            raise EditError("pages copied within a document are duplicated, not imported")
+        base = self.synced(source.id) or source
+        staged = self.staged(base)
+        pages = self._pages_at(staged.ids, indices)
+        from core.pagemap import PageMap
+        content = staged.content if staged.changes_page_list else current_content(
+            base, lambda n: self.blob(base, n), self.sync.author())
+        pagemap = PageMap(json.loads(json.dumps(content)), self.sync.author())
+        templates, files, data = [], [], {}
+        for page_id in pages:
+            info = pagemap.info(page_id)
+            templates.append(info.template if info is not None else "")
+            listed = []
+            for pattern, blob in self._page_snapshot(base, staged, page_id):
+                sha = hashlib.sha256(blob).hexdigest()
+                data[sha] = blob
+                listed.append((pattern, sha, len(blob)))
+            files.append(listed)
+        ids = self.staged(target).ids
+        index = len(ids) if int(insert_index) < 0 else int(insert_index)
+        index, after = self._place(ids, index)
+        edit = PageImport.new(target.id, base.id, pages, templates, files, index, after, now_ms)
+        self._add_edit(target, edit, data)
+        return edit, data
+
+    def move_pages_to(self, target: Document, source: Document, indices, insert_index: int,
+                      now_ms: int) -> tuple[PageImport, PageDelete]:
+        """Move the pages at `indices` of `source` into `target` at `insert_index`, as
+        DocumentController::movePages with another target does (0x140491b70): a task
+        group of RequestCompleteDeferredTask(source), CopyExternalPagesTask (import_pages)
+        and DeletePagesTask(source). Both documents must be editable here; the delete
+        is kept only once the import is."""
+        source_doc = self._editable(source)
+        pages = self._pages_at(self.staged(source_doc).ids, indices)
+        self._editable(target)
+        delete = PageDelete.new(source_doc.id, pages, now_ms)
+        # Worked out before anything is kept: a delete that cannot be made keeps no import.
+        document_files(source_doc, self.sync.edits.of(source_doc.id) + [delete],
+                       lambda name: self.blob(source_doc, name), self.sync.edits.data, self.sync.author(),
+                       self.sync.edits.file)
+        edit, _ = self.import_pages(target, source_doc, indices, insert_index, now_ms)
+        self._add_edit(source_doc, delete)
+        return edit, delete
 
     def delete_pages(self, doc: Document, indices, now_ms: int) -> PageDelete:
         """Delete the pages at `indices` (a document left empty gets a "Blank" page)."""
@@ -1499,8 +1578,10 @@ class LibrarySource:
         """Work the document out with the edits (and the files of inserted images) before
         keeping them: edits the writer refuses leave nothing behind."""
         new = {id(e): data for e, data in edits}
+        kept = {sha: blob for e, data in edits if isinstance(e, PageImport) for sha, blob in (data or {}).items()}
         document_files(doc, self.sync.edits.of(doc.id) + [e for e, _ in edits], lambda name: self.blob(doc, name),
-                       lambda e: new[id(e)] if id(e) in new else self.sync.edits.data(e), self.sync.author())
+                       lambda e: new[id(e)] if id(e) in new else self.sync.edits.data(e), self.sync.author(),
+                       lambda sha: kept[sha] if sha in kept else self.sync.edits.file(sha))
         for edit, data in edits:
             self.sync.edits.add(edit, data)
         with self._lock:
@@ -1556,7 +1637,7 @@ class LibrarySource:
                 log.warning("%s: image %s has no file %r", folder, image.item_id, image.file_name)
                 continue
             try:
-                image.data = self.blob(doc, source[1]) if source[0] == "doc" else self.sync.edits.data(source[1])
+                image.data = staged.image_data(source, self.sync.edits.data)
             except (SyncError, EditError, OSError) as err:
                 log.warning("%s: image %s: %s", folder, image.file_name, err)
 

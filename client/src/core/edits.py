@@ -825,6 +825,70 @@ class PageCopy(_PageEdit):
         return cls.new(raw["doc_id"], raw["sources"], raw["index"], raw["after"], raw["created_ms"], raw["new_ids"])
 
 
+IMPORT_FILES = ("{doc}/{page}.rm", "{doc}/{page}-metadata.json", "{doc}.highlights/{page}.json",
+                "{doc}.thumbnails/{page}.png")     # and "{doc}/{page}/<file>": the page's resources
+
+
+def import_path(pattern: str, doc_id: str, page_id: str) -> str:
+    """The target name of an imported page file (`pattern` as PageImport keeps it)."""
+    if pattern in IMPORT_FILES:
+        return pattern.format(doc=doc_id, page=page_id)
+    prefix = "{doc}/{page}/"
+    if not pattern.startswith(prefix) or "/" in pattern[len(prefix):] or not pattern[len(prefix):] \
+            or pattern[len(prefix):] in (".", ".."):
+        raise EditError(f"not a page file: {pattern!r}")
+    return f"{doc_id}/{page_id}/{pattern[len(prefix):]}"
+
+
+@dataclass(frozen=True)
+class PageImport(_PageEdit):
+    """Pages copied in from another document (DocumentController::copyPages/movePages
+    with another target: CopyExternalPagesTask -> DocumentWorker::doCopyExternalPages,
+    0x140559b20). Each source page becomes a page `new_ids[i]` of this document, put in
+    a row at `index`, with the source page's template (raw: none when it had none) and
+    NO PDF page (insertPage with redirection -1: a page of a PDF arrives as its ink on
+    plain paper). Its files are copied as they are (pagecopyhelper): kept here as they
+    were when copied, by hash in the pending files (`files[i]`: (pattern, sha256, size)
+    per file, pattern as in IMPORT_FILES or "{doc}/{page}/<name>")."""
+
+    doc_id: str
+    source_doc: str
+    sources: tuple[str, ...]
+    new_ids: tuple[str, ...]
+    templates: tuple[str, ...]
+    files: tuple[tuple[tuple[str, str, int], ...], ...]
+    index: int
+    after: str
+    created_ms: int
+
+    @classmethod
+    def new(cls, doc_id: str, source_doc: str, sources, templates, files, index: int, after: str,
+            created_ms: int, new_ids=None) -> "PageImport":
+        sources = _ids(sources)
+        new_ids = _ids(new_ids) if new_ids is not None else tuple(_new_id() for _ in sources)
+        templates = tuple(str(t or "") for t in templates)
+        files = tuple(tuple((str(p), str(s), int(n)) for p, s, n in page) for page in files)
+        if not (len(new_ids) == len(sources) == len(templates) == len(files)):
+            raise EditError("an imported page needs one new id, template and file list per page")
+        if str(source_doc) == str(doc_id):
+            raise EditError("pages copied within a document are a PageCopy")
+        for page in files:
+            for pattern, sha, _ in page:
+                import_path(pattern, "d", "p")
+                if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+                    raise EditError(f"not a sha256 hex digest: {sha!r}")
+        return cls(str(doc_id), str(source_doc), sources, new_ids, templates, files, int(index),
+                   str(after or ""), int(created_ms))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "PageImport":
+        return cls.new(raw["doc_id"], raw["source_doc"], raw["sources"], raw["templates"], raw["files"],
+                       raw["index"], raw["after"], raw["created_ms"], raw["new_ids"])
+
+    def hashes(self) -> set[str]:
+        return {sha for page in self.files for _, sha, _ in page}
+
+
 @dataclass(frozen=True)
 class PageMove(_PageEdit):
     """Pages moved (doMovePages) to before the page at `index` of the list as it was."""
@@ -986,7 +1050,7 @@ def _stored(value) -> tuple | None:
     return stored
 
 
-PAGE_EDITS = (PageAdd, PageCopy, PageMove, PageDelete, PageTemplate)
+PAGE_EDITS = (PageAdd, PageCopy, PageImport, PageMove, PageDelete, PageTemplate)
 DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty gets (0x140817f50)
 
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
@@ -994,7 +1058,7 @@ Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | Pa
         | ToolSettings | LayerAdd | LayerDelete | LayerReattach | LayerRename | LayerVisibility | LayerMove
         | LayerMergeDown | LayerUnmerge | SceneFlags)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
-                          "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy,
+                          "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy, "page-import": PageImport,
                           "page-move": PageMove, "page-delete": PageDelete, "page-template": PageTemplate,
                           "text": TextEdit,
                           "stroke": StrokeAdd, "stroke-erase": StrokeErase, "stroke-delete": StrokeDelete,
@@ -1084,18 +1148,29 @@ class PendingEdits:
     def documents(self) -> list[str]:
         return list(dict.fromkeys(e.doc_id for e in self.all()))
 
-    def add(self, edit: Edit, data: bytes | None = None) -> None:
-        """Keep `edit` (and an inserted image's file: first, so an edit on record always
-        has its file)."""
-        if isinstance(edit, ImageInsert) and (data is None or hashlib.sha256(data).hexdigest() != edit.sha256
-                                              or len(data) != edit.size):
-            raise EditError("the image is not the one the edit describes")
+    def add(self, edit: Edit, data=None) -> None:
+        """Keep `edit` (and its files first, so an edit on record always has them): an
+        inserted image's file (`data`: its bytes), or the files of pages imported from
+        another document (`data`: sha256 -> bytes)."""
+        files: dict[str, bytes] = {}
+        if isinstance(edit, ImageInsert):
+            if data is None or hashlib.sha256(data).hexdigest() != edit.sha256 or len(data) != edit.size:
+                raise EditError("the image is not the one the edit describes")
+            files[edit.sha256] = data
+        elif isinstance(edit, PageImport):
+            data = data or {}
+            for page in edit.files:
+                for _, sha, size in page:
+                    blob = data.get(sha)
+                    if blob is None or hashlib.sha256(blob).hexdigest() != sha or len(blob) != size:
+                        raise EditError("an imported page file is not the one the edit describes")
+                    files[sha] = blob
         with self._changing():
-            if isinstance(edit, ImageInsert):
-                path = self._file(edit.sha256)
+            for sha, blob in files.items():
+                path = self._file(sha)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_name(f".{path.name}.tmp")
-                tmp.write_bytes(data)
+                tmp.write_bytes(blob)
                 tmp.replace(path)
             self._edits.append(edit)
 
@@ -1112,17 +1187,34 @@ class PendingEdits:
         except OSError as err:
             raise EditError(f"the image of an edit is missing: {err}") from err
 
+    def file(self, sha256: str) -> bytes:
+        """A file kept for a pending edit, by its hash (an imported page's)."""
+        try:
+            return self._file(sha256).read_bytes()
+        except OSError as err:
+            raise EditError(f"a file of a pending edit is missing: {err}") from err
+
     def discard(self, edits: list[Edit]) -> None:
         """Forget edits (uploaded, or given up), and image files no edit uses any more."""
         gone = set(edits)
         with self._changing():
             self._edits = [e for e in self._edits if e not in gone]
-            used = {e.sha256 for e in self._edits if isinstance(e, ImageInsert)}
-            for sha in {e.sha256 for e in gone if isinstance(e, ImageInsert)} - used:
+            for sha in _hashes(gone) - _hashes(self._edits):
                 self._file(sha).unlink(missing_ok=True)
 
     def clear(self) -> None:
         self.discard(self.all())
+
+
+def _hashes(edits) -> set[str]:
+    """The pending files `edits` use (inserted images, imported pages)."""
+    out: set[str] = set()
+    for e in edits:
+        if isinstance(e, ImageInsert):
+            out.add(e.sha256)
+        elif isinstance(e, PageImport):
+            out |= e.hashes()
+    return out
 
 
 def _kind(edit: Edit) -> str:
@@ -1864,10 +1956,13 @@ class Staged:
     empty page, or a copy of another page as it was when copied. `read(name)` gives a
     file of `doc`. Pages are worked out when asked for (page, replay)."""
 
-    def __init__(self, doc: Document, edits: list[Edit], read: Callable[[str], bytes], author: bytes) -> None:
+    def __init__(self, doc: Document, edits: list[Edit], read: Callable[[str], bytes], author: bytes,
+                 files: Callable[[str], bytes] | None = None) -> None:
         self.doc, self.read, self.author = doc, read, author
+        self._files = files                             # sha256 -> a pending file (imported pages)
         self.page_edits: dict[str, list[Edit]] = {}
         # page id -> ("new",) | ("copy", source page id, how many of its edits the copy has)
+        #          | ("import", the PageImport, which of its pages)
         self.origin: dict[str, tuple] = {}
         self.deleted: set[str] = set()                  # pages the edits deleted
         self.page_list_edits: list[Edit] = []
@@ -1925,6 +2020,15 @@ class Staged:
                 for i, (info, source, new_id) in enumerate(infos):
                     pagemap.insert(at + i, new_id, info.template, info.redirect)
                     self.origin[new_id] = ("copy", source, len(self.page_edits.get(source, [])))
+            elif isinstance(edit, PageImport):
+                at = self._place(pagemap, edit.index, edit.after)
+                for i, (new_id, template) in enumerate(zip(edit.new_ids, edit.templates)):
+                    if pagemap.known(new_id):
+                        continue
+                    # doCopyExternalPages: insertPage(index, id, template, -1, mode 0)
+                    pagemap.insert(at, new_id, template, None)
+                    self.origin[new_id] = ("import", edit, i)
+                    at += 1
             elif isinstance(edit, PageMove):
                 indices = [pagemap.index(p) for p in edit.pages if pagemap.index(p) >= 0]
                 if indices:
@@ -1967,7 +2071,21 @@ class Staged:
             return self.read(name) if name in self.doc.files else None
         if origin[0] == "new":
             return None
+        if origin[0] == "import":
+            sha = self._imported(origin, "{doc}/{page}.rm")
+            return self.file(sha) if sha is not None else None
         return self._page(origin[1], origin[2])
+
+    @staticmethod
+    def _imported(origin: tuple, pattern: str) -> str | None:
+        """The hash of an imported page's file kept as `pattern`, or None."""
+        return next((sha for p, sha, _ in origin[1].files[origin[2]] if p == pattern), None)
+
+    def file(self, sha256: str) -> bytes:
+        """A pending file by hash (an imported page's)."""
+        if self._files is None:
+            raise EditError("the files of imported pages are not at hand")
+        return self._files(sha256)
 
     def _page(self, page_id: str, count: int | None = None) -> bytes | None:
         edits = self.page_edits.get(page_id, [])
@@ -1999,11 +2117,14 @@ class Staged:
             return True
         if origin is None:
             return f"{self.doc.id}/{page_id}.rm" in self.doc.files
+        if origin[0] == "import":
+            return self._imported(origin, "{doc}/{page}.rm") is not None
         return origin[0] == "copy" and (bool(origin[2]) or self.has_file(origin[1]))
 
     def image_source(self, page_id: str, file_name: str):
         """Where the page's image file `file_name` is: ("doc", name of a file of `doc`),
-        ("edit", the ImageInsert that brought it), or None."""
+        ("edit", the ImageInsert that brought it), ("pending", sha256 of an imported
+        page's file), or None."""
         for edit in self.page_edits.get(page_id, []):
             if isinstance(edit, ImageInsert) and edit.file_name == file_name:
                 return "edit", edit
@@ -2011,7 +2132,31 @@ class Staged:
         if origin is None:
             name = f"{self.doc.id}/{page_id}/{file_name}"
             return ("doc", name) if name in self.doc.files else None
+        if origin[0] == "import":
+            sha = self._imported(origin, "{doc}/{page}/" + file_name)
+            return ("pending", sha) if sha is not None else None
         return self.image_source(origin[1], file_name) if origin[0] == "copy" else None
+
+    def image_data(self, source: tuple, read_edit: Callable[[ImageInsert], bytes]) -> bytes:
+        """The bytes of an image_source() result."""
+        if source[0] == "doc":
+            return self.read(source[1])
+        if source[0] == "pending":
+            return self.file(source[1])
+        return read_edit(source[1])
+
+    def page_extras(self, page_id: str) -> list[tuple[str, Callable[[], bytes]]]:
+        """(name in this document, its bytes) for the page files other than the .rm a
+        copied or imported page takes with it: -metadata.json, highlights, thumbnail
+        (and an imported page's whole folder), as the app's pagecopyhelper copies them."""
+        origin, page = self.origin.get(page_id), page_id
+        while origin is not None and origin[0] == "copy":
+            page, origin = origin[1], self.origin.get(origin[1])
+        if origin is not None and origin[0] == "import":
+            return [(import_path(pattern, self.doc.id, page_id), lambda sha=sha: self.file(sha))
+                    for pattern, sha, _ in origin[1].files[origin[2]]
+                    if pattern != "{doc}/{page}.rm"]       # the page's folder too, as copied
+        return [(new, lambda name=name: self.read(name)) for name, new in self.copied_files(page_id)]
 
     def copied_files(self, page_id: str) -> list[tuple[str, str]]:
         """(file of `doc`, its name for the copy) for the page files other than the .rm
@@ -2030,12 +2175,14 @@ class Staged:
 
 
 def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes],
-                   image: Callable[[ImageInsert], bytes], author: bytes) -> dict[str, bytes | None]:
+                   image: Callable[[ImageInsert], bytes], author: bytes,
+                   files: Callable[[str], bytes] | None = None) -> dict[str, bytes | None]:
     """The files of `doc` that `edits` add, change (name -> new bytes) or remove (name ->
     None); empty when nothing is left to do. `read(name)` gives a file `doc` has,
-    `image(edit)` an inserted image's file. EditError if an edit no longer fits: its page
-    was removed, or cannot be edited safely."""
-    staged = Staged(doc, edits, read, author)
+    `image(edit)` an inserted image's file, `files(sha256)` a kept file of an imported
+    page. EditError if an edit no longer fits: its page was removed, or cannot be
+    edited safely."""
+    staged = Staged(doc, edits, read, author, files)
     missing = staged.missing()
     if missing:
         raise EditError("the page of an edit is no longer in the document")
@@ -2063,15 +2210,15 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
             if source is None:
                 log.warning("page %s shows image %s, which has no file", page_id, file_name)
             else:
-                out[path] = read(source[1]) if source[0] == "doc" else image(source[1])
+                out[path] = staged.image_data(source, image)
         if origin is None:
             for file_name in set(page_images(old).values()) - used:
                 path = f"{doc.id}/{page_id}/{file_name}"
                 if path in doc.files:                   # the page no longer uses it
                     out[path] = None
         else:
-            for source, copy in staged.copied_files(page_id):
-                out[copy] = read(source)
+            for copy, data in staged.page_extras(page_id):
+                out[copy] = data()
     for page_id in staged.removed():
         for name in page_files(doc, page_id):
             out[name] = None
