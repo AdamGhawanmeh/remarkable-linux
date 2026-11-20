@@ -12,9 +12,10 @@ is written anywhere. For every PDF and EPUB document with a page list:
     226/72 px per point; not clipped to 1404 x 1872), an eraser pass over it, an image
     put on the page, moved, the stroke copied and pasted, every live stroke of the
     page's layers turned and moved, one deleted, and the image deleted. Then:
-      the page parses; it splits and joins back to its bytes; SceneInfo, glyph ranges
-      (0x03), text items (0x06), Array blocks (0x0B) and blocks of unknown types are
-      byte for byte as they were; every block the page had before is still there with
+      the page parses; it splits and joins back to its bytes; SceneInfo, text items
+      (0x06), Array blocks (0x0B) and blocks of unknown types are byte for byte as they
+      were; a glyph range (0x03, a text highlight) is either as it was or deleted by the
+      eraser (its block still 0x03, no value: 3.29's eraser takes highlights whole); every block the page had before is still there with
       the same bytes or as the same item (an edit only deletes items, keeping their
       headers); no id is used twice; every new id is this client's, and newer than
       every id the page had; every layer's items still replay as a sequence; ink drawn
@@ -53,7 +54,7 @@ from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, parse  # noqa: E402
 
 AUTHOR = bytes.fromhex("5eed0000000040008000000000000001")      # not anyone's device
 NOW = 1_900_000_000_000
-KEPT = (w.BLOCK_SCENE_INFO, w.BLOCK_GLYPH_ITEM, w.BLOCK_TEXT_ITEM, 0x0B)
+KEPT = (w.BLOCK_SCENE_INFO, w.BLOCK_TEXT_ITEM, 0x0B)
 KNOWN = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F}
 
 
@@ -150,7 +151,18 @@ def check_page(doc, page_id: str, base: bytes | None, frame, stats: Counter) -> 
                 f"block {kind:#x} changed"
         unknown = [b.encode() for b in before if b.type not in KNOWN]
         assert unknown == [b.encode() for b in after if b.type not in KNOWN], "an unknown block changed"
-        stats["glyph ranges kept"] += sum(b.type == w.BLOCK_GLYPH_ITEM for b in before)
+        now = {w.decode_item(b.payload).item: b for b in after if b.type == w.BLOCK_GLYPH_ITEM}
+        for b in before:
+            if b.type != w.BLOCK_GLYPH_ITEM:
+                continue
+            item = w.decode_item(b.payload)
+            if now.get(item.item) is not None and now[item.item].encode() == b.encode():
+                stats["glyph ranges kept"] += 1
+                continue
+            gone = w.decode_item(now[item.item].payload) if item.item in now else None
+            assert gone is not None and gone.value is None and gone.deleted_length >= 1, \
+                f"glyph range {item.item} changed other than by being erased"
+            stats["glyph ranges erased"] += 1
         stats["SceneInfo field 6 kept"] += sum(b.type == w.BLOCK_SCENE_INFO and any(
             i == 6 and v != w.lww(w.ZERO_ID, bytes(32)) for i, _, v in w.read_values(b.payload)) for b in before)
         old_items, new_items = items_of(base), items_of(page)

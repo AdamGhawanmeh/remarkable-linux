@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Callable
 from xml.sax.saxutils import escape, quoteattr
 
-from .rm_parser import (PAGE_HEIGHT, PAGE_WIDTH, Color, ImageItem, PageScene, ParagraphStyle, Stroke,
+from .rm_parser import (PAGE_HEIGHT, PAGE_WIDTH, Color, GlyphRange, ImageItem, PageScene, ParagraphStyle, Stroke,
                         TextBlock)
 
 # Official stroke palette (ARGB), indexed by Color; built inline by the renderer in
@@ -558,6 +558,9 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
                 if element := _svg_image(scene, stroke):
                     out.append(element)
                 continue
+            if isinstance(stroke, GlyphRange):
+                out += _svg_glyphs(scene, stroke)
+                continue
             style = stroke_style(stroke, background)
             if style is None:
                 continue
@@ -648,6 +651,10 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
                 if layers != "darken" and _paint_image(painter, scene, stroke, blend_modes):
                     drawn += 1
                 continue
+            if isinstance(stroke, GlyphRange):
+                if layers != "normal" and _paint_glyphs(painter, scene, stroke, blend_modes):
+                    drawn += 1
+                continue
             style = stroke_style(stroke, background)
             if style is None or (layers == "darken" and not style.blend_darken) \
                     or (layers == "normal" and style.blend_darken):
@@ -692,6 +699,39 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
             painter.drawText(QPointF(x, line.baseline), text)
             x += qt_measure(text, font)
     return drawn
+
+
+def _paint_glyphs(painter, scene: PageScene, glyph: GlyphRange, blend_modes: bool) -> bool:
+    """A PDF/EPUB text highlight: its rectangles filled with its colour, no outline,
+    composited with Darken, as reMarkable.exe paints one (0x140a1dc00: composition
+    mode 16, pen NoPen, brush = its colour). The app also looks at the rendered page
+    under each rectangle (light grey pixels are tinted, dark ones kept), which Darken
+    over the page gives the same way. False when it has no rectangle."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QPainter
+
+    rects = [r for r in glyph.rects if r[2] > 0 and r[3] > 0]
+    if not rects:
+        return False
+    painter.save()
+    if blend_modes:
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Darken)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor.fromRgba(glyph.colour_argb()))
+    for x, y, w, h in rects:
+        painter.drawRect(QRectF(*scene.to_page(x, y), w, h))
+    painter.restore()
+    return True
+
+
+def _svg_glyphs(scene: PageScene, glyph: GlyphRange) -> list[str]:
+    argb = glyph.colour_argb()
+    colour = f"#{argb & 0xFFFFFF:06x}"
+    alpha = ((argb >> 24) & 255) / 255
+    opacity = f' fill-opacity="{alpha:.4g}"' if alpha < 1 else ""
+    return [f'<g data-tool="text-highlight" fill="{colour}"{opacity} style="mix-blend-mode:darken">'] + [
+        f'<rect x="{x + scene.x_origin:.2f}" y="{y:.2f}" width="{w:.2f}" height="{h:.2f}"/>'
+        for x, y, w, h in glyph.rects if w > 0 and h > 0] + ["</g>"]
 
 
 def _paint_image(painter, scene: PageScene, image: ImageItem, blend_modes: bool) -> bool:

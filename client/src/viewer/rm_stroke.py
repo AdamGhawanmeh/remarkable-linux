@@ -739,7 +739,7 @@ class _Chain:
             self.at[item_id] = new
 
     def insert_after(self, left: tuple[int, int], item_id: tuple[int, int], value: bytes,
-                     kind: int = w.BLOCK_LINE_ITEM) -> None:
+                     kind: int = w.BLOCK_LINE_ITEM, versions: tuple[int, int] | None = None) -> None:
         """Put a new item (a line, or of block type `kind`) right after the item `left`
         (0x1408c8920): its right neighbour is what followed `left`. When `left` is an
         id inside a run of deleted ids the run is cut there, the second part keeping
@@ -757,7 +757,7 @@ class _Chain:
             self._after(link, _Link(rest, None, link.kind))
         right = link.next.item.item if link.next is not None else ZERO_ID
         self._after(link, _Link(w.ItemHeader(self.parent, item_id, left, right, 0, value), None,
-                                (kind, *w.BLOCK_VERSIONS[kind])))
+                                (kind, *(versions or w.BLOCK_VERSIONS[kind]))))
 
     def write(self, blocks: list[w.Block]) -> list[w.Block]:
         """`blocks` with what was done to this node's items."""
@@ -785,7 +785,7 @@ def delete_strokes(page: bytes, items: Iterable[tuple[int, int]]) -> bytes:
     header, blocks = w.split(page)
     parents: dict[tuple[int, int], tuple[int, int]] = {}
     for block in blocks:
-        if block.type == w.BLOCK_LINE_ITEM:
+        if block.type in ERASABLE_BLOCKS:
             item = w.decode_item(block.payload)
             if item.value is not None and not item.deleted_length:
                 parents[item.item] = item.parent
@@ -1176,10 +1176,15 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
         if where is None:
             continue
         for _, block in w.sequence(blocks, node):
-            if block.type != w.BLOCK_LINE_ITEM or id(block) in seen:
+            if block.type not in ERASABLE_BLOCKS or id(block) in seen:
                 continue
             seen.add(id(block))
             item = w.decode_item(block.payload)
+            if block.type == w.BLOCK_GLYPH_ITEM:
+                rects = _glyph_rects(item.value)
+                if rects is not None and glyph_hit(outline, rects, *where):
+                    hit.append((item, None, []))        # the whole highlight goes, nothing is left
+                continue
             if item.value is None or block.version < 2:
                 continue
             line = decode_line_value(item.value)
@@ -1239,8 +1244,8 @@ def clear_layer(page: bytes, *, layer: tuple[int, int] | None = None) -> Cleared
     images nor groups (the filter 0x140433d20: value type 7 or 2 stays) deleted as
     delete_strokes deletes them, one SceneDeleteItemsActionCrdt per node in one
     SceneMacroAction. Nothing is cut and no id is taken. Every item a real page has of
-    that kind is a line; glyph ranges (none in any cached page) and strokes stored with
-    version 1 points (which this client cannot put back) are left. The app also detaches
+    that kind is a line or a PDF/EPUB text highlight (glyph range, 0x03), and both go;
+    strokes stored with version 1 points (which this client cannot put back) are left. The app also detaches
     a group node that is left empty (SceneDeleteGroupActionCrdt, a SceneTreeMove to 0:0)
     and drops its anchor; the client leaves such a group in place, empty, as its eraser
     does. Untouched when the layer holds no stroke."""
@@ -1251,7 +1256,8 @@ def clear_layer(page: bytes, *, layer: tuple[int, int] | None = None) -> Cleared
     for node in nodes:
         seen: set[int] = set()
         for item_id, block in w.sequence(blocks, node):
-            if block.type != w.BLOCK_LINE_ITEM or id(block) in seen or block.version < 2:
+            if block.type not in ERASABLE_BLOCKS or id(block) in seen \
+                    or (block.type == w.BLOCK_LINE_ITEM and block.version < 2):
                 continue
             seen.add(id(block))
             item = w.decode_item(block.payload)
@@ -1267,6 +1273,113 @@ def clear_layer(page: bytes, *, layer: tuple[int, int] | None = None) -> Cleared
     for chain in chains.values():
         blocks = chain.write(blocks)
     return Cleared(w.join(header, blocks), tuple(found))
+
+
+# Item blocks the eraser, ClearPage and stroke deletes reach: lines, and the glyph
+# ranges (PDF/EPUB text highlights) that 0x140996fb0 and the ClearPage filter
+# (0x140433d20) take as well.
+ERASABLE_BLOCKS = (w.BLOCK_LINE_ITEM, w.BLOCK_GLYPH_ITEM)
+
+
+def _glyph_rects(value: bytes | None) -> list[tuple[float, float, float, float]] | None:
+    """The rectangles of a live glyph range's value, or None (deleted, not readable)."""
+    if not value:
+        return None
+    from .rm_parser import decode_glyph_value
+    try:
+        return decode_glyph_value(value).rects
+    except (RmParseError, ValueError, IndexError, struct.error, UnicodeError):
+        return None
+
+
+def glyph_hit(outline: Outline, rects, dx: float = 0.0, dy: float = 0.0) -> bool:
+    """Whether the eraser outline takes a glyph range (a PDF/EPUB text highlight) with
+    rectangles `rects` (x, y, w, h), as 0x140996fb0 decides: the union of the rectangles
+    (QRectF |=) must intersect the outline's bounds (QRectF::intersects), and then more
+    than half of them (count > n >> 1) must have their centre inside the outline (the
+    winding test of the stroke cut, 0x140a63420), the centre taken to float and moved by
+    the node's anchor position (dx, dy). The range then goes whole: it is never cut."""
+    if not outline.points or not rects:
+        return False
+    union = None
+    for x, y, w_, h in rects:
+        if w_ == 0 and h == 0:                      # QRectF::isNull: left out of the union
+            continue
+        x0, x1 = (x, x + w_) if w_ >= 0 else (x + w_, x)
+        y0, y1 = (y, y + h) if h >= 0 else (y + h, y)
+        union = (x0, y0, x1, y1) if union is None else \
+            (min(union[0], x0), min(union[1], y0), max(union[2], x1), max(union[3], y1))
+    if union is None:
+        return False
+    left, top, right, bottom = outline.bounds()
+    if not (union[0] < union[2] and union[1] < union[3]):        # an empty rectangle meets nothing
+        return False
+    if not (max(union[0], left) < min(union[2], right) and max(union[1], top) < min(union[3], bottom)):
+        return False
+    half, inside = len(rects) >> 1, 0
+    for x, y, w_, h in rects:
+        cx, cy = f32(f32(x + w_ / 2) + f32(dx)), f32(f32(y + h / 2) + f32(dy))
+        if outline.contains(cx, cy):
+            inside += 1
+            if inside > half:
+                return True
+    return False
+
+
+def item_values(page: bytes | None) -> dict[tuple[int, int], bytes]:
+    """The live items of a page the eraser and ClearPage take, id -> value bytes: its
+    strokes (version 2 points) and its glyph ranges, what undo puts back."""
+    out: dict[tuple[int, int], bytes] = {}
+    for block in w.split(page)[1] if page is not None else []:
+        if block.type == w.BLOCK_LINE_ITEM:
+            item, line = _line_item(block)
+            if line is not None:
+                out[item.item] = line.encode()
+        elif block.type == w.BLOCK_GLYPH_ITEM:
+            item = w.decode_item(block.payload)
+            if item.value is not None and not item.deleted_length and _glyph_rects(item.value) is not None:
+                out[item.item] = item.value
+    return out
+
+
+def glyph_ranges(page: bytes | None, parent: tuple[int, int] | None = None) -> list[tuple[tuple[int, int], tuple[int, int], bytes]]:
+    """The live glyph ranges (PDF/EPUB text highlights) of a page, of the node `parent`
+    only when given: (id, parent node, value bytes), in file order."""
+    out = []
+    for block in w.split(page)[1] if page is not None else []:
+        if block.type == w.BLOCK_GLYPH_ITEM:
+            item = w.decode_item(block.payload)
+            if item.value is not None and not item.deleted_length and parent in (None, item.parent):
+                out.append((item.item, item.parent, item.value))
+    return out
+
+
+def restore_item(page: bytes, *, author: bytes, item: tuple[int, int], value: bytes,
+                 move_id: tuple[int, int] | None = None) -> tuple[bytes, tuple[int, int]]:
+    """restore_stroke for any value the eraser takes: a line value, or a glyph range's
+    (u8 1 ...), which comes back unchanged (it has no moveId: 0x140a1bcf0 writes none)
+    as a 0x03 block under the versions of the block it was deleted in."""
+    from .rm_parser import GLYPH_ITEM_TYPE
+    if not value or value[0] != GLYPH_ITEM_TYPE:
+        return restore_stroke(page, author=author, item=item, line=decode_line_value(value), move_id=move_id)
+    header, blocks = w.split(page)
+    item = tuple(item)
+    owner, versions = None, None
+    for block in blocks:
+        if block.type in w.ITEM_BLOCKS:
+            found = w.decode_item(block.payload)
+            if found.item[0] == item[0] and 0 <= item[1] - found.item[1] < max(found.deleted_length, 1):
+                owner = found
+                if block.type == w.BLOCK_GLYPH_ITEM:
+                    versions = (block.min_version, block.version)
+                break
+    if owner is None or owner.value is not None or owner.deleted_length < 1:
+        raise StrokeError(f"the page has no deleted item {item}")
+    me = w._author_index(blocks, author)
+    new_id = (me, w.highest_counter(blocks) + 1)
+    chain = _Chain(blocks, owner.parent)
+    chain.insert_after(item, new_id, bytes(value), w.BLOCK_GLYPH_ITEM, versions)
+    return w.join(header, chain.write(blocks)), new_id
 
 
 def restore_stroke(page: bytes, *, author: bytes, item: tuple[int, int], line: LineValue,
@@ -1309,7 +1422,8 @@ def eraser_line(samples: Iterable[tuple], thickness: float = MEDIUM, tool: int =
 
 
 __all__ = ["BALLPOINT_V2", "CALLIGRAPHY", "CLEAR_PAGE", "COLOR_ARGB", "Cleared", "DEFAULT_TIMESTAMP", "ERASER", "ERASE_SECTION", "Erased",
-           "FINELINER_V2", "HIGHLIGHTER_V2", "LineValue", "anchored_nodes", "group_nodes", "MARKER_V2", "MEDIUM", "MOUSE_PRESSURE", "NOT_DRAWN",
+           "FINELINER_V2", "HIGHLIGHTER_V2", "LineValue", "ERASABLE_BLOCKS", "glyph_hit", "glyph_ranges", "item_values",
+           "restore_item", "anchored_nodes", "group_nodes", "MARKER_V2", "MEDIUM", "MOUSE_PRESSURE", "NOT_DRAWN",
            "Outline", "PAINTBRUSH_V2", "PENCIL_V2", "PENS", "Point", "SHADING_MARKER", "SHARP_PENCIL_V2",
            "StrokeBuilder", "StrokeError", "StrokeItem", "THICK", "THIN", "append_stroke", "append_strokes", "can_join",
            "clear_layer", "decode_line_value", "delete_strokes", "draw", "erase", "erase_line", "eraser_line", "eraser_outline",

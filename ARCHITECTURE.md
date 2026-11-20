@@ -1241,8 +1241,9 @@ code is in the binary, mouse path included:
   it as one `StrokeDelete` (pending edit) and one undo step (`StrokeChange` readd in
   that order), and nothing when the layer holds no stroke.
 - Deviations: an emptied group node is left attached and anchored (as the client's
-  eraser leaves it); glyph ranges (PDF highlights, block 0x03; none in any cached page)
-  and strokes stored with version-1 points (which the client cannot put back) stay.
+  eraser leaves it); strokes stored with version-1 points (which the client cannot put
+  back) stay. Glyph ranges (PDF/EPUB text highlights, block 0x03) go with the strokes,
+  as the filter has it (§5.11).
   Checked read-only on the same 150 cached pages: every current-layer clear takes no
   id, and putting the strokes back in `undo_order` gives the page's own stacking order.
 
@@ -1816,7 +1817,8 @@ PDF / EPUB-backed):
 
 **Editing PDF and EPUB pages (client).** The same editing as on notebook pages (pens,
 straight lines, eraser, rectangle and lasso selection, move/scale/turn, clipboard,
-images, undo/redo; typed text not yet), gated like notebooks: Settings > Editing, or
+images, undo/redo, the eraser taking text highlights (§5.11); typed text only on pages
+inserted into the document, as 3.29 allows it, §5.11), gated like notebooks: Settings > Editing, or
 `--edit-notebook NAME` (`LibrarySource.edit_refusal`: then one non-trashed notebook,
 PDF or EPUB of that name; §3.7), and a PDF/EPUB needs its page list. Input goes through the same view ↔ scene transform as on
 notebook pages; the scene bounds are the PDF page's frame united with the ink
@@ -1834,9 +1836,8 @@ clamping, scrolling), so nothing is clipped to 1404 × 1872.
   read from such blocks as far as they are tagged (top level, and sub-blocks shaped like
   LWW values); others cannot clash with new ids anyway, since those use this client's
   own author index. None of the 4,226 cached pages has a 0x03, 0x06 or 0x0B block, so
-  this is checked on synthetic pages only. Deviation: the app's eraser deletes a glyph
-  range when more than half its rectangles' centres are inside the outline (§5.1); this
-  client's leaves glyph ranges alone.
+  this is checked on synthetic pages only. The eraser, Erase selection, Erase all and a
+  layer's delete take glyph ranges as the app does (§5.11).
 - `tools/pdf_edit_corpus.py` (read-only) makes every kind of edit on every cached PDF
   and EPUB page and works out each document's upload: 113 documents (96 worked out to an
   upload, 15 not wholly cached, 2 without a page list), 2,494 pages (141 with a `.rm`, 41
@@ -2501,6 +2502,94 @@ the app keeps its unlocked PDFium document); an uncached PDF is not downloaded t
 out whether it is locked. Export: ExportDialog's password opens the source, and "keep
 password protection" encrypts the exported PDF with it (pypdf, AES-256) [I: the app's
 encryption scheme is not traced].
+
+### 5.11 PDF/EPUB text highlights erased; typed text on PDF/EPUB documents
+
+**Text highlights (`CrdtGlyphItem`, block 0x03)** [O: reMarkable.exe 3.29; none of the
+6,110 cached v6 pages (4,281 blobs + 1,829 document files, 2026-11-21) has a 0x03 block,
+and no `.highlights/` file is cached, so everything below is checked on synthetic pages
+made to this layout]. A smart highlight is a layer item like a stroke (the item header
+of §5.1), its value a `SceneGlyphRangeItem` (RTTI `.?AVSceneGlyphRangeItem@@`, vtables
+0x140ca2488 / 0x140ca24e8, value type 1: 0x140a076f0 maps value types 1/2/3/6/7 to
+blocks 3/4/5/6/15). Value writer 0x140a1bcf0 (called from 0x140a67180 after `u8 1`):
+
+| Field | Written |
+|---|---|
+| `24` start u32, `34` length u32 | only when the first-glyph id (+0x98) is `0:0` |
+| `44` colour u32 | always (scene::Color; 0 is drawn as HighlighterYellow) |
+| `5C` text | varuint UTF-8 length, `u8 1`, UTF-8 bytes |
+| `6C` rectangles | varuint n, n × QRectF (x, y, w, h as f64), scene coordinates |
+| `7F` first glyph id, `8F` last glyph id, `91` u8 include-last | only when the first id is set |
+| `A4` ARGB u32 | always |
+| unknown tail | kept as read |
+
+Block versions are the ones read (0x1405a5100 / 0x1405a7f30: stored, else 1 and 1).
+Paint 0x140a1dc00: composition mode 16 (Darken), no pen, brush = colour (0 → 3; 9 →
+its ARGB; ≥ 17 → black), each rectangle mapped and filled, the rendered page under it
+consulted pixel by pixel (grey pixels lighter than 0xa0 tinted, darker kept). The client
+(`rm_parser.GlyphRange`, `decode_glyph_value`; `renderer._paint_glyphs`/`_svg_glyphs`)
+fills the rectangles under Darken, which keeps dark text dark the same way; PDF export
+draws them in its Darken layer. Selection: the item's rectangle and lasso hooks (vtable
++0x38 0x1404431e0, +0x40 0x140442ec0) are `xor al,al; ret`, so highlights are never
+selected (and so never moved, copied or deleted by a selection), in 3.29 or here.
+
+**Erasing** [O]. The eraser's search 0x140996fb0 walks a node's items in sequence order
+(the layer, then every group node below it, as for strokes, §5.1). For a value of type 1
+it unions the rectangles (QRectF `|=`), and only if that union `intersects` the outline's
+bounding rectangle (outline +0x30) counts the rectangles whose centre (QRectF::center,
+taken to float and moved by the node's anchor position, float adds) is inside the
+outline (the nonzero-winding test 0x140a63420); as soon as the count exceeds `n >> 1`
+the item is queued for deletion **whole** (no pieces, no id taken). Strokes found in the
+same pass are cut as before. So: half of the rectangles or fewer is not enough, and the
+bounds test uses the stored rectangles, not the anchored ones. EraseSection (8) is the
+same search with the drawn outline. ClearPage (`clearLinesInLayer`, filter 0x140433d20:
+everything but value types 7 and 2) deletes highlights with the strokes. Deleting a layer
+empties it (the client's `_emptying`, §5.8) of highlights too. Undo/redo are the item
+actions of §5.1: the highlight comes back as a new 0x03 item (`++clock`) right after its
+deleted self, with the value it had (it has no moveId to set); a deleted highlight stays
+a 0x03 block without a value.
+
+Client: `rm_stroke.glyph_hit` (the rule above), `erase` (glyph ranges in the node walk,
+deleted whole, in hit order with the strokes), `clear_layer`, `delete_strokes`
+(`ERASABLE_BLOCKS` = 0x05 and 0x03), `item_values` / `glyph_ranges`, `restore_item`
+(glyph values back under their 0x03 block's versions); `core.edits.StrokeRestore`
+accepts a glyph value; `LibrarySource._stroke_values` (eraser undo) and `_emptying` (layer
+delete) include them. A `StrokeErase` stores only the eraser's line, so the highlights it
+takes are found again on every replay (restart, upload, rebase); the ledger and outbox
+need nothing new. `tests/test_pdf_highlights_offline.py` covers the layout, the rule (more
+than half, exactly half, bounds, anchor offset), eraser/lasso/clear/layer delete with
+undo and redo, a restart with pending edits, the fake-cloud upload, the drawn colour, and
+the eraser over a highlight through the app's QML; `tools/pdf_edit_corpus.py` accepts a
+glyph range that is unchanged or erased.
+
+**Typed text on PDF and EPUB documents** [O]. 3.29 allows typed text on **note pages
+only**. `QmlDocumentWrapper.isNotepage(int)` (moc method 34 of the wrapper's static
+metacall 0x14066c400) calls `Document::isNotepage` 0x1406609e0:
+
+```
+if fileType (+0x238) == Notebook (1): true
+if page < 0: false
+no page map (0x14065fdb0 false): page < redirections (+0x400) ? redirection[page] == -1 : true
+page map:                        page < pages ? redirection(page) (0x140876260) == -1 : false
+```
+
+so a PDF/EPUB page is a note page only when no PDF page is behind it: a page inserted
+into the document (§5.4, `redir` absent). Every way into typed text in the desktop QML
+is gated by it: DocumentView.qml's Text button (`visible: ... document.isNotepage(currentPage)
+&& actions.canEditDocuments`, and its `onClicked` again), DocumentViewport.qml's
+`notePage` (text mode on a click in the page, line 931; `selectAllAction` and text paste
+`enabled: ... notePage ...`; `focusTextWhenActive && notePage` on load; "Add page" from
+the page menu starts text mode on the new note page). On a PDF/EPUB page itself no text
+box can be made. The client matches it: `DocumentWrapper.isNotepage` (`pdf_page is None`;
+past the page map false, as with a page map) drives the official QML unchanged, and
+`SceneView._text_target` refuses (`"Text can only be typed on notebook pages"`) a page
+with a PDF page behind it should anything call `createRootDocument` there. On an inserted
+page the text is laid out on the note page's own 1404 × 1872 scene, whatever the PDF's
+page sizes, and goes through the same view ↔ scene transform as the pens; the QML test
+types on such a page in a PDF of A4 and 16:9 pages, clicks the caret position of a
+character where the window shows it (the caret lands there), and paints the page at
+device pixel ratios 1 and 2 (the text's box agrees within 2 px). Not traced: whether the
+tablet's own firmware lets text onto PDF pages (only the desktop binary is here).
 
 ## 6. Implications for the Linux client
 

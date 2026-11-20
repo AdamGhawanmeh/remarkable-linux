@@ -71,6 +71,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import struct
 import threading
 import uuid
 from contextlib import contextmanager
@@ -403,13 +404,22 @@ class StrokeRestore:
     def line(self) -> rm_stroke.LineValue:
         return rm_stroke.decode_line_value(bytes.fromhex(self.value))
 
+    @property
+    def is_glyph(self) -> bool:
+        """A PDF/EPUB text highlight (glyph range value, u8 1 ...), not a stroke."""
+        return self.value[:2] == "01"
+
     @classmethod
     def new(cls, doc_id: str, page_id: str, item, value, created_ms: int, origin=None,
             uid: str | None = None) -> "StrokeRestore":
         data = bytes(value) if isinstance(value, (bytes, bytearray)) else bytes.fromhex(str(value))
         try:
-            rm_stroke.decode_line_value(data)
-        except (RmParseError, ValueError) as err:
+            if data[:1] == b"\x01":                 # a glyph range (PDF/EPUB text highlight)
+                from viewer.rm_parser import decode_glyph_value
+                decode_glyph_value(data)
+            else:
+                rm_stroke.decode_line_value(data)
+        except (RmParseError, ValueError, IndexError, struct.error, UnicodeError) as err:
             raise EditError(f"not the value of a stroke: {err}") from err
         return cls(str(doc_id), str(page_id), _ref(item), data.hex(), int(created_ms),
                    None if origin is None else _ref(origin), uuid.uuid4().hex if uid is None else str(uid))
@@ -1499,7 +1509,8 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 log.warning("not putting back a stroke on page %s: the item it was is not known", edit.page_id)
                 continue
             try:
-                page, new_id = rm_stroke.restore_stroke(page, author=author, item=item, line=edit.line(), move_id=origin)
+                page, new_id = rm_stroke.restore_item(page, author=author, item=item,
+                                                      value=bytes.fromhex(edit.value), move_id=origin)
             except rm_stroke.StrokeError as err:
                 log.warning("not putting back a stroke on page %s: %s", edit.page_id, err)
                 continue

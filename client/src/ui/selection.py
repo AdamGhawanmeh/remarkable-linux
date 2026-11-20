@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 
 from viewer import rm_select as rsel
 from viewer import rm_stroke as rs
-from viewer.rm_parser import ImageItem, Layer, PageScene, Point, Stroke
+from viewer.rm_parser import GlyphRange, ImageItem, Layer, PageScene, Point, Stroke
 
 
 @dataclass
@@ -63,6 +63,8 @@ def selectable(scene: PageScene | None, layer: int, offsets: dict | None = None)
         return []
     out = []
     for item in scene.layers[layer].items():
+        if isinstance(item, GlyphRange):
+            continue        # a PDF/EPUB text highlight: its select hooks return false (0x1404431e0)
         if isinstance(item, ImageItem):
             if item.vertices and item.item_id is not None:
                 out.append(Picked(tuple(item.item_id), image=item))

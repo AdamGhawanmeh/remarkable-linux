@@ -173,7 +173,10 @@ ITEM_BLOCKS = (BLOCK_GLYPH_ITEM, BLOCK_GROUP_ITEM, BLOCK_LINE_ITEM, BLOCK_TEXT_I
 BLOCK_VERSIONS = {BLOCK_MIGRATION: (1, 1), BLOCK_TREE_MOVE: (1, 1), BLOCK_TREE_NODE: (1, 2),
                   BLOCK_GROUP_ITEM: (1, 1), BLOCK_LINE_ITEM: (2, 2), BLOCK_ROOT_TEXT: (1, 1),
                   BLOCK_TOMBSTONE: (1, 1), BLOCK_AUTHORS: (1, 1), BLOCK_PAGE_STATS: (0, 1),
-                  BLOCK_SCENE_INFO: (0, 1), BLOCK_IMAGES_TABLE: (3, 3), BLOCK_IMAGE_ITEM: (2, 2)}
+                  BLOCK_SCENE_INFO: (0, 1), BLOCK_IMAGES_TABLE: (3, 3), BLOCK_IMAGE_ITEM: (2, 2),
+                  # a glyph range's own getters (0x1405a5100, 0x1405a7f30): the versions it was
+                  # read with, else 1 and 1
+                  BLOCK_GLYPH_ITEM: (1, 1)}
 ZERO_ID = (0, 0)
 ROOT_NODE, LAYER_1 = (0, 1), (0, 11)
 

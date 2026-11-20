@@ -314,10 +314,11 @@ def start_page(doc: Document, page_count: int) -> int:
 
 
 def _stroke_values(page: bytes | None) -> dict[tuple[int, int], str]:
-    """The live strokes of a page: id -> value (hex), as undo keeps them ({} for a page
-    the stroke engine cannot read whole: no undo step is kept then)."""
+    """The live strokes and PDF/EPUB text highlights (glyph ranges) of a page: id ->
+    value (hex), as undo keeps them ({} for a page the stroke engine cannot read whole:
+    no undo step is kept then)."""
     try:
-        return {s.item: s.line.encode().hex() for s in rm_stroke.strokes(page)}
+        return {item: value.hex() for item, value in rm_stroke.item_values(page).items()}
     except (RmParseError, ValueError) as err:
         log.warning("strokes of a page not readable for undo: %s", err)
         return {}
@@ -1386,13 +1387,17 @@ class LibrarySource:
         ImageDelete each, as delete_items does: undo puts each right after its deleted
         self, in its old place in the stacking order."""
         items = [i for i in self._layer_items(before, node) if i.item not in skip]
-        lines = [i for i in items if i.is_line]
+        lines = [(i.item, i.line.encode().hex()) for i in items if i.is_line]
+        # PDF/EPUB text highlights (glyph ranges) of the layer go with its strokes.
+        nodes = {tuple(node)} | {n for n, _ in rm_stroke.group_nodes(rm_writer.split(before.page)[1], tuple(node))} \
+            if before.page is not None else set()
+        lines += [(item, value.hex()) for item, parent, value in rm_stroke.glyph_ranges(before.page)
+                  if parent in nodes and item not in skip]
         edits: list[Edit] = []
         changes: list = []
         if lines:
-            edits.append(StrokeDelete.new(doc.id, page_id, [before.ref(i.item) for i in lines], now_ms))
-            changes.append(StrokeChange(readd=tuple(StrokePart(before.ref(i.item), i.line.encode().hex())
-                                                    for i in lines)))
+            edits.append(StrokeDelete.new(doc.id, page_id, [before.ref(i) for i, _ in lines], now_ms))
+            changes.append(StrokeChange(readd=tuple(StrokePart(before.ref(i), value) for i, value in lines)))
         for i in items:
             if not i.is_line:
                 edits.append(ImageDelete.new(doc.id, page_id, i.image.ref, now_ms))

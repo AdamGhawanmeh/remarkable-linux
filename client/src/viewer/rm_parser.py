@@ -218,11 +218,12 @@ class Layer:
     strokes: list[Stroke] = field(default_factory=list)     # bottom to top (v6: stacking order)
     node_id: tuple[int, int] | None = None
     images: list["ImageItem"] = field(default_factory=list)
+    glyphs: list["GlyphRange"] = field(default_factory=list)     # PDF/EPUB text highlights
 
     def items(self) -> list:
-        """Strokes and images bottom to top: their stacking order (each node's CRDT
-        sequence; the file's order when that cannot be worked out)."""
-        return sorted([*self.strokes, *self.images], key=lambda item: item.seq)
+        """Strokes, images and text highlights bottom to top: their stacking order (each
+        node's CRDT sequence; the file's order when that cannot be worked out)."""
+        return sorted([*self.strokes, *self.images, *self.glyphs], key=lambda item: item.seq)
 
 
 class ParagraphStyle(IntEnum):
@@ -416,6 +417,88 @@ class TextBlock:
         return not self.text.strip()
 
 
+GLYPH_ITEM_TYPE = 1      # the value's leading byte of a CrdtGlyphItem (block 0x03)
+
+
+@dataclass
+class GlyphRange:
+    """A highlight on the text of a PDF or EPUB page (CrdtGlyphItem, block 0x03, value
+    type 1), as reMarkable.exe 3.29 writes one (0x140a1bcf0): u8 1, then
+    {2: u32 start, 3: u32 length} (only when it has no glyph ids), {4: u32 colour},
+    {5: the highlighted text: varuint length, u8 1, UTF-8}, {6: rectangles: varuint n,
+    n QRectF (x, y, w, h as f64) in scene coordinates}, {7: first glyph id, 8: last
+    glyph id, 9: u8 include last} (only when it has them), {10: u32 ARGB}, then any
+    bytes it does not know, kept. It is an item of its layer like a stroke; it cannot be
+    selected (its selection hooks return false), and the eraser takes it whole."""
+
+    item_id: tuple[int, int]
+    parent_id: tuple[int, int]
+    seq: int = 0
+    color: int = 0
+    argb: int | None = None
+    text: str = ""
+    rects: list[tuple[float, float, float, float]] = field(default_factory=list)
+    start: int | None = None
+    length: int | None = None
+    first_id: tuple[int, int] | None = None
+    last_id: tuple[int, int] | None = None
+    include_last: bool | None = None
+
+    def colour_argb(self) -> int:
+        """The colour it is painted with (0x140a1dc00): colour 0 is HighlighterYellow,
+        9 (ArgbCode) its own ARGB, past the table (>= 17) black."""
+        from .renderer import PALETTE_ARGB        # the app's colour table (renderer, §5.2)
+        colour = self.color or Color.HIGHLIGHTER_YELLOW
+        if colour == Color.ARGB:
+            return self.argb if self.argb is not None else PALETTE_ARGB[Color.HIGHLIGHTER_YELLOW]
+        if colour >= 17:
+            return 0xFF000000
+        try:
+            return PALETTE_ARGB[Color(colour)]
+        except (ValueError, KeyError):
+            return 0xFF000000
+
+    def bounds(self) -> tuple[float, float, float, float] | None:
+        """The union of its rectangles (x0, y0, x1, y1), or None without any."""
+        rects = [r for r in self.rects if r[2] > 0 and r[3] > 0]
+        if not rects:
+            return None
+        return (min(r[0] for r in rects), min(r[1] for r in rects),
+                max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects))
+
+
+def decode_glyph_value(value: bytes, item_id=(0, 0), parent_id=(0, 0)) -> GlyphRange:
+    """A CrdtGlyphItem value (u8 1 + tagged fields) -> GlyphRange; RmParseError when it
+    is not one."""
+    if not value or value[0] != GLYPH_ITEM_TYPE:
+        raise RmParseError(f"glyph item type {value[:1].hex() or 'missing'}, expected {GLYPH_ITEM_TYPE:02x}")
+    f = _read_fields(value[1:])
+    g = GlyphRange(item_id=tuple(item_id), parent_id=tuple(parent_id))
+    if 2 in f:
+        g.start = f[2].as_int()
+    if 3 in f:
+        g.length = f[3].as_int()
+    if 4 in f:
+        g.color = f[4].as_int()
+    if 10 in f:
+        g.argb = f[10].as_int() & 0xFFFFFFFF
+    if 5 in f and f[5].type == TAG_LENGTH4:
+        r = _Reader(f[5].raw)
+        n = r.varuint()
+        r.take(1)                                   # is-ASCII flag (the app writes 1)
+        g.text = r.take(n).decode("utf-8", "replace")
+    if 6 in f and f[6].type == TAG_LENGTH4:
+        r = _Reader(f[6].raw)
+        g.rects = [tuple(r.unpack("<4d")) for _ in range(r.varuint())]
+    if 7 in f and f[7].type == TAG_ID:
+        g.first_id = f[7].raw
+    if 8 in f and f[8].type == TAG_ID:
+        g.last_id = f[8].raw
+    if 9 in f:
+        g.include_last = bool(f[9].as_int())
+    return g
+
+
 @dataclass
 class ImageItem:
     """A live inserted image (CrdtImageItem, item type 7), decoded from a page the tablet
@@ -546,6 +629,7 @@ BLOCK_NAMES = (
 
 BLOCK_SCENE_TREE = 0x01
 BLOCK_TREE_NODE = 0x02
+BLOCK_GLYPH_ITEM = 0x03
 BLOCK_SCENE_GROUP = 0x04
 BLOCK_SCENE_LINE = 0x05
 BLOCK_ROOT_TEXT = 0x07
@@ -1029,6 +1113,7 @@ def _parse_v6(data: bytes) -> PageScene:
     text: TextBlock | None = None
     authors: dict[int, bytes] = {}          # author index -> UUID (block 0x09)
     images: list[ImageItem] = []
+    glyphs: list[tuple[tuple, GlyphRange]] = []     # (parent node, highlight) in file order
     image_files: dict[bytes, str] = {}      # imageRef -> file name (SceneImagesTable)
     node_parent: dict[tuple, tuple] = {}    # group node -> parent node (group items)
     anchors: dict[tuple, Anchor] = {}
@@ -1112,6 +1197,19 @@ def _parse_v6(data: bytes) -> PageScene:
                     except (RmParseError, struct.error, IndexError) as err:
                         log.warning("image item %s: cannot decode (%s)", item, err)
                     images.append(image)
+            elif block_type == BLOCK_GLYPH_ITEM and _glyph_item(payload) is not None:
+                parent, item, left, right, deleted_length, value = _glyph_item(payload)
+                sequence_items.append((parent, item, left, right, deleted_length))
+                if deleted_length or not value:
+                    deleted.add(item)
+                else:
+                    try:
+                        glyph = decode_glyph_value(value, item, parent)
+                    except (RmParseError, struct.error, IndexError, UnicodeError) as err:
+                        log.warning("glyph item %s: cannot decode (%s)", item, err)
+                    else:
+                        glyph.seq = counts_total(counts)
+                        glyphs.append((parent, glyph))
             elif block_type == BLOCK_IMAGES_TABLE:
                 image_files.update(_decode_images_table(payload))
             elif block_type not in STRUCTURAL_BLOCKS:
@@ -1155,6 +1253,8 @@ def _parse_v6(data: bytes) -> PageScene:
             stroke.seq = rank.get(stroke.item_id, stroke.seq)
         for image in images:
             image.seq = rank.get(image.item_id, image.seq)
+        for _, glyph in glyphs:
+            glyph.seq = rank.get(glyph.item_id, glyph.seq)
 
     # Layer order: root's live group items in CRDT sequence order (excluding layers
     # detached by SceneTreeMove to parent != ROOT_NODE), falling back to file order.
@@ -1219,6 +1319,18 @@ def _parse_v6(data: bytes) -> PageScene:
             result[0].images.append(image)
         else:
             result.insert(0, Layer(name="Root", images=[image], node_id=ROOT_NODE))
+    for parent, glyph in sorted(glyphs, key=lambda g: g[1].seq):
+        if glyph.item_id in deleted:
+            continue
+        layer = ROOT_NODE if parent == ROOT_NODE else owner(parent)[0]
+        if layer == _NO_ID:
+            continue
+        target = layers.get(layer)
+        if target is None:
+            if not (result and result[0].node_id == ROOT_NODE):
+                result.insert(0, Layer(name="Root", node_id=ROOT_NODE))
+            target = result[0]
+        target.glyphs.append(glyph)
     return PageScene(version=6, layers=result, x_origin=PAGE_WIDTH / 2, text=text,
                      images=live_images, block_counts=counts, skipped_blocks=skipped,
                      background_visible=background_visible, root_document_visible=root_document_visible,
@@ -1226,6 +1338,18 @@ def _parse_v6(data: bytes) -> PageScene:
 
 
 IMAGE_ITEM_TYPE = 7      # the value's leading byte, as 2 is a group and 3 a line
+
+
+def _glyph_item(payload: bytes):
+    """(parent, id, left, right, deleted length, value) of a 0x03 block, or None when it
+    is not an item (then it is counted as skipped, as before glyph items were read)."""
+    try:
+        f = _read_fields(payload)
+        value = f[6].raw if 6 in f and f[6].type == TAG_LENGTH4 else b""
+        return (_field(f, 1, TAG_ID, "glyph item").raw, _field(f, 2, TAG_ID, "glyph item").raw,
+                _left(f), _right(f), f[5].as_int() if 5 in f else 0, value)
+    except (RmParseError, struct.error, IndexError, KeyError, AttributeError):
+        return None
 
 
 def counts_total(counts: dict[int, int]) -> int:
