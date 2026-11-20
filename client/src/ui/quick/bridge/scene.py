@@ -350,25 +350,35 @@ SceneLinkHandler = qml_class("SceneLinkHandler", behaviour=_LinkHandler)
 
 
 def pdf_links(pdf, pdf_page: int, frame: QRectF, page_of_pdf: dict[int, int]) -> list[dict]:
-    """The links on a PDF page, in scene coordinates (QtPdf's link model)."""
+    """The links on a PDF page, in scene coordinates (QtPdf's link model).
+
+    Runs on the view's worker (SceneView._load). The document's signals are
+    disconnected from the model before it goes: destroyed while still connected, its
+    ~QObject disconnected from the (Python-wrapped) document holding Qt's signal-slot
+    lock and waited there for the GIL, which the GUI thread held while it waited for
+    that lock (connecting QML objects): the app hung. (setDocument(None) would do it
+    too, with a Qt warning: QPdfLinkModel connects to the null document.)"""
     from PySide6.QtPdf import QPdfLinkModel
     model = QPdfLinkModel()
     model.setDocument(pdf.doc)
-    model.setPage(pdf_page)
-    roles = {bytes(v).decode(): k for k, v in model.roleNames().items()}
-    scale = frame.width() / pdf.page_size(pdf_page).width()
-    links = []
-    for row in range(model.rowCount(QModelIndex())):
-        index = model.index(row, 0)
-        rect: QRectF = model.data(index, roles["rectangle"])
-        url = model.data(index, roles["url"])
-        target = model.data(index, roles["page"])
-        area = QRectF(frame.x() + rect.x() * scale, frame.y() + rect.y() * scale, rect.width() * scale,
-                      rect.height() * scale)
-        links.append({"valid": True, "index": row, "rect": to_scene(area),
-                      "url": url.toString() if url is not None and not url.isEmpty() else "",
-                      "page": page_of_pdf.get(int(target), -1) if target is not None and target >= 0 else -1})
-    return links
+    try:
+        model.setPage(pdf_page)
+        roles = {bytes(v).decode(): k for k, v in model.roleNames().items()}
+        scale = frame.width() / pdf.page_size(pdf_page).width()
+        links = []
+        for row in range(model.rowCount(QModelIndex())):
+            index = model.index(row, 0)
+            rect: QRectF = model.data(index, roles["rectangle"])
+            url = model.data(index, roles["url"])
+            target = model.data(index, roles["page"])
+            area = QRectF(frame.x() + rect.x() * scale, frame.y() + rect.y() * scale, rect.width() * scale,
+                          rect.height() * scale)
+            links.append({"valid": True, "index": row, "rect": to_scene(area),
+                          "url": url.toString() if url is not None and not url.isEmpty() else "",
+                          "page": page_of_pdf.get(int(target), -1) if target is not None and target >= 0 else -1})
+        return links
+    finally:
+        QObject.disconnect(pdf.doc, None, model, None)
 PAGE_NONE, PAGE_READY, PAGE_LOAD_ERROR = (Page.StatusCode[k].value for k in ("None", "Ready", "LoadError"))
 
 
@@ -1361,6 +1371,13 @@ class _SceneView:
         self._hidden: list = []             # items committed and not yet shown at their new place
         self._picked: tuple | None = None   # (content, layer, the layer's selectable items)
         self._after_load = None             # run once the page is loaded again
+        # Layer eye clicks not yet kept: layer node -> (visible, the last load queued
+        # before it). Shown at once (set_layer_visible) and over every reload loaded
+        # before the click was kept, so that a second click before the first is kept
+        # reads the state the first gave.
+        self._visible_clicks: dict = {}
+        self._loads_queued = 0              # loads queued on self._pool (_load) ...
+        self._load_shown = 0                # ... and the number of the one loaded last
         self._tiles = SceneTileManager(self)
         self._values["controller"] = self._controller
         self._values["tileManager"] = self._tiles
@@ -1449,6 +1466,8 @@ class _SceneView:
             return
         self._stale = False
         self._loading_key = self._page_key(node, page_id)
+        self._loads_queued += 1
+        number = self._loads_queued
         if not quiet:
             self._set("status", 1)  # Updating
 
@@ -1475,10 +1494,11 @@ class _SceneView:
                 if pages is not None:
                     pages.close()
                 result = (None, None, None, None, [], err, "")
-            emit_from_worker(self, lambda: self._loaded.emit(result))
+            emit_from_worker(self, lambda: self._loaded.emit((number, result)))
         self._pool.start(_Job(job))
 
-    def _on_loaded(self, result) -> None:
+    def _on_loaded(self, numbered) -> None:
+        self._load_shown, result = numbered
         pages, content, frame, bounds, links, error, shown = result
         if error is not None:
             log.warning("cannot load page %s: %s", self._get("pageId"), error)
@@ -1494,6 +1514,10 @@ class _SceneView:
         if shown != self._page_id:
             self.clear_glyphs()
         self._glyph_pages.clear()             # the old DocumentPages' PDF is closed
+        if self._visible_clicks and shown == self._page_id:
+            content = self._with_visible_clicks(content, self._load_shown)
+        elif shown != self._page_id:
+            self._visible_clicks.clear()
         self._pages, self._content, self._bounds, self._page_id = pages, content, bounds, shown
         node = getattr(self._get("document"), "node", None)
         self._shown_key = self._page_key(node, shown) if node is not None else self._loading_key
@@ -1790,12 +1814,11 @@ class _SceneView:
     def refocus_viewport(self) -> None:
         """Give keyboard focus back to the page after the Layers foldout dropped it, so
         Ctrl+Z / Ctrl+Y (ProxyActions resolved from the focused item, main.qml
-        actionHandler) reach this page again. The foldout loses it two ways: its rows
-        are rebuilt on every layer change (SceneLayersModel reset), destroying the
-        clicked button and leaving the window's root item focused, which main.qml
-        ignores, so actionHandler pointed at nothing; and its New layer row, or the
-        rename field once cleared, keep or leave focus inside the foldout, which handles
-        no actions. Only then: focus the user moved elsewhere, or a text field being
+        actionHandler) reach this page again. The foldout loses it two ways: a row
+        removed (a layer deleted or merged) destroys a clicked button, leaving the
+        window's root item focused, which main.qml ignores, so actionHandler pointed at
+        nothing; and its rows' buttons, its New layer row, or the rename field once
+        cleared, keep or leave focus inside the foldout, which handles no actions. Only then: focus the user moved elsewhere, or a text field being
         typed in, is left alone."""
         if not shiboken6.isValid(self):
             return
@@ -1819,30 +1842,65 @@ class _SceneView:
             item = item.parentItem()
 
     def set_layer_visible(self, index: int, visible: bool) -> None:
+        """Show or hide layer `index`: `visible` is the state wanted, not a toggle. The
+        eye and the page change at once; on an edit-enabled page the change is then kept
+        (LibrarySource.set_layer_visible, on the view's one worker, in click order) and
+        stays shown over the reloads in between (_with_visible_clicks), so quick clicks
+        alternate: each reads (isLayerVisible) the state the one before gave, never a
+        state reloaded before it was kept, which made the second click a no-op."""
         if not 0 <= index < len(self._controller.layers):
             return
+        visible = bool(visible)
+        layer = self._controller.layers[index]
         if self._editable():
             source, node, page_id = _source(), self._get("document").node, self._page_id
             now_ms = _now_ms()
+            self._visible_clicks[layer.node_id] = (visible, self._loads_queued)
+            self._show_layer_visible(index, visible)
             self._run_layer_edit("change layer visibility",
                                  lambda: source.set_layer_visible(node, page_id, index, visible, now_ms))
             return
-        # Read-only page: toggle visibility live in memory without writing. On copies: the
-        # Layer objects belong to the PageScene LibrarySource.page_scene caches, which
-        # thumbnails, exports and the next opening of the page share.
+        # Read-only page: toggle visibility live in memory without writing.
+        self._show_layer_visible(index, visible)
+
+    def _show_layer_visible(self, index: int, visible: bool) -> None:
+        """The eye of layer `index` and the page drawn with it shown or hidden, here
+        only. On copies: the Layer objects belong to the PageScene LibrarySource.page_scene
+        caches, which thumbnails, exports and the next opening of the page share."""
         from dataclasses import replace
         layer = self._controller.layers[index]
-        if layer.visible != bool(visible):
-            layers = list(self._controller.layers)
-            layers[index] = replace(layer, visible=bool(visible))
-            self._controller.layers = layers
-            content = self._content
-            if content is not None and content.scene is not None and index < len(content.scene.layers):
-                scene_layers = list(content.scene.layers)
-                scene_layers[index] = replace(scene_layers[index], visible=bool(visible))
-                self._content = replace(content, scene=replace(content.scene, layers=scene_layers))
-            self._controller.layerStatesChanged.emit()
-            self._render()
+        if layer.visible == visible:
+            return
+        layers = list(self._controller.layers)
+        layers[index] = replace(layer, visible=visible)
+        self._controller.layers = layers
+        content = self._content
+        if content is not None and content.scene is not None and index < len(content.scene.layers):
+            scene_layers = list(content.scene.layers)
+            scene_layers[index] = replace(scene_layers[index], visible=visible)
+            self._content = replace(content, scene=replace(content.scene, layers=scene_layers))
+        self._controller.layerStatesChanged.emit()
+        self._render()
+
+    def _with_visible_clicks(self, content, loaded: int):
+        """`content` (a reload of the page shown, by load number `loaded`) with the eye
+        clicks it may not show yet over it: those made after its load was queued. The
+        view's pool runs its jobs one at a time in order, so a load queued after a
+        click's edit shows that edit kept (or refused): the click is then forgotten. On
+        copies, as _show_layer_visible."""
+        from dataclasses import replace
+        for node_id, (_, after) in list(self._visible_clicks.items()):
+            if loaded > after:
+                del self._visible_clicks[node_id]
+        scene = content.scene if content is not None else None
+        if scene is None or not scene.layers or not self._visible_clicks:
+            return content
+        layers = [replace(layer, visible=self._visible_clicks[layer.node_id][0])
+                  if layer.node_id in self._visible_clicks and
+                  layer.visible != self._visible_clicks[layer.node_id][0] else layer for layer in scene.layers]
+        if all(a is b for a, b in zip(layers, scene.layers)):
+            return content
+        return replace(content, scene=replace(scene, layers=layers))
 
     def move_layer(self, index: int, new_position: int) -> None:
         target = self._insertion_target("Layers")
@@ -2786,7 +2844,14 @@ PagePickerModel = qml_class("PagePickerModel", QAbstractListModel, _PagePicker)
 
 class _Layers:
     """The current page's layers (LayersFoldout's Repeater), roles as reMarkable.exe
-    SceneLayersModel::buildItems (0x14045bbc0)."""
+    SceneLayersModel::buildItems (0x14045bbc0).
+
+    Rows are changed in place: each page load, eye click, layer edit or upload emits
+    two or three of the controller's signals (layerStatesChanged, currentLayerChanged,
+    boundingRectChanged), and a model reset on each rebuilt every row, destroying the
+    row a click was being pressed on (the click was lost). Now each signal compares the
+    rows with those shown and emits dataChanged for the rows that differ, and only rows
+    added or taken away are inserted or removed (at the top: rows are bottom first)."""
 
     ROLES = (b"layerIndex", b"layerName", b"layerVisible", b"layerSelected", b"layerMoveUpEnabled",
              b"layerMoveDownEnabled", b"layerMergeEnabled", b"layerTrashEnabled")
@@ -2794,6 +2859,7 @@ class _Layers:
     def __init__(self, parent: QObject | None = None) -> None:
         QAbstractListModel.__init__(self, parent)
         self._watched_controller = None
+        self._rows: list[tuple] = []        # the role values of each row, as shown
 
     def _property_changed(self, name: str) -> None:
         if name == "controller":
@@ -2801,7 +2867,7 @@ class _Layers:
             if old is not None and shiboken6.isValid(old):
                 for sig_name in ("layerStatesChanged", "currentLayerChanged", old._NOTIFY["boundingRect"]):
                     try:
-                        getattr(old, sig_name).disconnect(self._reset)
+                        getattr(old, sig_name).disconnect(self._update)
                     except (RuntimeError, TypeError, AttributeError):
                         pass
             controller = self._get("controller")
@@ -2809,7 +2875,7 @@ class _Layers:
                 for sig_name in ("layerStatesChanged", "currentLayerChanged", controller._NOTIFY["boundingRect"]):
                     sig = getattr(controller, sig_name, None)
                     if sig is not None:
-                        sig.connect(self._reset)
+                        sig.connect(self._update)
                 self._watched_controller = controller
             self._reset()
 
@@ -2817,28 +2883,60 @@ class _Layers:
         controller = self._get("controller")
         return controller.layers if controller is not None and shiboken6.isValid(controller) else []
 
+    def _row_values(self) -> list[tuple]:
+        layers = self._layers()
+        controller = self._get("controller")
+        count = len(layers)
+        current = (int(controller._get("currentLayer") or 0) if controller is not None and shiboken6.isValid(controller)
+                   else max(count - 1, 0))
+        return [(row, layer.name, layer.visible, row == current, row < count - 1, row > 0, row > 0, count > 1)
+                for row, layer in enumerate(layers)]
+
     def _reset(self) -> None:
+        """Another controller: every row anew."""
         self.beginResetModel()
+        self._rows = self._row_values()
         self.endResetModel()
-        self._set("count", len(self._layers()))
-        # The rows were rebuilt: a row button that had focus is gone (see
-        # SceneView.refocus_viewport), once QML has settled.
+        self._set("count", len(self._rows))
+        self._refocus()
+
+    def _update(self) -> None:
+        """The rows brought to the controller's layers in place (see the class's doc)."""
+        rows = self._row_values()
+        old = self._rows
+        if rows == old:
+            return
+        if len(rows) > len(old):
+            self.beginInsertRows(QModelIndex(), len(old), len(rows) - 1)
+            self._rows = old + rows[len(old):]
+            self.endInsertRows()
+        elif len(rows) < len(old):
+            self.beginRemoveRows(QModelIndex(), len(rows), len(old) - 1)
+            self._rows = old[:len(rows)]
+            self.endRemoveRows()
+        changed = [n for n in range(len(rows)) if self._rows[n] != rows[n]]
+        self._rows = rows
+        if changed:
+            self.dataChanged.emit(self.index(changed[0]), self.index(changed[-1]))
+        self._set("count", len(rows))
+        self._refocus()
+
+    def _refocus(self) -> None:
+        # The foldout's row, or New layer, button clicked keeps the focus (or the row
+        # is gone): the page takes it back (SceneView.refocus_viewport) once QML has
+        # settled, so that Ctrl+Z reaches the page.
         controller = self._get("controller")
         view = getattr(controller, "view", None) if controller is not None and shiboken6.isValid(controller) else None
         if view is not None and shiboken6.isValid(view):
             QTimer.singleShot(0, view.refocus_viewport)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self._layers())
+        return 0 if parent.isValid() else len(self._rows)
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
-        layers = self._layers()
-        if not index.isValid() or not 0 <= index.row() < len(layers):
+        if not index.isValid() or not 0 <= index.row() < len(self._rows):
             return None
-        layer, row, count = layers[index.row()], index.row(), len(layers)
-        controller = self._get("controller")
-        current = int(controller._get("currentLayer") or 0) if controller is not None else max(count - 1, 0)
-        values = (row, layer.name, layer.visible, row == current, row < count - 1, row > 0, row > 0, count > 1)
+        values = self._rows[index.row()]
         offset = int(role) - Qt.ItemDataRole.UserRole.value
         return values[offset] if 0 <= offset < len(values) else None
 

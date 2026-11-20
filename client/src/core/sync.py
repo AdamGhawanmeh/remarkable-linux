@@ -249,6 +249,18 @@ def file_entry(name: str, data: bytes) -> IndexEntry:
     return IndexEntry(sha256_hex(data), FILE_ENTRY_TYPE, name, 0, len(data))
 
 
+def opened_lww(existing: Any, opened_ms: int) -> str:
+    """The .metadata lastOpened to write when the document was opened at `opened_ms`
+    and the metadata has `existing`: the later of the two (as a last-writer-wins value
+    keeps it), so that saving where a document was left never puts its lastOpened back
+    behind a later opening on another device. `existing` unreadable or missing: ours."""
+    try:
+        before = int(str(existing))
+    except (TypeError, ValueError):
+        before = 0
+    return str(max(before, int(opened_ms)))
+
+
 # ------------------------------------------------------------------- checksums
 
 def _crc32c_table() -> list[int]:
@@ -1064,11 +1076,21 @@ class SyncClient:
     def set_reading_position(self, doc_id: str, page: int, opened_ms: int | None = None) -> DocumentTree:
         """Record where a document was left (lastOpenedPage) and, with `opened_ms`, when it
         was opened (lastOpened). Reading is not editing: lastModified stays, as the
-        tablet's own metadata shows (documents opened after their last change keep it)."""
-        fields: dict[str, Any] = {"lastOpenedPage": int(page)}
-        if opened_ms is not None:
-            fields["lastOpened"] = str(int(opened_ms))
-        return self._update(f"reading position of {doc_id}", [doc_id], touch=False, **fields)
+        tablet's own metadata shows (documents opened after their last change keep it).
+        lastOpened never goes back: another device that opened the document later than
+        `opened_ms` (the cloud's metadata, as the commit finds it, says so) keeps its
+        time (opened_lww)."""
+
+        def edit(tree: DocumentTree) -> list[ItemChange]:
+            node = tree.get(doc_id)
+            if node is None:
+                return []
+            fields: dict[str, Any] = {"lastOpenedPage": int(page)}
+            if opened_ms is not None:
+                fields["lastOpened"] = opened_lww(node.metadata.raw.get("lastOpened"), opened_ms)
+            change = self._metadata_change(node, False, **fields)
+            return [change] if change is not None else []
+        return self._commit(f"reading position of {doc_id}", edit)
 
     def import_file(self, path: str | Path, parent: str = ROOT_ID, name: str | None = None,
                     progress: Callable[[int, int], None] | None = None) -> str:

@@ -30,7 +30,7 @@ from core.edits import (IMPORT_FILES, PAGE_EDITS, Change, Edit, EditError, Image
                         SceneFlags,
                         Staged, StrokeAdd, StrokeChange, StrokeDelete, StrokeErase, StrokePart, StrokePaste,
                         ToolSettings, current_content, document_files, import_path, page_files, page_images, rebase_refs,
-                        swapped)
+                        swapped, _alias)
 from core.sync import SyncClient, SyncError, build_index, file_entry, sha256_hex
 from core.config import atomic_write_json, read_json
 from viewer import rm_layer, rm_select, rm_stroke, rm_writer
@@ -1127,7 +1127,8 @@ class LibrarySource:
             if not source:
                 return False
             doc = self._editable(doc, page_id)
-            edits, back = swapped(source[-1], doc.id, page_id, now_ms, history.aliases)
+            step = self._with_emptying(doc, page_id, source[-1], history.aliases, now_ms)
+            edits, back = swapped(step, doc.id, page_id, now_ms, history.aliases)
             self._add_edits(doc, [(e, None) for e in edits])
             source.pop()
             target.append(back)
@@ -1359,11 +1360,71 @@ class LibrarySource:
             target_ref = before.ref(target_node)
             old_cur_ref = before.ref(old_cur_node)
             new_cur_ref = before.ref(new_cur_node)
+            emptied, changes = self._emptying(doc, page_id, before, target_node, now_ms)
             edit = LayerDelete.new(doc.id, page_id, target_ref, now_ms, new_current=new_cur_ref)
-            self._add_edit(doc, edit)
-            history.push([LayerAttachChange(target_ref, old_cur_ref, new_cur_ref, attached=False, index=idx)])
+            self._add_edits(doc, [(e, None) for e in [*emptied, edit]])
+            history.push([*changes, LayerAttachChange(target_ref, old_cur_ref, new_cur_ref, attached=False,
+                                                      index=idx)])
             history.seen = self._seen(doc.id, page_id)
         return edit
+
+    def _layer_items(self, before, node: tuple[int, int]) -> list:
+        """The live strokes and images (rm_select.Item) of layer `node` and of the groups
+        below it, in block order."""
+        if before.page is None:
+            return []
+        nodes = {tuple(node)} | {n for n, _ in rm_stroke.group_nodes(rm_writer.split(before.page)[1], tuple(node))}
+        return [i for i in rm_select.page_items(before.page) if i.parent in nodes]
+
+    def _emptying(self, doc: Document, page_id: str, before, node: tuple[int, int], now_ms: int,
+                  skip: frozenset = frozenset()) -> tuple[list[Edit], list]:
+        """(the edits deleting the live items of layer `node` (but those in `skip`), the
+        undo changes putting them back): what deleting a layer does before detaching it,
+        so that a detached layer holds nothing live, as the tablet's files have it (a
+        renderer that does not follow SceneTreeMoves, as the web app's, would draw a
+        detached layer's strokes). Strokes go with one StrokeDelete, images with an
+        ImageDelete each, as delete_items does: undo puts each right after its deleted
+        self, in its old place in the stacking order."""
+        items = [i for i in self._layer_items(before, node) if i.item not in skip]
+        lines = [i for i in items if i.is_line]
+        edits: list[Edit] = []
+        changes: list = []
+        if lines:
+            edits.append(StrokeDelete.new(doc.id, page_id, [before.ref(i.item) for i in lines], now_ms))
+            changes.append(StrokeChange(readd=tuple(StrokePart(before.ref(i.item), i.line.encode().hex())
+                                                    for i in lines)))
+        for i in items:
+            if not i.is_line:
+                edits.append(ImageDelete.new(doc.id, page_id, i.image.ref, now_ms))
+                changes.append(Change(i.image.ref.hex(), before.ref(i.item), None))
+        return edits, changes
+
+    def _with_emptying(self, doc: Document, page_id: str, step: tuple, aliases: dict, now_ms: int) -> tuple:
+        """`step` (an undo or redo stack entry) with, after each layer it detaches (a
+        LayerAttachChange that is attached now: undo of an add, redo of a delete), the
+        removal of the items that layer holds now and `step` does not take away itself
+        (drawn on the layer while it was attached): the layer goes empty, as a deleted
+        one does (_emptying), and what is put back takes them back."""
+        if not any(isinstance(c, LayerAttachChange) and c.attached for c in step):
+            return step
+        before = self.staged(doc).replay(page_id)
+        resolve = lambda ref: before.resolve(_alias(aliases, ref)) if ref is not None else None   # noqa: E731
+        named = {resolve(p.ref) for c in step if isinstance(c, StrokeChange) for p in c.remove}
+        named |= {resolve(c.remove) for c in step if isinstance(c, Change) and c.remove is not None}
+        out: list = []
+        for change in step:
+            out.append(change)
+            if isinstance(change, LayerAttachChange) and change.attached:
+                node = resolve(change.layer)
+                if node is not None:
+                    # Processed last first: these removals run before the detach.
+                    _, removals = self._emptying(doc, page_id, before, node, now_ms, frozenset(named))
+                    for removal in removals:
+                        if isinstance(removal, StrokeChange):
+                            out.append(StrokeChange(remove=removal.readd))
+                        else:
+                            out.append(Change(removal.key, None, removal.readd))
+        return tuple(out)
 
     def rename_layer(self, doc: Document, page_id: str, layer_index: int, name: str, now_ms: int) -> LayerRename | None:
         """Rename layer `layer_index` on `page_id`, as one undo step. None when unchanged."""

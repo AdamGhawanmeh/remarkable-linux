@@ -15,6 +15,17 @@ A document keeps the settings in its .content "extraMetadata" (DocumentToolSetti
     Last<Tool>ColorCode  the ARGB colour, decimal
 
 (every one of the 92 cached documents that has them, as read 2026-11-15).
+
+The highlighter is the one pen whose colour goes as an ARGB colour: the tablet draws it
+with Line::Color ArgbCode (9) and the colour itself in the line's field 8, and keeps
+"ArgbCode" and that colour (decimal) in the settings. Every highlighter line the tablet
+wrote in the cache (2026-11-20) is so: colour 9, ARGB 0xFFFFED75 (yellow), and the one
+document holding them has LastHighlighterv2Color "ArgbCode", ColorCode "4294962549". The
+ARGB of each highlighter colour is reMarkable.exe 3.29's palette (the Line::Color table
+the app builds at 0x1409d25a0 and 0x1409d9faf: HIGHLIGHTER_ARGB below); its pen handler
+(PenInputLineHandler, lineColor / lineArgbCode) puts them in the line as it is given
+them. A highlighter colour kept by name (HighlighterYellow, older documents) is drawn
+so too.
 """
 
 from __future__ import annotations
@@ -106,12 +117,18 @@ PEN_COLORS: tuple[PenColor, ...] = (
     PenColor("yellow", "Yellow", Color.YELLOW), PenColor("pink", "Pink", Color.MAGENTA),
     PenColor("cyan", "Cyan", Color.CYAN),
 )
-# The highlighter draws in its own, lighter colours (Line::Color Highlighter*).
+# The highlighter draws in its own, lighter colours (Line::Color Highlighter*), as ARGB
+# colours (see the module's doc).
 HIGHLIGHTER_COLORS: tuple[PenColor, ...] = (
     PenColor("yellow", "Yellow", Color.HIGHLIGHTER_YELLOW), PenColor("green", "Green", Color.HIGHLIGHTER_GREEN),
     PenColor("pink", "Pink", Color.HIGHLIGHTER_PINK), PenColor("blue", "Blue", Color.HIGHLIGHTER_BLUE),
-    PenColor("grey", "Grey", Color.HIGHLIGHTER_GRAY),
+    PenColor("orange", "Orange", Color.HIGHLIGHTER_ORANGE), PenColor("grey", "Grey", Color.HIGHLIGHTER_GRAY),
 )
+# reMarkable.exe 3.29's palette entries of the highlighter colours (0x1409d25a0).
+HIGHLIGHTER_ARGB: dict[Color, int] = {
+    Color.HIGHLIGHTER_YELLOW: 0xFFFFED75, Color.HIGHLIGHTER_GREEN: 0xFFACFF85, Color.HIGHLIGHTER_PINK: 0xFFF29EFF,
+    Color.HIGHLIGHTER_BLUE: 0xFFBEEAFE, Color.HIGHLIGHTER_ORANGE: 0xFFFFC38C, Color.HIGHLIGHTER_GRAY: 0xFFC7C7C6,
+}
 
 
 @dataclass(frozen=True)
@@ -120,8 +137,8 @@ class Pen:
 
     tool: PenTool
     size: int
-    color: PenColor | None              # None: the eraser, or an ARGB colour (`argb`)
-    argb: int | None = None
+    color: PenColor | None              # None: the eraser, or an ARGB colour (`argb`) of no swatch
+    argb: int | None = None             # set: the line is drawn with colour ArgbCode and this
 
     @property
     def line_color(self) -> int:
@@ -146,13 +163,23 @@ def pen_of(settings: dict[str, str], tool: PenTool) -> Pen:
     name = settings.get(f"Last{tool.name}Color")
     if name == "ArgbCode":
         try:
-            return Pen(tool, size, None, int(settings.get(f"Last{tool.name}ColorCode", "")) & 0xFFFFFFFF)
+            argb = int(settings.get(f"Last{tool.name}ColorCode", "")) & 0xFFFFFFFF
         except ValueError:
             pass
+        else:
+            # The swatch of that colour, if the tool has one (the highlighter's).
+            color = next((c for c in tool.colors if _argb_of(tool, c) == argb), None)
+            return Pen(tool, size, color, argb)
     color = next((c for c in tool.colors if c.name == name), None)
     if color is None:
         color = next(c for c in tool.colors if c.key == tool.default_color)
-    return Pen(tool, size, color)
+    return Pen(tool, size, color, _argb_of(tool, color))
+
+
+def _argb_of(tool: PenTool, color: PenColor) -> int | None:
+    """The ARGB colour a line of `tool` in `color` is drawn with (the highlighter's,
+    see the module's doc), or None: the line has the colour itself."""
+    return HIGHLIGHTER_ARGB.get(color.color) if tool.tool == s.HIGHLIGHTER_V2 else None
 
 
 def current_tool(settings: dict[str, str]) -> PenTool:
@@ -182,4 +209,7 @@ def color_values(tool: PenTool, key: str) -> dict[str, str]:
     color = next((c for c in tool.colors if c.key == key), None)
     if color is None:
         raise ValueError(f"{tool.label} has no colour {key!r}")
+    argb = _argb_of(tool, color)
+    if argb is not None:
+        return {f"Last{tool.name}Color": "ArgbCode", f"Last{tool.name}ColorCode": str(argb)}
     return {f"Last{tool.name}Color": color.name}

@@ -968,6 +968,15 @@ def restore_image(page: bytes, *, author: bytes, item: tuple[int, int], value: I
     new_id = (me, highest_counter(blocks) + 1)
     back = ImageValue(value.ref, value.ref_timestamp, value.bounds_timestamp, [tuple(v) for v in value.vertices],
                       value.indices, value.move_id if value.move_id not in (None, ZERO_ID) else item)
+    if owner.deleted_length > 1:
+        # The image's deleted item was joined with deleted neighbours into one run (a
+        # stroke deleted next to it after it, 0x1408c3e60): the run is cut after it,
+        # as a stroke put back cuts it (rm_stroke._Chain.insert_after), so that the
+        # run's ids stay in one piece on each side of the new item.
+        from . import rm_stroke         # here: rm_stroke imports this module
+        chain = rm_stroke._Chain(blocks, owner.parent)
+        chain.insert_after(item, new_id, back.encode(), kind=BLOCK_IMAGE_ITEM)
+        return join(header, chain.write(blocks))
     _insert_item(blocks, new_block(BLOCK_IMAGE_ITEM, ItemHeader(owner.parent, new_id, item, right, 0,
                                                                 back.encode()).encode()))
     _check_untouched(before, original, blocks, {0})

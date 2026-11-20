@@ -1772,8 +1772,14 @@ class PenTests(unittest.TestCase):
         self.assertEqual((extra["LastTool"], extra["LastFinelinerv2Color"]), ("Finelinerv2", "Blue"))
         # The highlighter has its own colours; the eraser none.
         self.click(self.toolbar_item(view, "penTool_highlighter"))
-        self.assertEqual([c["key"] for c in tools.property("colors")], ["yellow", "green", "pink", "blue", "grey"])
+        self.assertEqual([c["key"] for c in tools.property("colors")],
+                         ["yellow", "green", "pink", "blue", "orange", "grey"])
         self.assertEqual((tools.property("size"), tools.property("color")), (1, "yellow"))
+        # Chosen, a highlighter colour is kept as the tablet keeps it: ArgbCode and the colour.
+        tools.setColor("pink")
+        self.assertEqual(tools.property("color"), "pink")
+        self.assertEqual((self.settings()["LastHighlighterv2Color"], self.settings()["LastHighlighterv2ColorCode"]),
+                         ("ArgbCode", str(0xFFF29EFF)))
         self.click(self.toolbar_item(view, "penTool_eraser"))
         self.assertEqual(tools.property("colors"), [])
         self.assertEqual(self.settings()["LastEraserTool"], "Eraser")

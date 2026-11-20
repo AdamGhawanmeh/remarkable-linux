@@ -738,12 +738,13 @@ class _Chain:
         for item_id in new.ids():
             self.at[item_id] = new
 
-    def insert_after(self, left: tuple[int, int], item_id: tuple[int, int], value: bytes) -> None:
-        """Put a new line item right after the item `left` (0x1408c8920): its right
-        neighbour is what followed `left`. When `left` is an id inside a run of
-        deleted ids the run is cut there, the second part keeping its ids, with the
-        id before it as its left and the run's right (as real pages have it: the
-        piece an eraser left always follows the last id of a run)."""
+    def insert_after(self, left: tuple[int, int], item_id: tuple[int, int], value: bytes,
+                     kind: int = w.BLOCK_LINE_ITEM) -> None:
+        """Put a new item (a line, or of block type `kind`) right after the item `left`
+        (0x1408c8920): its right neighbour is what followed `left`. When `left` is an
+        id inside a run of deleted ids the run is cut there, the second part keeping
+        its ids, with the id before it as its left and the run's right (as real pages
+        have it: the piece an eraser left always follows the last id of a run)."""
         link = self.at.get(left)
         if link is None:
             raise RmParseError(f"the page has no item {left} to put a stroke after")
@@ -756,7 +757,7 @@ class _Chain:
             self._after(link, _Link(rest, None, link.kind))
         right = link.next.item.item if link.next is not None else ZERO_ID
         self._after(link, _Link(w.ItemHeader(self.parent, item_id, left, right, 0, value), None,
-                                (w.BLOCK_LINE_ITEM, *w.BLOCK_VERSIONS[w.BLOCK_LINE_ITEM])))
+                                (kind, *w.BLOCK_VERSIONS[kind])))
 
     def write(self, blocks: list[w.Block]) -> list[w.Block]:
         """`blocks` with what was done to this node's items."""

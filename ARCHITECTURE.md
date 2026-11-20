@@ -223,7 +223,10 @@ calls `LibraryController.setLastOpenedPage(id, currentPage)`. The Tags view call
 just before opening a tagged page. The Library keeps the position locally, so the next
 open and "Page %1 of %2" use it at once. 1.5 s after the document is closed it saves
 `lastOpenedPage`/`lastOpened` (`SyncClient.set_reading_position`), without touching
-`lastModified`. The user's library shows reading does not change it: 105 documents were
+`lastModified`. `lastOpened` never moves back: the save is worked out inside the commit,
+on the cloud's metadata as the commit's refresh finds it, and keeps the later of that
+and this opening (`core.sync.opened_lww`, last writer wins). A live test had a save
+written after another device had opened the document put its `lastOpened` 37 s back. The user's library shows reading does not change it: 105 documents were
 opened after their last change, with `lastModified` kept. Saving is quiet: offline or
 logged out, the position stays in the session, and a failed save is logged, not shown.
 A sync no longer re-announces items whose index hash did not change: every refresh
@@ -1148,10 +1151,28 @@ code is in the binary, mouse path included:
 - Settings are written as `extraMetadata` strings, the enum names real documents have:
   `LastTool`/`LastPen` (or `LastEraserTool`), `Last<Tool>Size`, `Last<Tool>Color`. Pen
   colours Black, Gray, White, Blue, Red, Green, Yellow, Magenta ("Pink"), Cyan; the
-  highlighter's own HighlighterYellow/Green/Pink/Blue/Gray. Defaults: Ballpointv2, size 2,
-  Black; highlighter size 1, HighlighterYellow (as every cached document has). A settings-only
+  highlighter's own yellow, green, pink, blue, orange and gray. Defaults: Ballpointv2, size 2,
+  Black; highlighter size 1, yellow. A settings-only
   change uploads `.content` alone; whether the app also bumps `.metadata` lastModified then
   is not traced.
+- **The highlighter draws in ARGB colours, as the tablet does.** Every highlighter line
+  the tablet wrote in the cache (2026-11-20, 6 lines) is Line::Color ArgbCode (9) with
+  ARGB `0xFFFFED75` in field 8 (fields 1–6 and 8), and the one document holding them keeps
+  `LastHighlighterv2Color` "ArgbCode", `LastHighlighterv2ColorCode` "4294962549". In
+  reMarkable.exe 3.29 the pen handler (`PenInputLineHandler`, properties `lineColor`,
+  `lineArgbCode`, peninputhandler.cpp) puts the colour and ARGB it is given into the line,
+  and the ARGB of each highlighter colour is the app's palette (the Line::Color table
+  built at 0x1409d25a0 and 0x1409d9faf): yellow `FFFFED75`, green `FFACFF85`, pink
+  `FFF29EFF`, blue `FFBEEAFE`, orange `FFFFC38C`, gray `FFC7C7C6`. The client wrote
+  colour 3 (HighlighterYellow) with no ARGB before; it now writes colour 9 and that ARGB,
+  keeps "ArgbCode" and the code in the settings, and reads a colour kept by name (older
+  documents) as that colour's ARGB (`ui.pen.HIGHLIGHTER_ARGB`).
+- **Paintbrush (Paintbrushv2, 12).** 3.29's addPoint (0x140b40df0) sends tool 12 to the
+  Paintbrush (0) branch (jump table at 0x140b4161c) with the v2 flag (`+0x98`): pressure
+  at least 0.25, width `max(2, p^4.5 × 4.5 + tilt^4 × 4.5) × size` (v1: × 10 and × 5),
+  colours by name (no ARGB). The client's builder is the same; the 268 points of the 9
+  paintbrush lines it wrote on the test notebook all match the formula, and the lines'
+  fields (1–6) are those of every tablet v2 pen line. No tablet paintbrush line is cached.
 - The Shader (ShadingMarker, 23) is the toolbar's tenth tool here (icon `shader`). No
   cached document has a shader stroke or setting, and the tablet's toolbar (its colour
   list) is not in reMarkable.exe: the client offers the pen colours with Gray first
@@ -2202,7 +2223,10 @@ node's current parent: a layer is live only if its final parent is `0:1` (a deta
 layer's tree node, root group item and child strokes stay in the file so undo can
 re-attach it with a `SceneTreeMove` `31 = 1, 4C = { 1F: 0:1 }`, reusing the existing
 root group item). Real cached pages show up to 8 root group items with 6 detached layers
-(leaving 2 live layers).
+(leaving 2 live layers). A tablet-written detached layer holds no live item; one that
+did (a client deleting a layer with its strokes left live) is drawn by renderers that do
+not follow `SceneTreeMove`s, as the web app's (seen live: ghost strokes of deleted layers
+on a page).
 
 **Layer operations (all go through `SceneController::pushAction` 0x1404470a0):**
 
@@ -2221,6 +2245,17 @@ root group item). Real cached pages show up to 8 root group items with 6 detache
   fallback (`0x14095d7de`): if `deletedIdx < oldCur` or `oldCur == newCount`, sets
   `currentLayer = oldCur - 1`; otherwise keeps `oldCur` (pointing to the layer that shifted
   into that index). Undo re-attaches `nodeId` under `0:1` and restores `oldCur`.
+  **Client:** before detaching, the layer is emptied: its live strokes (one
+  `StrokeDelete`) and images (an `ImageDelete` each), and those of the groups below it,
+  are deleted with the same tombstones as ClearPage and delete-selection, in the same
+  undo step, so a detached layer holds nothing live, as the tablet's files have it. Undo
+  re-attaches the layer at its index and puts each item back right after its deleted
+  self (new ids, moveId = the deleted id), so the layer's stacking order comes back;
+  redo empties it again. An undo of an add (or redo of a delete) whose layer holds items
+  no step above it accounts for empties it too, and its redo puts them back
+  (`LibrarySource._with_emptying`). Putting an image back inside a run of deleted ids
+  (its deleted item joined to deleted strokes beside it, `can_join` 0x1408c3e60) cuts the
+  run, as putting a stroke back does (`rm_writer.restore_image`).
 - **Rename & visibility (`setLayerName` 0x1404485b0 → 0x14095e1d0 → 0x1408cfac0;
   `setLayerVisible` 0x1404486d0 → 0x14095e3d0 → 0x1408cfb60):** updates `SceneTreeNode`
   field 2 (label LWW string) or field 3 (visible LWW bool) with timestamp `++clock`,
@@ -2270,13 +2305,26 @@ root group item). Real cached pages show up to 8 root group items with 6 detache
   `layerSelected = (i == currentLayer)`, `layerMoveUpEnabled = (i < n - 1)`,
   `layerMoveDownEnabled = (i > 0)`, `layerMergeEnabled = (i > 0)`,
   `layerTrashEnabled = (n > 1)`). `LayersFoldout.qml` rotates the repeater 180° so index
-  `n - 1` sits at the top and index `0` at the bottom. Keyboard focus (client): every
-  layer change resets the model, destroying the clicked row button, and the rename
-  field / New layer row keep or drop focus inside the foldout; Undo/Redo are
-  ProxyActions resolved from the focused item (`main.qml` `actionHandler`, which skips
-  the window's root item), so Ctrl+Z / Ctrl+Y went nowhere until the page was clicked.
-  `SceneView.refocus_viewport` hands focus back to `DocumentViewport` after a model reset
+  `n - 1` sits at the top and index `0` at the bottom. **Client:** rows are updated in
+  place. Each page load, eye click, layer edit or upload emits two or three of the
+  controller's signals, and resetting the model on each rebuilt every row 2–3 times,
+  destroying a row mid-press (the click was lost); the model now diffs the rows and
+  emits `dataChanged` for those that differ, inserting or removing only rows added or
+  taken away (a reset only for another controller). Keyboard focus: a removed row's
+  button, or a row button, the rename field or the New layer row keeping focus inside the
+  foldout, leave Undo/Redo (ProxyActions resolved from the focused item, `main.qml`
+  `actionHandler`, which skips the window's root item) with nowhere to go;
+  `SceneView.refocus_viewport` hands focus back to `DocumentViewport` after a row change
   or a rename when focus fell to the root item or a non-text control of the foldout.
+- **Eye clicks (client).** `LayersFoldout.qml` calls `setLayerVisible(i,
+  !isLayerVisible(i))`: an explicit target read from the controller's layers. Those
+  were only refreshed when the page reloaded after the edit was kept, so a second
+  click before then asked for the same state again (a no-op): quick clicks were
+  dropped. The click now shows at once (the controller's layers and the page drawn),
+  so the next click reads the state it gave; the edit is kept on the view's one worker
+  in click order, and the state clicked stays over every reload queued before that
+  edit (`SceneView._visible_clicks`, by load number), so a reload loaded in between
+  does not flip the eye back.
 
 ### 5.9 Selecting and copying PDF / EPUB text
 

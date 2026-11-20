@@ -954,7 +954,8 @@ class PenSettingsTests(Base):
         p = pen.pen_of({"LastFinelinerv2Size": "3", "LastFinelinerv2Color": "Blue"}, pen.BY_KEY["fineliner"])
         self.assertEqual((p.size, p.color.key, p.line_color), (3, "blue", int(Color.BLUE)))
         p = pen.pen_of({}, pen.BY_KEY["highlighter"])
-        self.assertEqual((p.size, p.color.name, p.line_color), (1, "HighlighterYellow", int(Color.HIGHLIGHTER_YELLOW)))
+        # The highlighter draws in ARGB colours, as the tablet does (colour 9, the palette's ARGB).
+        self.assertEqual((p.size, p.color.name, p.line_color, p.argb), (1, "HighlighterYellow", 9, 0xFFFFED75))
         p = pen.pen_of({"LastFinelinerv2Color": "ArgbCode", "LastFinelinerv2ColorCode": "4294962549"},
                        pen.BY_KEY["fineliner"])
         self.assertEqual((p.color, p.argb, p.line_color), (None, 0xFFFFED75, 9))
