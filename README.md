@@ -144,13 +144,14 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 846 offline tests use a fake cloud and synthetic documents; they need no account
+The 863 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
 `client/tools/rm_roundtrip.py` checks the page writer against your own cached pages:
 every page must come back byte for byte, and take an image, a move and a delete without
 any other block changing (it prints counts only). `client/tools/search_toc_corpus.py`
 loads the table of contents of every cached PDF and EPUB and searches every cached page,
-in memory and read-only (counts only).
+and `client/tools/pdf_text_corpus.py` selects text on every cached PDF and EPUB page
+(each line, a word on it, the whole page), both in memory and read-only (counts only).
 
 ## Feature status and roadmap
 
@@ -172,6 +173,7 @@ when you use them.
 | Library | My files and folders, Notebooks, PDFs, Ebooks, Favorites, Trash, sort orders, grid and list views, thumbnails |
 | Search | Title search across the library (Ctrl+F) |
 | Search in documents | Ctrl+F inside a document: the text of PDF and EPUB pages and your typed text, case-insensitive; "Page only" (searched as you type) or the whole document (Return), with the official app's progress bar and "2 / 5" count; Return and Shift+Return (or the arrows) step through the hits and wrap around, turning pages; every hit on the page shown is highlighted, the current one darker, at any zoom; Escape closes it. Hits follow the document's own page order, so pages you inserted or moved are allowed for. Handwriting is not searched (no handwriting recognition on Linux) |
+| Select and copy PDF/EPUB text | Drag across the text of a PDF or EPUB page to select it, across lines and paragraphs, forward or backward; double-click selects a word (a triple click too, as in the official app); Ctrl+C or right-click > Copy puts it on the clipboard, lines joined by line breaks, ligatures spelled out, ready to paste into other programs or into a notebook's typed text. The highlight follows the text at any zoom, scroll and screen scaling (HiDPI). A click elsewhere, turning the page, closing the document or taking up a pen, the eraser, the lasso or typing clears it; Esc clears it first, then closes the document as before. Pages you inserted have no PDF text to select. Text the PDF places off the page (as some EPUB renditions do) is left out |
 | Table of contents | `LibraryController.loadTableOfContents` answers as the app does: a PDF's outline (nested), or an EPUB's own table of contents placed on the pages of its PDF version, each entry on the page that shows it (inserted and moved pages allowed for); nothing for documents without one. The official desktop app has no table of contents panel, so nothing on screen shows it yet |
 | Tags | Tags set on the tablet are listed in Tags, and the library filters by them |
 | File operations | New folder, rename, move (drag, Move, Cut and Paste), favorite, move to trash, restore, delete, empty trash |

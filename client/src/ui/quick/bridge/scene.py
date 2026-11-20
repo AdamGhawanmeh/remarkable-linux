@@ -62,6 +62,7 @@ from viewer.renderer import qt_measure
 
 from ... import docsearch
 from ... import editing
+from ... import pdftext
 from ... import selection as selecting
 from ... import textedit
 from ...editing import prepare_image
@@ -146,6 +147,44 @@ def _drop_idle_pools() -> None:
     _retired_pools[:] = [p for p in _retired_pools if p.activeThreadCount() > 0]
     if not _retired_pools and _retire_timer is not None:
         _retire_timer.stop()
+
+
+# One glyph worker for every view: hit tests and selections of PDF text run off the GUI
+# thread (QtPdf serialises PDFium behind its own mutex, so a render can hold them up),
+# as 3.29 posts them to its scene thread (0x14056dd20). Requests coalesce: a drag asks
+# faster than PDFium answers, and only the latest position matters.
+_glyph_pool: QThreadPool | None = None
+
+
+def _glyph_worker() -> QThreadPool:
+    global _glyph_pool
+    if _glyph_pool is None:
+        _glyph_pool = QThreadPool()
+        _glyph_pool.setMaxThreadCount(1)
+    return _glyph_pool
+
+
+class _EscapeFilter(QObject):
+    """Esc clears a PDF text selection (client addition). In 3.29 Esc reaches DocumentView
+    (a SheetDialog: Keys.onEscapePressed hides it) and closes the document, selection and
+    all. Here, while text is selected, the window's Esc is taken: the first Esc clears
+    the selection and the document stays open, the next one closes it as before.
+    Shortcuts come first (Qt tries them before the window gets the key), so Esc still
+    closes the Ctrl+F bar or leaves edit mode where those take it."""
+
+    def __init__(self, view) -> None:
+        super().__init__()
+        self._view = view
+
+    def eventFilter(self, obj, event) -> bool:
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape \
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            view = self._view
+            if view is not None and shiboken6.isValid(view) and not view._glyph_selection.empty:
+                view.clear_glyphs()
+                return True
+        return False
 
 
 def set_page_source(provider: Callable[[], object]) -> None:
@@ -984,6 +1023,29 @@ class _Controller:
         if self.view is not None:
             self.view.clear_lines_in_layer(int(index))
 
+    # PDF / EPUB text selection, as 3.29's slots 98-101 (0x140447590, 0x140447670,
+    # 0x1404474c0, 0x140439d40): each posts the work to the scene's worker and the
+    # answer comes back as glyphsSelected (ui/pdftext.py has the rules).
+    @Slot(QPointF, QPointF)
+    def selectGlyphsFromPositions(self, anchor: QPointF, cursor: QPointF) -> None:
+        if self.view is not None:
+            self.view.select_glyphs("points", QPointF(anchor), QPointF(cursor))
+
+    @Slot(int, QPointF)
+    def selectGlyphsWithAnchorIndex(self, anchor_index: int, cursor: QPointF) -> None:
+        if self.view is not None:
+            self.view.select_glyphs("anchor", int(anchor_index), QPointF(cursor))
+
+    @Slot(QPointF)
+    def selectGlyphWordAtPoint(self, pos: QPointF) -> None:
+        if self.view is not None:
+            self.view.select_glyphs("word", QPointF(pos))
+
+    @Slot()
+    def clearPdfTextSelection(self) -> None:
+        if self.view is not None:
+            self.view.clear_glyphs()
+
     @Slot(QPointF, result="QVariantMap")
     def linkAt(self, pos: QPointF) -> dict:
         """The link under a scene position (DocumentViewport reads .valid and .index):
@@ -1283,6 +1345,7 @@ class _SceneView:
     _text_opened = Signal(object)
     _text_kept = Signal(object)
     _pen_done = Signal(object)
+    _glyphs = Signal(object)
     penShown = Signal(int)          # the page is drawn with pen commit n (and those before it) on it
 
     def __init__(self, parent: QQuickItem | None = None) -> None:
@@ -1333,6 +1396,16 @@ class _SceneView:
         self.setFlag(QQuickItem.ItemAcceptsInputMethod, False)
         # Pens: the last commit waiting for the page to load, and to be drawn.
         self._pen_done.connect(self._on_pen_done)
+        # PDF / EPUB text selection (ui/pdftext.py): the request waiting for the glyph
+        # worker, the generation answers must match, what is selected, the pages' text.
+        self._glyph_lock = threading.Lock()
+        self._glyph_request = None
+        self._glyph_busy = False
+        self._glyph_gen = 0
+        self._glyph_selection = pdftext.EMPTY
+        self._glyph_pages: dict = {}
+        self._glyph_escape: _EscapeFilter | None = None
+        self._glyphs.connect(self._on_glyphs)
         self._pen_loading = 0
         self._pen_rendering = 0
         # Live incoming sync: the document whose node changes this view follows, what
@@ -1416,6 +1489,11 @@ class _SceneView:
             return
         if self._pages is not None:
             self._pages.close()
+        # Another page: its PDF text selection goes (DocumentViewport also clears it on
+        # currentPageChanged); a reload of the same page after an edit keeps it.
+        if shown != self._page_id:
+            self.clear_glyphs()
+        self._glyph_pages.clear()             # the old DocumentPages' PDF is closed
         self._pages, self._content, self._bounds, self._page_id = pages, content, bounds, shown
         node = getattr(self._get("document"), "node", None)
         self._shown_key = self._page_key(node, shown) if node is not None else self._loading_key
@@ -1585,6 +1663,80 @@ class _SceneView:
             return bytes.fromhex(source.insert_image(node, page_id, data, extension, corners, now_ms,
                                                      layer_index=layer).key)
         self._run_insertion(page_id, insert)
+
+    # -- PDF / EPUB text selection (ui/pdftext.py) --
+    def select_glyphs(self, kind: str, *args) -> None:
+        """A selection of the PDF page's text, worked out on the glyph worker; the answer
+        is glyphsSelected (_on_glyphs). kind: "points" (anchor, cursor), "anchor"
+        (anchor index, cursor) or "word" (point)."""
+        content = self._content
+        if content is None or not content.has_pdf_page:
+            return
+        request = (self._glyph_gen, content.pdf.doc, content.pdf_page, kind, args)
+        with self._glyph_lock:
+            self._glyph_request = request
+            if self._glyph_busy:
+                return              # the running job takes this one when it is done
+            self._glyph_busy = True
+        _glyph_worker().start(_Job(self._glyph_job))
+
+    def _glyph_job(self) -> None:
+        while True:
+            with self._glyph_lock:
+                request, self._glyph_request = self._glyph_request, None
+                if request is None:
+                    self._glyph_busy = False
+                    return
+            gen, doc, pdf_page, kind, args = request
+            try:
+                key = (id(doc), pdf_page)
+                page = self._glyph_pages.get(key)
+                if page is None:
+                    page = self._glyph_pages[key] = pdftext.PageText(doc, pdf_page)
+                if kind == "points":
+                    found = page.select_points(*args)
+                elif kind == "anchor":
+                    found = page.select(int(args[0]), page.hit(args[1]))
+                else:
+                    found = page.word(*args)
+            except Exception:
+                log.exception("selecting text on PDF page %s", pdf_page)
+                found = pdftext.EMPTY
+            emit_from_worker(self, lambda gen=gen, found=found: self._glyphs.emit((gen, found)))
+
+    def _on_glyphs(self, result) -> None:
+        gen, found = result
+        if gen != self._glyph_gen:
+            return                  # cleared, or another page, since it was asked for
+        self._show_glyphs(found)
+
+    def _show_glyphs(self, found) -> None:
+        self._glyph_selection = found
+        self._controller.glyphsSelected.emit(list(found.areas), found.text, found.start, found.end,
+                                             QPointF(found.start_handle), QPointF(found.end_handle))
+        window = getattr(self, "_shown_window", None)
+        if not found.empty and self._glyph_escape is None and window is not None and shiboken6.isValid(window):
+            self._glyph_escape = _EscapeFilter(self)
+            window.installEventFilter(self._glyph_escape)
+        elif found.empty and self._glyph_escape is not None:
+            if window is not None and shiboken6.isValid(window):
+                window.removeEventFilter(self._glyph_escape)
+            self._glyph_escape = None
+
+    def clear_glyphs(self) -> None:
+        """No text selected (clearPdfTextSelection, Esc, another page or tool): answers
+        still on their way are dropped, and the QML overlay told."""
+        if not shiboken6.isValid(self):
+            return
+        self._glyph_gen += 1
+        with self._glyph_lock:
+            self._glyph_request = None
+        if not self._glyph_selection.empty or self._glyph_escape is not None:
+            self._show_glyphs(pdftext.EMPTY)
+
+    @property
+    def selected_pdf_text(self) -> str:
+        return self._glyph_selection.text
 
     # -- layers & SceneInfo --
     def _close_selection_for_layer_edit(self) -> None:

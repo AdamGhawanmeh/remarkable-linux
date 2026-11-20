@@ -657,12 +657,13 @@ Item {
     Connections {
         target: panel
         ignoreUnknownSignals: true
-        function onTextModeChanged() { if (panel.textMode) penTools.deactivate(); }
-        function onSelectionModeChanged() { if (panel.selectionMode) penTools.deactivate(); }
+        function onTextModeChanged() { if (panel.textMode) { penTools.deactivate(); clearPdfText(); } }
+        function onSelectionModeChanged() { if (panel.selectionMode) { penTools.deactivate(); clearPdfText(); } }
     }
     Connections {
         target: penTools
         function onActiveChanged() {
+            if (penTools.active) clearPdfText();
             if (!penTools.active || !panel) return;
             if (panel.selectionMode) {
                 if (viewport && viewport.endItemSelection) viewport.endItemSelection();
@@ -670,6 +671,10 @@ Item {
             }
             if (panel.textMode) panel.textMode = false;
         }
+    }
+    // A PDF / EPUB text selection goes when a tool is taken up (pen, eraser, lasso, text).
+    function clearPdfText() {
+        if (viewport && viewport.sceneController) viewport.sceneController.clearPdfTextSelection();
     }
     Shortcut {
         sequence: "Escape"

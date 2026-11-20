@@ -2084,6 +2084,88 @@ root group item). Real cached pages show up to 8 root group items with 6 detache
   `SceneView.refocus_viewport` hands focus back to `DocumentViewport` after a model reset
   or a rename when focus fell to the root item or a non-text control of the foldout.
 
+### 5.9 Selecting and copying PDF / EPUB text
+
+Traced in reMarkable.exe 3.29 [O]; EPUB pages are their tablet-rendered PDF, so both go
+the same way. The whole interaction lives in the app's QML; only the glyph engine is C++.
+
+**QML (carved, unchanged).** `DocumentViewport.qml` `mainMouse`, on a page that is not a
+note page (`!notePage`): a left press inside the page records `pdfSelectAnchorPos`
+(scene) and counts clicks (500 ms `clickCountTimer`, `doubleClickDistanceThreshold`);
+a move with the button down past `dragDistanceThreshold x devicePixelRatio` calls
+`sceneController.selectGlyphsFromPositions(anchor, cursor)` on every move; release with
+`clickCount >= 2` calls `selectGlyphWordAtPoint(point)` (so a triple click selects a word
+too: no line or paragraph selection), and a plain click with a selection clears it. The
+right button opens the context menu (Copy = `actions.copyAction`). `mainMouse` is
+disabled in selection mode (`enabled: !selectionMode`), so the lasso never starts a text
+selection; the cursor over the page is `Qt.IBeamCursor`, a link's `PointingHandCursor`.
+`PdfTextSelection.qml` (objectName `pdfTextSelection`) keeps `selectedText` from
+`glyphsSelected` and paints the areas through `PdfGlyphSelectionOverlay.qml` ("Client-only
+— device uses C++ PdfTextSelectionOverlay"): one `Colors.textSelectionBlue` (#6635A7FF)
+Rectangle per area at `tileManager.sceneToView(area)`, refreshed on `transformChanged`.
+It is cleared on `onDocumentChanged` and `onCurrentPageChanged`. Copy:
+`copyAction` → `Clipboard.setTextFromString(pdfTextSelection.selectedText)`.
+
+**SceneController (moc slots 98–101, metacall 0x1403c99b0 jump table 0x1403cb590).**
+`selectGlyphsFromPositions(QPointF anchor, QPointF cursor)` 0x140447590,
+`selectGlyphsWithAnchorIndex(int, QPointF)` 0x140447670, `selectGlyphWordAtPoint(QPointF)`
+0x1404474c0, `clearPdfTextSelection()` 0x140439d40; signal `glyphsSelected(QList<QRectF>
+selectedAreas, QString text, int startIndex, int endIndex, QPointF startHandlePos, QPointF
+endHandlePos)`. Each slot wraps its arguments in a `std::function` (vtables 0x140c8b4b0,
+0x140c8b520, 0x140c8b558; `_Do_call` 0x1404349e0, 0x1404349b0, 0x140433f30) posted to the
+scene thread (0x14056dd20), which runs `Scene::selectGlyphsFromPositions` 0x1409b3bb0,
+`selectGlyphWordAtPoint` 0x1409b3680 and the clear 0x1409b0750.
+
+**Glyphs (PDFium, 0x14071e0b0 → 0x14071dae0).** `FPDFText_LoadPage`, `CountChars`, then
+per index `GetUnicode`, `GetCharBox` and `GetCharOrigin`; a character is skipped only if
+one of those fails, so generated and zero-size characters stay. Records are 0x38 bytes:
+`+0x8` origin y (baseline), `+0x10` QRectF box, `+0x30` QChar. Lines (0x140a2af00): in
+order, a glyph joins the current line when its baseline is within 1.0 of the line's last
+glyph's, the line's top/bottom growing to the boxes; line entries are 32 bytes (first,
+last, top, bottom, …), also kept sorted for hit testing.
+
+**Hit test (0x140a2c5b0 → 0x140a2c160).** With a hint index, the glyphs ±2 around it on
+its line if the point is within that line's top..bottom (zero-size boxes skipped); else
+a binary search of the lines by y, the lines within a tolerance band (min 2.0, 0.4 x line
+spacing), the glyph nearest in x on each (0x140a2c810), and of those the one with the
+smallest squared distance from the point to its box. No distance limit: a drag that
+starts in a margin snaps to the nearest text.
+
+**Range (0x140a51460).** Indices ordered, inclusive at both ends; trimmed of glyphs that
+are `QChar::isSpace` or not `isPrint` at either end (0x140a516b0); cut into line segments
+(0x140a2ca90); per segment (0x140a4fc80, pads 0 and 0.25): an area from the segment's
+leftmost to rightmost glyph, from `baseline − 1.25·ascent` with height `1.5·ascent`
+(ascent = max over the whole line of baseline − box top), and a string of its characters.
+The text is the strings joined with `"\n"` (0x141009850, `QStringList::join`); `endIndex =
+start + count − 1`. Handles (0x1409b3e35…): the first area's left (right if right-to-left)
+and the last area's right, at `y + 0.5·height` (0x14102b728 = 0.5). The old and new areas
+are invalidated, then `glyphsSelected` is emitted (0x1408b08c0). An unchanged range
+(+0x210/+0x214) emits nothing.
+
+**Word (0x140a51550).** Nothing when the glyph under the point is whitespace or not
+printable (0x140a508f0); else it grows backwards (0x140a50800) and forwards (0x140a50700)
+over neighbours that sit next to it on the line (0x140a2bd40) and are neither `isSpace`
+nor `isPunct`; the glyph itself may be punctuation ("bravo," from its comma).
+
+**The client (ui/pdftext.py, bridge/scene.py).** The four slots and the signal as above,
+on one shared single-thread glyph worker with requests coalesced (a drag asks faster
+than PDFium answers). QtPdf exposes no character origins or lines (PDFium's symbols are
+not exported from libQt6Pdf), so, deviations: lines are PDFium's own (the runs between
+the line breaks it generates in `getAllText`), the nearest line is found by distance to
+its box (where PDFium's lines overlap, as table cells or columns on one baseline do, the
+one whose middle is nearest) and the character in it by bisecting prefix boxes (`getSelectionAtIndex`, ~1–2 ms
+a call, per-page text built once per page); an area runs from `top − 0.2·h` to the
+line box's bottom (h its height: ascent taken as 0.8·h); a segment whose glyphs QtPdf
+gives no box at all (3.29 has zero-width ones) takes its line's box. Text placed off the PDF page
+(an EPUB rendition's run-in above the top) is not selectable, as in search. Additions:
+typographic ligatures (U+FB00–FB06) are spelled out in the copied text, and each line of
+it is trimmed of the spaces at its ends, lines of spaces only left out (3.29 trims only
+the range's two ends, so a multi-line copy carried trailing spaces and blank lines); Esc with text
+selected clears it and keeps the document open (in 3.29 Esc reaches DocumentView, a
+SheetDialog, and closes the document); taking up a pen, eraser, lasso or text mode
+clears it. Inserted pages (no `redir`) have no PDF page and select nothing; the PDF page
+comes from the page list (`document_pages`), so moved and inserted pages are allowed for.
+
 ## 6. Implications for the Linux client
 
 1. **Auth**: implement device/new → user/new with discovery-based host resolution and

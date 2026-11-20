@@ -54,6 +54,8 @@ from xml.etree import ElementTree
 
 from PySide6.QtCore import QModelIndex, QRectF
 
+from ui.pdftext import MIN_BOX_PT, pdf_frame, selection_boxes, to_scene
+from ui.pdftext import solid as _solid
 from viewer.renderer import BASELINE_AT, caret_x, layout_text, qt_measure
 from viewer.rm_parser import PAGE_WIDTH, PageScene
 
@@ -125,16 +127,6 @@ def result(page: int, metrics: list[dict]) -> dict:
     return {"page": int(page), "metrics": metrics}
 
 
-MIN_BOX_PT = 1.0       # a box flat in one direction (a rule, a generated character) is made this thick
-
-
-def _solid(box: QRectF) -> QRectF:
-    """`box` at least MIN_BOX_PT wide and high, about its centre."""
-    w, h = max(box.width(), MIN_BOX_PT), max(box.height(), MIN_BOX_PT)
-    c = box.center()
-    return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
-
-
 def _lines(boxes: Iterable[QRectF]) -> list[QRectF]:
     """Character boxes merged into one box per line: boxes that overlap vertically (by
     more than half the smaller one's height) and follow each other. Characters with no
@@ -154,12 +146,6 @@ def _lines(boxes: Iterable[QRectF]) -> list[QRectF]:
                 continue
         lines.append(QRectF(box))
     return lines
-
-
-def pdf_frame(page_size) -> QRectF:
-    """Where a PDF page of `page_size` points lies in scene coordinates."""
-    w, h = page_size.width() * PDF_PX_PER_PT, page_size.height() * PDF_PX_PER_PT
-    return QRectF(-w / 2, 0, w, h)
 
 
 def pdf_hits(doc, pdf_page: int, term: str, text_cache: dict | None = None) -> list[list[dict]]:
@@ -182,18 +168,11 @@ def pdf_hits(doc, pdf_page: int, term: str, text_cache: dict | None = None) -> l
     page = QRectF(0, 0, size.width(), size.height())
     hits = []
     for start, end in found:
-        selection = doc.getSelectionAtIndex(pdf_page, start, end - start)
-        boxes = [polygon.boundingRect() for polygon in selection.bounds()]
-        if not boxes:
-            box = selection.boundingRectangle()
-            boxes = [box] if box.isValid() else []
         metrics = []
-        for line in _lines(boxes):
+        for line in _lines(selection_boxes(doc, pdf_page, start, end - start)):
             if not page.intersects(line):
                 continue        # text set outside the page: never shown, so not highlighted
-            rect = QRectF(frame.x() + line.x() * scale, frame.y() + line.y() * scale,
-                          line.width() * scale, line.height() * scale)
-            metrics.append(metric(rect))
+            metrics.append(metric(to_scene(line, frame, scale)))
         if metrics:
             hits.append(metrics)
     return hits
