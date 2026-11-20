@@ -71,6 +71,7 @@ from ...pages import DocumentPages, PageContent, render_content
 from ...workers import EXPECTED_ERRORS, _Job, emit_from_worker
 from .generated import qml_class
 from . import pen as pen_bridge
+from . import toc as toc_bridge
 
 log = logging.getLogger("rm.ui.quick.scene")
 
@@ -1442,6 +1443,7 @@ class _SceneView:
         self._watch_document()
         self._load()
         pen_bridge.attach(self)
+        toc_bridge.attach(self)
 
     def _property_changed(self, name: str) -> None:
         if name in ("pageId", "document") and self.isComponentComplete():
@@ -1451,6 +1453,7 @@ class _SceneView:
             if name == "document":
                 self._watch_document()
                 pen_bridge.attach(self)
+                toc_bridge.attach(self)
         elif name == "textModeEnabled" and not self._get("textModeEnabled"):
             self.stop_text()
 

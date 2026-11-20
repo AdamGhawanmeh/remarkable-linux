@@ -2207,6 +2207,37 @@ layout engine), else on the previous entry's page. The cached library: 6 of 75 P
 EPUBs with a cached rendition have an outline (111 entries); no cached EPUB has its
 `.epub` blob (fetched on demand), and their renditions have no outline.
 
+**Contents panel (client-only, injected).** Since 3.29's QML has no panel, the client
+adds one beside the official DocumentView without changing a QML file, as it adds the
+pen toolbar (§2.1, `bridge/pen.py`) and Settings > Editing (§3.7): `bridge/toc.py`
+`attach(view)` runs from `SceneView.componentComplete` and on every `document` change,
+next to `pen.attach`; per `DocumentViewport` it makes a `_Toc` (child of the viewport's
+QObject, so it goes with it) holding a `TocModel` and a QML item built from a Python
+string (`qrc:/linux/TocSidebar.qml`, its own `QQmlContext` with `tocModel` and
+`viewport`, parented to the viewport's container, z 55; the pen toolbar is at z 50 on
+the left, so the panel sits on the right). `QuickApp` hands it the app's
+`LibraryController` (`toc.set_controller`). For a PDF or EPUB the model asks
+`loadTableOfContents(id)` once per document opened and again when the document's page
+list changes (`pageMapChanged`: inserted, moved or deleted pages move the entries), and
+listens to `tableOfContentsUpdated` / `tocRunningChanged` through `@Slot`s on the model
+(disconnected when another document is shown, and by Qt when the viewport goes). A
+notebook, or a document whose answer is empty, shows nothing. On screen: a 40 px button
+with the app's own `qrc:/ark/icons/list` icon at the container's top right (tooltip
+"Contents"), and when open a panel along the right edge (≤ 360 px, 45 % of the width):
+"Contents", then one row per entry, indented 20 px per level, its page number counted
+from 1 at the right; an entry the backend could not place (page −1) is grey and not
+clickable. A click on an entry turns the page as the app turns pages
+(`DocumentViewport.setCurrentPage(page)`); the panel stays open. The entry being read
+(the last one placed at or before `viewport.currentPage`, bound in QML) is marked,
+however the page was turned. Ctrl+Shift+T or the button opens and closes it; Escape
+closes it first (a `Shortcut` enabled only while it is open, so DocumentView's own
+Escape, which closes the document, waits for the next press). The panel takes the
+clicks and wheel turns over it. Tests: `tests/test_toc_sidebar_offline.py` (the model's
+current-entry rule; through the app's window: the button, a PDF outline with a page
+inserted before Chapter 2, an EPUB's navigation, jumps, the current entry following a
+page turned otherwise, Escape, Ctrl+Shift+T, no button for a notebook or a PDF without
+an outline, entries placed again after a page is added before Chapter 1).
+
 ### 5.8 Layers and SceneInfo visibility
 
 Traced in reMarkable.exe 3.29 [O] from `SceneController::qt_static_metacall`

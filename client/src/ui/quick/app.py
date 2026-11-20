@@ -47,6 +47,7 @@ from ..outgoing import EditSettings, OutgoingSync, install_settings_cell
 from ..workers import Account, InternetCheck, Mutator, Syncer
 from . import assets
 from .bridge import Singletons, register_types, use_singletons
+from .bridge import toc as toc_bridge
 from .bridge.exporter import DocumentExporter
 from .bridge.images import DragIconImageProvider, ThumbnailImageProvider
 from .bridge.importer import DocumentImporter
@@ -143,6 +144,7 @@ class QuickApp:
             handwriting=HandwritingLanguageModel(), recognizer=Recognizer())
         self.item_inspector = QObject()
         s = self.singletons
+        toc_bridge.set_controller(s.controller)     # the injected contents panel asks it
         self.engine: QQmlApplicationEngine | None = None
         self.translator: QTranslator | None = None
         self.thumbnails: ThumbnailImageProvider | None = None
