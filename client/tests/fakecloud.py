@@ -73,6 +73,7 @@ class FakeCloud:
         self.codes: set[str] | None = None   # one-time codes still valid (None: any code)
         self.device_tokens = {"device"}      # paired_auth's
         self.revoked = False                 # the account no longer accepts this device
+        self.offline = False                 # no network: every request fails to connect
 
     # -- content ------------------------------------------------------------
 
@@ -125,6 +126,8 @@ class FakeCloud:
     def __call__(self, method, url, headers, body, timeout) -> HttpResponse:
         host, path = url.split("://", 1)[1].split("/", 1)
         path = "/" + path
+        if self.offline:
+            raise ConnectionRefusedError(f"offline: {method} {path}")
         self.requests.append(path)
         self.hosts.append(host)
         self.calls.append((method, path, dict(headers)))

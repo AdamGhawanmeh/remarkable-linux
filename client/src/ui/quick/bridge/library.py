@@ -510,13 +510,20 @@ class EntryWrapper(QObject):
     def _status(self) -> int:
         if self._status_override is not None:
             return self._status_override
-        return int(EntryWrapper.Status.Exporting) if self._export_progress() is not None else _OK
+        if self._export_progress() is not None:
+            return int(EntryWrapper.Status.Exporting)
+        upload = self._library.upload_status(self._node.id)
+        return upload[0] if upload is not None else _OK
+
+    def _sync_progress(self) -> float:
+        upload = self._library.upload_status(self._node.id)
+        return upload[1] if upload is not None else 0.0
 
     id = Property(str, lambda self: self._node.id, constant=True)
     parentId = Property(str, lambda self: self._node.parent_id, notify=parentIdChanged)
     status = Property(int, _status, notify=statusChanged)
     statusAdditionalText = Property(str, lambda self: "", notify=statusAdditionalTextChanged)
-    syncProgress = Property(float, lambda self: 0.0, notify=syncProgressChanged)
+    syncProgress = Property(float, _sync_progress, notify=syncProgressChanged)
     exportProgress = Property(float, lambda self: self._export_progress() or 0.0, notify=exportProgressChanged)
     subtext = Property(str, lambda self: self._subtext(), notify=subtextChanged)
     progressText = Property(str, lambda self: self._progress_text(), notify=progressTextChanged)
@@ -543,7 +550,9 @@ class EntryWrapper(QObject):
 
     @Slot(int)
     def handleSyncError(self, handling: int) -> None:
-        pass
+        """EntryErrorIcon's click on a document whose edits did not upload: try again."""
+        if handling == EntryWrapper.ConflictHandling.Retry:
+            self._library.retry_upload(self._node.id)
 
     @Slot()
     def abortExport(self) -> None:
@@ -937,6 +946,29 @@ class Library(QObject):
         self.abort_export: Callable[[str], None] = lambda entry_id: None
         # Whether a document's PDF needs a password not given yet (the app sets it: ui.pdflock).
         self.pdf_locked: Callable[[DocumentNode], bool] = lambda node: False
+        # Documents with edits not in the cloud yet (ui.outgoing): id -> (Entry status,
+        # Uploading or SyncError; upload progress 0..1). Entry.handleSyncError(Retry) ->
+        # retry_upload (the app sets it).
+        self._uploads: dict[str, tuple[int, float]] = {}
+        self.retry_upload: Callable[[str], None] = lambda entry_id: None
+
+    def upload_status(self, entry_id: str) -> tuple[int, float] | None:
+        return self._uploads.get(entry_id)
+
+    def set_upload_statuses(self, statuses: dict[str, tuple[int, float]]) -> None:
+        """Show which documents have edits waiting to upload (Entry.Uploading, with the
+        upload's progress while it runs) or whose upload failed (Entry.SyncError, whose
+        icon retries when clicked), as the app's entries show their own sync."""
+        old, self._uploads = self._uploads, dict(statuses)
+        for entry_id in set(old) | set(statuses):
+            if old.get(entry_id) == statuses.get(entry_id):
+                continue
+            entry = self._entries.get(entry_id)
+            if entry is None:
+                continue
+            if (old.get(entry_id) or (0,))[0] != (statuses.get(entry_id) or (0,))[0]:
+                entry.statusChanged.emit()
+            entry.syncProgressChanged.emit()
 
     def reading_position(self, doc_id: str) -> dict[str, int]:
         return self._reading.get(doc_id, {})

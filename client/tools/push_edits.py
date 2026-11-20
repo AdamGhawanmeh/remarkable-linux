@@ -14,7 +14,9 @@
         Forget the pending edits of that document. Nothing was uploaded; the page shows
         again as the cloud has it.
 
-Edits are made with  client/run.py --edit-notebook NAME  (see README.md).
+Edits are made in the app (Settings > Editing, or  client/run.py --edit-notebook NAME; see
+README.md). The app uploads them itself too (Upload now, or automatically): both use
+core.outbox, the same upload, conflict handling and ledger clean-up.
 """
 
 from __future__ import annotations
@@ -25,8 +27,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from core.auth import AuthClient, AuthError  # noqa: E402
-from core.edits import EditError  # noqa: E402
+from core import outbox  # noqa: E402
+from core.auth import AuthClient  # noqa: E402
 from core.sync import SyncClient, SyncError  # noqa: E402
 
 
@@ -43,28 +45,8 @@ def offline(sync: SyncClient) -> SyncClient:
 
 
 def show(sync: SyncClient) -> int:
-    sync.load_cached()
-    documents = sync.edits.documents()
-    if not documents:
-        print("No pending edits.")
-        return 0
-    status = 0
-    for doc_id in documents:
-        node = sync.tree.get(doc_id)
-        print("=" * 78)
-        if node is None:
-            print(f"Document  {doc_id}\nNot in the cached library any more: its {len(sync.edits.of(doc_id))} pending "
-                  f"edits cannot be uploaded (--discard {doc_id} forgets them).")
-            status = 1
-            continue
-        print(f"Name      {node.name!r}")
-        try:
-            print(sync.push_plan(doc_id).describe())
-        except (SyncError, EditError) as err:
-            print(f"Document  {doc_id}\nCannot be uploaded as it is: {err}")
-            status = 1
-    print("=" * 78)
-    print("Nothing was sent. To upload one document's edits:  push_edits.py --confirm DOCUMENT_ID")
+    text, status = outbox.describe_pending(sync)
+    print(text)
     return status
 
 
@@ -77,23 +59,23 @@ def main(argv: list[str] | None = None, sync: SyncClient | None = None) -> int:
     sync = sync or SyncClient(AuthClient())
 
     if args.discard:
-        edits = sync.edits.of(args.discard)
-        sync.edits.discard(edits)
-        print(f"Forgot {len(edits)} pending edits of {args.discard}.")
+        count = outbox.discard(sync, args.discard)
+        print(f"Forgot {count} pending edits of {args.discard}.")
         return 0
     if not args.confirm:
         return show(offline(sync))
 
-    edits = sync.edits.of(args.confirm)
-    if not edits:
+    if not sync.edits.of(args.confirm):
         print(f"No pending edits of {args.confirm}.")
         return 1
     try:
-        sync.push_edits(args.confirm, lambda sent, total: print(f"  uploaded {sent} of {total} bytes"))
-    except (SyncError, AuthError, EditError, OSError) as err:
-        print(f"Not uploaded: {err}\nThe edits are still pending.")
+        result = outbox.push_document(sync, args.confirm,
+                                      lambda sent, total: print(f"  uploaded {sent} of {total} bytes"))
+    except outbox.PushFailed as err:
+        print(f"Not uploaded ({err.kind}): {err}\nThe edits are still pending.")
         return 1
-    print(f"Uploaded {len(edits)} edits of {args.confirm}; root generation {sync.root.generation}.")
+    kept = f"; {len(result.after)} edits made meanwhile still pending" if result.after else ""
+    print(f"Uploaded {len(result.uploaded)} edits of {args.confirm}; root generation {result.generation}{kept}.")
     return 0
 
 

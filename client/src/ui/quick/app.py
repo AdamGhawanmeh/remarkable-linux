@@ -43,6 +43,7 @@ from core.auth import AuthError, AuthNetworkError
 from core.models import DocumentTree
 
 from ..library import LibrarySource
+from ..outgoing import EditSettings, OutgoingSync, install_settings_cell
 from ..workers import Account, InternetCheck, Mutator, Syncer
 from . import assets
 from .bridge import Singletons, register_types, use_singletons
@@ -114,6 +115,11 @@ class QuickApp:
         self._check_waiting = False      # "Check sync" asked for a sync while one was running
         self._online = False             # Screen Share started for this log-in
         store = SettingsStore(config_dir / "settings.ini" if config_dir else None)
+        # Settings > Editing: editing on, automatic upload (both off until turned on), and
+        # the uploader of pending edits (ui.outgoing).
+        self.edit_settings = EditSettings(store)
+        self.outgoing = OutgoingSync(source, self.edit_settings,
+                                     notify=lambda message: self.library.errorMessage.emit(message))
         # ExportDialog -> PlatformHelpers.exportFile; results show as the app's notifications.
         self.exporter = DocumentExporter(source, self.library,
                                          notify=lambda message: self.singletons.platform_helpers.errorMessage.emit(message))
@@ -170,6 +176,19 @@ class QuickApp:
         s.screen_share.notificationsConnected.connect(
             lambda connected: sync.onConnectedNotification() if connected else None)
         s.link.availabilityChanged.connect(lambda _: self._update_suspended())
+        # Outgoing sync (ui.outgoing): edits made here go up after a pause (automatic
+        # upload) or on Upload now / Check sync; each document shows its state.
+        out = self.outgoing
+        out.can_upload = lambda: (self.logged_in and not self.source.cached_only and self._online
+                                  and not self.closing and not s.link.known_offline)
+        out.uploaded.connect(self.set_tree)
+        out.statuses.connect(self.library.set_upload_statuses)
+        out.unauthorized.connect(self._unauthorized)
+        out.editingChanged.connect(self._update_editing)
+        self.library.retry_upload = out.retry
+        self.library.openDocumentsChanged.connect(
+            lambda: out.documents_open(d.id for d in self.library.open_documents()))
+        s.link.availabilityChanged.connect(lambda _: out.network_available() if s.link.isOnline else None)
 
     def _save_reading_position(self, doc_id: str, page: int, opened_ms: int | None) -> None:
         """Library.save_reading_position: lastOpenedPage/lastOpened to the cloud, as the app
@@ -187,7 +206,7 @@ class QuickApp:
         if shown:
             on = all(self.source.can_edit(d) for d in shown)
         else:
-            on = bool(getattr(self.source, "editable", ()))
+            on = bool(self.source.editing_on)
         self.singletons.user_info.set_client_edit(on)
 
     @property
@@ -219,6 +238,7 @@ class QuickApp:
         self.account.logout(remote=not self.source.cached_only, after=self._forget_library)
 
     def _forget_library(self) -> None:          # on the Account worker thread
+        self.outgoing.wait()
         self.syncer.wait()
         self.mutator.wait()
         self.exporter.wait()
@@ -258,6 +278,7 @@ class QuickApp:
         self._update_suspended()
         if sync:
             self.syncer.refresh()
+        self.outgoing.network_available()
 
     def _go_offline(self) -> None:
         if self._online:
@@ -293,7 +314,10 @@ class QuickApp:
 
     def _sync_for_check(self) -> None:
         """The full sync "Check sync" asks for; while one runs, it follows that one, as
-        the app's requestFullSync queues behind the running sync."""
+        the app's requestFullSync queues behind the running sync. A full sync of the app
+        also sends what changed here: pending edits are uploaded too (Upload now), the
+        two one after the other (SyncClient._busy)."""
+        self.outgoing.uploadNow()
         if not self.syncer.refresh():
             self._check_waiting = True
 
@@ -348,6 +372,7 @@ class QuickApp:
         engine.load(self.main)
         if not engine.rootObjects():
             raise RuntimeError(f"{self.main.toString()} failed to load:\n" + "\n".join(self.warnings))
+        install_settings_cell(engine, self.window, self.outgoing)
         return engine
 
     def _translate(self, code: str) -> None:
@@ -377,6 +402,7 @@ class QuickApp:
         if self.logged_in:
             # Offline (cached_only) a "sync" would only reload the cache just shown.
             self._go_online(sync and not self.source.cached_only)
+        self.outgoing.start()
 
     def shutdown(self) -> None:
         self.closing = True
@@ -385,6 +411,7 @@ class QuickApp:
         self.singletons.screen_share.shutdown()
         self.account.wait(60000)
         self.mutator.wait(120000)
+        self.outgoing.shutdown(120000)      # an upload under way finishes; pending edits stay on disk
         self.exporter.wait(120000)          # an export the user started still gets written
         self.syncer.wait(5000)
         self.internet.wait(5000)

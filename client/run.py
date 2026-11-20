@@ -68,10 +68,20 @@ def make_app(args: argparse.Namespace, workdir: Path) -> tuple[QuickApp, bool]:
     auth = AuthClient()
     if args.offline and not auth.is_paired:
         print("Not logged in: showing the cached library only. Run without --offline to log in.")
-    source = LibrarySource(SyncClient(auth), cached_only=args.offline, editable=tuple(args.edit_notebook))
+    source = LibrarySource(SyncClient(auth), cached_only=args.offline, editable=edit_notebooks(args))
     liveview = None if args.offline else (lambda emit: LiveViewService(auth, emit))
     quick = QuickApp(source, cache_dir(), config_dir=config_dir(), liveview_factory=liveview)
     return quick, not args.offline
+
+
+def edit_notebooks(args: argparse.Namespace, environ=os.environ) -> tuple[str, ...]:
+    """The documents --edit-notebook (or REMARKABLE_EDIT_NOTEBOOK, when no option is
+    given) limits editing to. They override Settings > Editing: given, editing is on for
+    them only, whatever the setting says."""
+    if args.edit_notebook:
+        return tuple(args.edit_notebook)
+    name = environ.get("REMARKABLE_EDIT_NOTEBOOK", "").strip()
+    return (name,) if name else ()
 
 
 # Qt notices that are not binding errors (the shipped Qt prints them too; ARCHITECTURE.md §2.1).
@@ -171,9 +181,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mode.add_argument("--self-test", action="store_true",
                       help="start on the demo library, check the interface loads, and quit")
     parser.add_argument("--edit-notebook", action="append", default=[], metavar="NAME",
-                        help="experimental: turn editing on for the notebook, PDF or ebook with this name "
-                             "(the only one of that name). Edits stay on this computer until "
-                             "client/tools/push_edits.py uploads them")
+                        help="turn editing on for the notebook, PDF or ebook with this name only (the only "
+                             "one of that name), whatever Settings > Editing says; also "
+                             "REMARKABLE_EDIT_NOTEBOOK=NAME. Edits upload with Settings > Editing > "
+                             "Upload now, automatically when that is turned on, or with "
+                             "client/tools/push_edits.py")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 

@@ -29,7 +29,8 @@ from core.edits import (IMPORT_FILES, PAGE_EDITS, Change, Edit, EditError, Image
                         PageAdd, PageCopy, PageDelete, PageHistory, PageImport, PageMove, PageTemplate, SceneFlagChange,
                         SceneFlags,
                         Staged, StrokeAdd, StrokeChange, StrokeDelete, StrokeErase, StrokePart, StrokePaste,
-                        ToolSettings, current_content, document_files, import_path, page_files, page_images, swapped)
+                        ToolSettings, current_content, document_files, import_path, page_files, page_images, rebase_refs,
+                        swapped)
 from core.sync import SyncClient, SyncError, build_index, file_entry, sha256_hex
 from core.config import atomic_write_json, read_json
 from viewer import rm_layer, rm_select, rm_stroke, rm_writer
@@ -383,8 +384,13 @@ class LibrarySource:
     `cached_only` keeps every read local (offline mode). Parsed scenes are kept in a
     small LRU so flipping pages back and forth does not re-parse.
 
-    `editable` names the notebooks whose pages may be edited here (none by default):
-    editing is being built feature by feature, and is tried on notebooks named for it.
+    What may be edited here (nothing by default: the library is read-only until editing
+    is turned on):
+    - `editable` (run.py --edit-notebook NAME): only the notebooks, PDFs or ebooks with
+      these names (each the only document of its name). It wins over the setting: with
+      it, editing is limited to those whatever `edit_everything` says.
+    - otherwise `edit_everything` (Settings > Editing, ui.outgoing.EditSettings): every
+      notebook, PDF and ebook.
     A copy made here of a notebook that may be edited may be edited too, and so on down
     (inherit_editing): their ids are kept with the cache (EDITABLE_COPIES), so they stay
     so after a restart.
@@ -397,6 +403,7 @@ class LibrarySource:
         self.sync = sync
         self.cached_only = cached_only
         self.editable = tuple(editable)
+        self.edit_everything = False            # Settings > Editing (unless `editable` names documents)
         self._copies_file = Path(sync.root_dir) / EDITABLE_COPIES
         self._copies: set[str] = self._read_copies()
         self._scenes: OrderedDict[str, PageScene | None] = OrderedDict()
@@ -414,6 +421,20 @@ class LibrarySource:
         # cloud's copy has them, by document id: (hash of the copy they apply to,
         # content fields, metadata fields). Dropped once that copy is replaced.
         self._shown: dict[str, tuple[str, dict, dict]] = {}
+        # What uploaded edits made, by document: their uids -> the ids the cloud's pages
+        # give those items now (core.outbox.PushResult made/typed). Edits handed over
+        # after an upload but named before it (typing kept for a pause) are renamed so.
+        self._uploaded: dict[str, tuple[dict, dict]] = {}
+
+    @property
+    def editing_on(self) -> bool:
+        """Whether anything may be edited here at all (see the class's doc)."""
+        return bool(self.editable) or bool(self.edit_everything)
+
+    @property
+    def edit_limited(self) -> bool:
+        """Editing is limited to the documents run.py --edit-notebook names."""
+        return bool(self.editable)
 
     @property
     def writable(self) -> bool:
@@ -475,7 +496,7 @@ class LibrarySource:
         online, since the cloud is where the document is kept."""
         from core.create import MIN_FREE_BYTES
         import shutil
-        if not self.editable:
+        if not self.editing_on:
             return "Editing is not turned on"
         if not self.writable:
             return "Not possible offline"
@@ -649,19 +670,20 @@ class LibrarySource:
 
     def edit_refusal(self, doc: Document | None) -> str:
         """Why `doc` may not be edited here ("": it may): only a notebook, PDF or ebook,
-        not in the trash, whose name is one of `editable` and the only document of that
-        name, or a copy made here of one that may be edited (by its id), so an edit can
-        never land on a document it was not meant for. A PDF or ebook needs its page
+        not in the trash. With `editable` (--edit-notebook), only one whose name is one of
+        those and the only document of that name, or a copy made here of one that may be
+        edited (by its id), so an edit can never land on a document it was not meant for;
+        else any, once Settings > Editing is on (`edit_everything`). A PDF or ebook needs its page
         list (the tablet makes it the first time it opens one: until then this client
         shows pages it cannot name to the cloud, unlisted_page_id)."""
-        if not self.editable:
+        if not self.editing_on:
             return "Editing is not turned on"
         tree = self.sync.tree
         if not isinstance(doc, Document) or self.synced(doc.id) is None:
             return "This document is not in the library"
         if doc.id in self._created:                     # made here, not uploaded yet: a notebook
             return ""
-        if doc.id not in self._copies:
+        if self.editable and doc.id not in self._copies:
             if doc.name not in self.editable:
                 return f"Editing is only turned on for the document named {' or '.join(map(repr, self.editable))}"
             same = [n for n in tree.nodes.values() if isinstance(n, Document) and n.name == doc.name
@@ -1019,7 +1041,40 @@ class LibrarySource:
         history = self._histories.get((doc_id, page_id))
         if history is None or history.seen != seen:
             history = self._histories[(doc_id, page_id)] = PageHistory(seen)
+            history.rename = lambda changes, d=doc_id: self._rename_uploaded(d, changes)
         return history
+
+    # -- after an upload (core.outbox) ---------------------------------------------------
+
+    def _rename_uploaded(self, doc_id: str, obj):
+        """`obj` (edits, undo entries) with what it names by the uid of an edit uploaded
+        since it was made named as the cloud's page has it (core.edits.rebase_refs)."""
+        names = self._uploaded.get(doc_id)
+        return rebase_refs(obj, *names) if names else obj
+
+    def settle_upload(self, apply):
+        """core.outbox's Settler: the ledger is changed (`apply()`: uploaded edits gone,
+        the others renamed) while no edit is being made here, and the undo history of
+        the pages goes along: entries naming what the upload made are renamed, so an
+        upload (an automatic one every few seconds) does not take undo away as a sync
+        from another device does."""
+        with self._history_lock:
+            # The pending edits of each document with an undo history, as they were.
+            ledger = {d: self.sync.edits.of(d) for d in {d for d, _ in self._histories}}
+            result = apply()
+            doc_id = result.doc_id
+            made, typed = self._uploaded.setdefault(doc_id, ({}, {}))
+            made.update(result.made)
+            typed.update(result.typed)
+            pending = ledger.get(doc_id, [])
+            for (d, page_id), history in list(self._histories.items()):
+                if d != doc_id:
+                    continue
+                if history.seen[1] != tuple(e for e in pending if e.page_id == page_id):
+                    continue                    # not current: it is emptied when next used
+                history.rebase(result.rebase)
+                history.seen = self._seen(doc_id, page_id)
+        return result
 
     @contextmanager
     def edit_action(self, doc: Document, page_id: str, action: list[Change] | None = None):
@@ -1577,6 +1632,7 @@ class LibrarySource:
     def _add_edits(self, doc: Document, edits: list[tuple[Edit, bytes | None]]) -> None:
         """Work the document out with the edits (and the files of inserted images) before
         keeping them: edits the writer refuses leave nothing behind."""
+        edits = [(self._rename_uploaded(doc.id, e), data) for e, data in edits]
         new = {id(e): data for e, data in edits}
         kept = {sha: blob for e, data in edits if isinstance(e, PageImport) for sha, blob in (data or {}).items()}
         document_files(doc, self.sync.edits.of(doc.id) + [e for e, _ in edits], lambda name: self.blob(doc, name),

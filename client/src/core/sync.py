@@ -104,6 +104,11 @@ class NotCachedError(SyncError):
     """A blob was needed while working from the cache only, and is not cached."""
 
 
+class NetworkError(SyncError):
+    """No usable answer from the cloud after the retries: no network, the cloud down or
+    throttling. Nothing was changed by the request; trying again later is safe."""
+
+
 class ConflictError(SyncError):
     """The cloud kept changing under a commit (another device syncing meanwhile)."""
 
@@ -698,7 +703,7 @@ class SyncClient:
                     delay = min(max(delay, float(retry_after)), MAX_RETRY_DELAY)
                 continue
             raise SyncError(f"{method} {path} failed: HTTP {resp.status} {resp.text[:200]}")
-        raise SyncError(f"{method} {path} failed after {NETWORK_RETRIES + 1} attempts: {problem}")
+        raise NetworkError(f"{method} {path} failed after {NETWORK_RETRIES + 1} attempts: {problem}")
 
     def _get(self, path: str, headers: dict[str, str] | None = None) -> HttpResponse:
         return self._request("GET", path, headers=headers)
@@ -1373,37 +1378,15 @@ class SyncClient:
                         fields, index_hash, index_data, doc.hash, self.tree.is_trashed(doc_id), removed, strokes)
 
     def push_edits(self, doc_id: str, progress: Callable[[int, int], None] | None = None) -> DocumentTree:
-        """Upload the pending edits of a document: its changed files, its index, the
-        root (_commit). The edits are applied to the document as the cloud has it at
-        that moment, so what another device changed meanwhile is kept; once the cloud
-        has them they are no longer pending."""
-        edits = self.edits.of(doc_id)
-        if not edits:
-            return self.tree
-
-        def edit(tree: DocumentTree) -> list[ItemChange]:
-            node = tree.get(doc_id)
-            if not isinstance(node, Document) or tree.is_trashed(doc_id):
-                raise SyncError("the edited document is no longer in the library")
-            try:
-                files = self.staged_files(node, cached_only=False, edits=edits)
-            except EditError as err:
-                raise SyncError(str(err)) from err
-            if not files:
-                return []                               # the cloud has these edits already
-            entries = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
-            data: dict[str, bytes] = {}
-            for name, blob in files.items():
-                if blob is None:                        # no longer used: out of the document
-                    entries.pop(name, None)
-                    continue
-                entries[name] = entry = file_entry(name, blob)
-                data[entry.hash] = blob
-            return [ItemChange(node.id, entries, data)]
-
-        tree = self._commit(f"edits of {doc_id}", edit, progress)
-        self.edits.discard(edits)
-        return tree
+        """Upload the pending edits of a document (core.outbox.push_document, the path
+        the app's outgoing sync and tools/push_edits.py share): its changed files, its
+        index, the root (_commit). The edits are applied to the document as the cloud has
+        it at that moment, so what another device changed meanwhile is kept; once the
+        cloud has them they are no longer pending. outbox.PushFailed (a SyncError) when
+        they did not go through: they are all still pending then."""
+        from .outbox import push_document
+        push_document(self, doc_id, progress)
+        return self.tree
 
     # -- local vs remote state --------------------------------------------------
 

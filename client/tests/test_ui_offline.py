@@ -431,7 +431,7 @@ class WorkerTests(DemoCase):
         self.auth.transport = broken
         self.assertTrue(syncer.refresh())
         settle(syncer.pool)
-        self.assertIn("SyncError", results[-1])
+        self.assertIn("NetworkError", results[-1])                  # a SyncError: no answer after the retries
         self.assertFalse(syncer.running)
 
 

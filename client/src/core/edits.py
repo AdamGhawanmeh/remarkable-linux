@@ -74,7 +74,7 @@ import logging
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1082,8 +1082,18 @@ class PendingEdits:
         self._lock = threading.Lock()
         self._edits: list[Edit] = []
         self._seen: tuple | None = None               # (mtime_ns, size, inode) of the file read
+        # Called (from whichever thread made it) after every change made here: the app's
+        # outgoing sync (ui.outgoing) learns of new edits so.
+        self.listeners: list[Callable[[], None]] = []
         with self._lock:
             self._refresh()
+
+    def _notify(self) -> None:
+        for listener in list(self.listeners):
+            try:
+                listener()
+            except Exception:           # a listener never stops an edit from being kept
+                log.exception("pending edits listener")
 
     def _stamp(self) -> tuple | None:
         try:
@@ -1123,6 +1133,7 @@ class PendingEdits:
                     self._save()
                 finally:
                     fcntl.flock(lock, fcntl.LOCK_UN)
+        self._notify()
 
     def _file(self, sha256: str) -> Path:
         if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
@@ -1204,6 +1215,91 @@ class PendingEdits:
 
     def clear(self) -> None:
         self.discard(self.all())
+
+    def settle(self, uploaded: list[Edit], doc_id: str,
+               rewrite: Callable[[Edit], Edit] | None = None) -> tuple[list[Edit], list[Edit]]:
+        """Forget `uploaded` (the cloud has them now) and pass every other edit of
+        `doc_id` through `rewrite` (rebase_refs: edits made while they were uploaded name
+        the items those made by the edits' uids, which mean nothing once they are gone),
+        in one change of the file. (the document's other edits before, after)."""
+        gone = set(uploaded)
+        with self._changing():
+            before = [e for e in self._edits if e.doc_id == doc_id and e not in gone]
+            kept = []
+            for edit in self._edits:
+                if edit in gone:
+                    continue
+                kept.append(rewrite(edit) if rewrite is not None and edit.doc_id == doc_id else edit)
+            self._edits = kept
+            after = [e for e in kept if e.doc_id == doc_id]
+            for sha in _hashes(gone) - _hashes(self._edits):
+                self._file(sha).unlink(missing_ok=True)
+        return before, after
+
+
+# -- after an upload: edits made meanwhile name what the uploaded ones made --------------
+#
+# An edit names an item another pending edit made by that edit's uid: ("edit", uid) for
+# an image, stroke or layer, ("edit", uid, n) for the n-th character typed by a text edit.
+# Once that edit is uploaded and forgotten, the name means nothing; the item is now one
+# the page has, with the id the upload gave it. rebase_refs renames such references, in
+# edits and in the undo history (core.edits.Change and friends) alike.
+
+def uploaded_names(staged: "Staged") -> tuple[dict[str, tuple[int, int]], dict[str, list[tuple[int, int]]]]:
+    """(made, typed) of every page of `staged` (the document with the edits that were
+    uploaded, on the version they were uploaded onto): the id each uploaded edit's item
+    got, by uid, and the ids of each text edit's characters. A copied page keeps its
+    source page's ids (the file is copied byte for byte), so the names are the same."""
+    made: dict[str, tuple[int, int]] = {}
+    typed: dict[str, list[tuple[int, int]]] = {}
+    for page_id in staged.page_edits:
+        if page_id in staged.deleted:
+            continue
+        done = staged.replay(page_id)
+        made.update(done.made)
+        typed.update(done.typed)
+    return made, typed
+
+
+def rebase_refs(obj, made: dict, typed: dict):
+    """`obj` (an edit, an undo history entry, a tuple, list or dict of them) with each
+    reference to an item an uploaded edit made, ("edit", uid) or ("edit", uid, n), named
+    ("page", author, counter) as the page has it now. Anything else is left as it is,
+    and so is a reference whose item the upload did not leave on the page (it means
+    "gone" either way). Unchanged parts are returned as they were (the same object)."""
+    if not made and not typed:
+        return obj
+    if isinstance(obj, tuple):
+        if len(obj) in (2, 3) and obj[0] == "edit" and isinstance(obj[1], str):
+            if len(obj) == 2 and obj[1] in made:
+                return ("page", *made[obj[1]])
+            if (len(obj) == 3 and isinstance(obj[2], int) and obj[1] in typed
+                    and 0 <= obj[2] < len(typed[obj[1]])):
+                return ("page", *typed[obj[1]][obj[2]])
+            return obj
+        if obj and not isinstance(obj[0], (tuple, list, dict, str)) and not is_dataclass(obj[0]):
+            return obj                  # numbers (points, vertices, ids): no references in there
+        new = tuple(rebase_refs(x, made, typed) for x in obj)
+        return obj if all(a is b for a, b in zip(new, obj)) else new
+    if isinstance(obj, list):
+        new = [rebase_refs(x, made, typed) for x in obj]
+        return obj if all(a is b for a, b in zip(new, obj)) else new
+    if isinstance(obj, dict):
+        new = {rebase_refs(k, made, typed): rebase_refs(v, made, typed) for k, v in obj.items()}
+        same = len(new) == len(obj) and all(a is b for a, b in zip(new, obj)) and \
+            all(new[k] is v for k, v in zip(new, obj.values()))
+        return obj if same else new
+    if is_dataclass(obj) and not isinstance(obj, type):
+        changes = {}
+        for f in fields(obj):
+            if not f.init:
+                continue
+            value = getattr(obj, f.name)
+            moved = rebase_refs(value, made, typed)
+            if moved is not value:
+                changes[f.name] = moved
+        return replace(obj, **changes) if changes else obj
+    return obj
 
 
 def _hashes(edits) -> set[str]:
@@ -1905,11 +2001,20 @@ class PageHistory:
         self.undo: list[tuple] = []
         self.redo: list[tuple] = []
         self.aliases: dict = {}             # text items put back, old name -> new (swapped)
+        # Applied to what is pushed: names of items uploaded meanwhile become the page's
+        # own (LibrarySource sets it; rebase_refs).
+        self.rename: Callable[[tuple], tuple] = lambda changes: changes
 
     def push(self, changes: list | tuple) -> None:
         if changes:
-            self.undo.append(tuple(changes))
+            self.undo.append(tuple(self.rename(tuple(changes))))
             self.redo.clear()
+
+    def rebase(self, rename: Callable) -> None:
+        """Rename the references in both stacks (an upload of this page's edits)."""
+        self.undo = [rename(entry) for entry in self.undo]
+        self.redo = [rename(entry) for entry in self.redo]
+        self.aliases = rename(self.aliases)
 
 
 def _later(old: Any, new_ms: int) -> str:

@@ -617,10 +617,144 @@ scheduler were read in `objdump` disassembly.
   them (§3.5).
   - The page's undo history starts again, because the page changed under it
     (`PageHistory.seen`).
-  - Uploading stays manual: `tools/push_edits.py`, behind `--edit-notebook`.
+  - Uploading is §3.7: automatic or by hand from the app, or `tools/push_edits.py`.
 
 Tests: `client/tests/test_live_sync_offline.py` mocks the socket with
 `liveview_fakes.FakeNotifications` over the fake cloud.
+
+### 3.7 Outgoing sync: uploading the edits made here
+
+Traced in reMarkable.exe 3.29 [O unless marked] (`xofm/libs/syncinterface`):
+- **The trigger.** A changed document asks for an entry sync:
+  `DocumentSyncInterface::requestEntrySync` (0x140137620) logs "entry sync requested,
+  id={}; fullSync={}, entries={}" (string 0x141006580, referenced at 0x1401377f1),
+  records the entries, sets flag +0xb8 when a full sync is asked for, and calls the
+  scheduler of §3.6 (0x140136bb0, called at 0x14013785a). Local edits and remote
+  notifications therefore share one timer and one running sync: the app never uploads
+  and downloads at the same time.
+- **Interval.** 10 ms for an entry sync (100 ms for a full one), and the timer is not
+  restarted by later requests within it (§3.6). The app writes edits to files and syncs
+  a document as a whole, so it can go almost at once.
+- **Skipped.** `execute()` (0x140138530) drops the request while suspended ("Ignoring
+  sync, suspended") or offline ("Ignoring sync; we are not online"). A request made
+  while a sync runs is held ("Delay request while syncing", logged in 0x1401cafa0) [I: by the string only;
+  that function was not traced to the scheduler].
+- **Errors.** A document whose sync failed shows `Entry.SyncError` (QML
+  `EntryErrorIcon`, `cloud_x`); clicking the icon calls
+  `entry.handleSyncError(Entry.Retry)`. While a document uploads it is
+  `Entry.Uploading`, with `syncProgress` (`EntryStatusIcon`, `EntryProgress`), and the
+  icon shows a checkmark for 1 s when it turns `Ok` again.
+- The desktop app has no setting for any of this: it always syncs. No string in the
+  binary and no QML in its resources names an automatic-sync or sync-enabled switch
+  (searched for autosync, auto sync, syncEnabled, disableSync, pauseSync).
+
+**This client.** Uploads go through one module, `core/outbox.py`. It is used by the app
+(`ui/outgoing.py`) and by `tools/push_edits.py --confirm`, so the two cannot drift
+apart. `SyncClient.push_edits` delegates to it as well.
+1. **Locks.** `push_document` takes `<cache>/pending/.push.lock` (fcntl), so only one
+   upload runs at a time across processes. It then takes `SyncClient._busy`, the RLock
+   that every incoming `refresh` and every other commit (`Mutator`) also hold. An
+   incoming live sync therefore waits for an upload under way and then sees its
+   result, and the reverse holds too. This plays the part of the app's single
+   scheduler.
+2. **Commit.** `SyncClient._commit` as before (§3.3): refresh, apply the snapshot of
+   the document's pending edits to the cloud's current version, upload the blobs and
+   indexes, then PUT the root with its generation. On 409 or 412 (another device
+   synced) it refreshes and re-applies the same edits, up to `COMMIT_ATTEMPTS`. A remote
+   edit that lands mid-upload is therefore merged, not overwritten.
+3. **Settle.** In one locked change of `edits.json` (`PendingEdits.settle`):
+   - The uploaded snapshot is forgotten.
+   - Every other edit of the document is **rebased** (`core.edits.rebase_refs`).
+     Edits made while the upload ran (the commit can take seconds) may name an item
+     that an uploaded edit made, by that edit's uid: `("edit", uid)` for an image,
+     stroke or layer, `("edit", uid, n)` for a typed character. Once the uploaded edit
+     is gone, that name means nothing, and the later edit would silently do nothing (a
+     delete of a just-uploaded stroke, typing after just-uploaded text).
+     `uploaded_names` replays the uploaded snapshot over the version it was committed
+     onto (`Staged` over the commit's base node). That gives the id each uid's item
+     received in the uploaded file (`Replay.made` / `typed`), and the references are
+     rewritten to `("page", author, counter)`.
+   - A copied page keeps its source's ids, so one map serves the whole document.
+4. **Failures.** Every pending edit is kept on any failure; nothing is discarded
+   before the root PUT is accepted. `PushFailed.kind` is one of:
+   - `offline`: `NetworkError`, raised by `_request` after its retries; an
+     `AuthNetworkError`; or an `OSError`.
+   - `conflict`: the cloud kept changing for every attempt.
+   - `auth`: device revoked, or not paired.
+   - `rejected`: the document is gone or in the trash, a page was removed, or similar.
+
+**The app's uploader** (`ui/outgoing.py` `OutgoingSync`, wired in `QuickApp`):
+- **Trigger.** It listens to `PendingEdits.listeners`, which fire after every change of
+  the ledger from any thread, and are marshalled to the GUI thread by a queued signal.
+- **Pause.** With automatic upload on, each change restarts a single-shot pause
+  (`DEBOUNCE_MS`, 3000 ms), and the pause's end uploads every document with edits on
+  the worker (`outbox.push_all`, one commit per document). This differs from the app's
+  10 ms on purpose: here every upload is a whole root commit, so a page of strokes
+  should go up as one commit, not one per stroke.
+- **At once, with no pause:**
+  - leaving a document (`Library.openDocumentsChanged`) while uploads are automatic;
+  - **Upload now** (Settings > Editing), whether or not uploads are automatic;
+  - Check sync, which uploads before its full sync, as the app's full sync sends
+    local changes too;
+  - the entry's `cloud_x` icon (`handleSyncError(Retry)`).
+  A flush while an upload runs leaves one follow-up for when it ends.
+- **Retries.** On `offline` or `conflict` the uploader retries on a backoff timer: 5 s,
+  15 s, 30 s, 1 min, 2 min, then 5 min. Automatic or asked-for uploads keep at it until
+  they go through. It also retries at once when the network comes back
+  (`LinkProvider.availabilityChanged`) or on log-in.
+- **No upload attempted** while logged out, `--offline`, or while the link is known to
+  be down: edits wait (state `waiting`).
+- **Refused documents.** On `rejected` the document shows `SyncError` and is not
+  retried until its edits change or the user asks; the app's error notification says
+  why. Documents made here and not yet in the cloud (`LibrarySource.created`) are
+  skipped until their own creation commit lands.
+- **Library entries.** A document with edits waiting is `Entry.Uploading`, with the
+  upload's progress while it runs; a failed one is `Entry.SyncError`.
+  `Library.set_upload_statuses` feeds `EntryWrapper.status` / `syncProgress`.
+- **Undo across uploads.** The uploader is `LibrarySource.settle_upload`, which runs
+  the ledger change under the undo-history lock. The page histories that were current
+  are renamed with the same map, and their `seen` moves to the uploaded state, so an
+  automatic upload does not empty undo. A sync from another device still empties it,
+  as in the app.
+- **Late edits.** The renaming map is kept by `LibrarySource._uploaded`. Edits named
+  before an upload but handed over after it are renamed through it in `_add_edits` and
+  `PageHistory.push`. Examples: the text session hands its typing over after a 1 s
+  pause, and a selection names its items when it is made.
+- **Shutdown.** `shutdown()` stops the timers and lets an upload under way finish.
+  Pending edits stay on disk, and the next start uploads them.
+
+**Settings** (`EditSettings`, kept in `settings.ini` as `LinuxClient/editingEnabled` and
+`LinuxClient/autoSyncEdits`, both false by default):
+- **Editing off** keeps every document read-only (`LibrarySource.edit_refusal` "Editing
+  is not turned on"; `UserInfo.featureToggles.clientEdit` false). On sets
+  `LibrarySource.edit_everything`: every notebook, PDF and ebook not in the trash.
+- **`--edit-notebook NAME`** (or `REMARKABLE_EDIT_NOTEBOOK`, read by `run.py` when no
+  option is given) takes precedence. Editing is then on for those names only (the
+  unique-name rule of §5.6 still applies), whatever the setting says.
+- **The two switches are independent.** Uploading pending edits does not need editing
+  to be on.
+- **UI.** The switches live in **Settings > Editing**, an `ArkControls.Cell` that
+  `install_settings_cell` creates at run time from a QML snippet and inserts into
+  main.qml's `settingsDialog.model` (GeneralSettings' `ObjectModel`), after the Cloud
+  cell. The shipped QML stays unmodified.
+  - It is resolved in QML through the window, because PySide has no converter for the
+    `GeneralSettings_QMLTYPE` property.
+  - It holds an `ArkControls.Toggle` for each switch, and a status row ("N edits in M
+    documents to upload", "Uploading...", "Not uploaded: ...") that is the **Upload
+    now** button.
+  - With `--edit-notebook` the Editing row reads "Only “NAME” (--edit-notebook)" and its
+    toggle is hidden.
+
+Tests: `client/tests/test_outgoing_sync_offline.py`, all over the fake cloud
+(`FakeCloud.offline`, `before_commit`, `fail_next`). They cover:
+- the shared path, the failure kinds, and conflict merge;
+- edits made mid-upload, and late text;
+- undo after an upload;
+- incoming sync waiting for an upload, and the cross-process lock;
+- the settings' defaults, precedence and persistence;
+- pause coalescing, flushes, offline backoff and back-online;
+- incoming and outgoing together with no edit lost;
+- the QML cell and the entry states.
 
 ## 4. LiveView / Screen Share
 
@@ -1661,9 +1795,9 @@ PDF / EPUB-backed):
 
 **Editing PDF and EPUB pages (client).** The same editing as on notebook pages (pens,
 straight lines, eraser, rectangle and lasso selection, move/scale/turn, clipboard,
-images, undo/redo; typed text not yet), gated like notebooks by `--edit-notebook NAME`
-(`LibrarySource.edit_refusal`: one non-trashed notebook, PDF or EPUB of that name; a
-PDF/EPUB needs its page list). Input goes through the same view ↔ scene transform as on
+images, undo/redo; typed text not yet), gated like notebooks: Settings > Editing, or
+`--edit-notebook NAME` (`LibrarySource.edit_refusal`: then one non-trashed notebook,
+PDF or EPUB of that name; §3.7), and a PDF/EPUB needs its page list. Input goes through the same view ↔ scene transform as on
 notebook pages; the scene bounds are the PDF page's frame united with the ink
 (`ui/pages.py`), which `DocumentViewport` uses as `sceneBounds` for non-note pages (paste
 clamping, scrolling), so nothing is clipped to 1404 × 1872.

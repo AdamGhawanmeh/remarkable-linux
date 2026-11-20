@@ -144,7 +144,7 @@ build/venv/bin/python client/run.py --demo
 QT_QPA_PLATFORM=offscreen build/venv/bin/python -m unittest discover -s client/tests
 ```
 
-The 896 offline tests use a fake cloud and synthetic documents; they need no account
+The 928 offline tests use a fake cloud and synthetic documents; they need no account
 or network. `install.sh` runs them before building the standalone app.
 `client/tools/rm_roundtrip.py` checks the page writer against your own cached pages:
 every page must come back byte for byte, and take an image, a move and a delete without
@@ -168,6 +168,7 @@ when you use them.
 | Log in | The app's log-in wizard with a one-time code from my.remarkable.com; **Log out** removes this computer from your account |
 | Cloud sync | Your library from reMarkable's cloud (sync v3/v4); documents download on demand |
 | Live sync | Changes from your tablet or phone appear on their own, as in the official app: the cloud's notifications socket announces each sync of another device ("SyncComplete"), and the client syncs shortly after (a burst of announcements makes one sync; one that arrives during a sync makes one more after it; a reconnection of the socket syncs what it may have missed). Its own announcements are ignored. Nothing syncs on its own while logged out, offline (`--offline`) or while the network is down; it catches up once the network is back. Where you are stays as it is: the library keeps its folder and selection, and an open page that changed is redrawn in place (while you select or type on it, once you finish). Edits not uploaded yet are kept and drawn over the new version of the page, never dropped |
+| Outgoing sync | With editing turned on (Settings > Editing), your edits upload in the background: after a short pause when **Upload edits automatically** is on, otherwise with **Upload now** or **Check sync**. The library shows which documents have edits waiting (cloud-upload icon) or failed to upload (cloud-x: click to retry). Offline they stay on disk and go once you are back online |
 | Sync status | Settings > Cloud > **Check sync** runs the official app's checks (network, log-in, internet, then a full sync) with its messages; sync progress ("Syncing (3 of 10)"), "No cloud connection" while the network is down, and "Unable to sync" when a sync fails |
 | Offline cache | The cached library opens at once, also without a network; `--offline` never connects or writes |
 | Library | My files and folders, Notebooks, PDFs, Ebooks, Favorites, Trash, sort orders, grid and list views, thumbnails |
@@ -197,25 +198,41 @@ when you use them.
 ### Editing (experimental)
 
 Editing is being built feature by feature, each one the way the official app does it
-(verified against `reMarkable.exe` and real pages), and is off unless asked for:
+(verified against `reMarkable.exe` and real pages), and is **off** until you turn it on.
+**Settings > Editing** (in the app's General settings, under Cloud) has two switches,
+both off by default and kept in `~/.config/remarkable-linux/settings.ini`:
+
+- **Edit notebooks, PDFs and ebooks** turns the app's own editing interface on for your
+  library (not for documents in the trash).
+- **Upload edits automatically** uploads your edits in the background a few seconds
+  after you stop editing, and at once when you leave the document. Off, edits wait
+  until you click **Upload now** (in the same place) or **Check sync**.
 
 ```sh
-client/.venv/bin/python client/run.py --edit-notebook NAME
+client/.venv/bin/python client/run.py --edit-notebook NAME     # or REMARKABLE_EDIT_NOTEBOOK=NAME
 ```
 
-turns the app's own editing interface on for the one notebook, PDF or ebook with that
-name (not in the trash, and no other notebook, PDF or ebook may share the name). Edits
-are kept on this computer and drawn over the page until you upload them yourself (see
-Upload below). When another device changes a page you have edits on, live sync redraws
-it with the other device's changes and your edits over them; the edits stay pending
-(and that page's undo history starts again, as when it changes on another device).
+limits editing to the one notebook, PDF or ebook with that name (not in the trash, and
+no other notebook, PDF or ebook may share the name), whatever the setting says; the
+Editing switch then shows "Only “NAME”".
+
+Edits are kept on this computer (`~/.cache/remarkable-linux/pending/`) and drawn over
+the page until they are uploaded. A document with edits waiting shows the cloud-upload
+icon in the library, with a progress bar while it uploads; a failed upload shows the
+cloud-x icon, and clicking it tries again. Offline, edits wait and go once the network
+is back (retrying every 5 s, then less often, up to every 5 minutes). Uploads and live
+sync take turns, never both at once. When another device changes a page you have edits
+on, live sync redraws it with the other device's changes and your edits over them, and
+the upload applies your edits to that newer version. You can keep drawing or typing
+while an upload runs: those edits go with the next one, and undo still works after
+your own uploads.
 
 | Feature | Status |
 |---|---|
 | Images: insert | **Working.** Drop a PNG or JPEG file on a page. It is stored as the official app stores one (turned as its EXIF says, scaled to at most 3200 px, PNG with transparency or else JPEG, at most 3 MiB), placed one unit a pixel at the drop point, and selected. The page's existing content is kept byte for byte. |
 | Images: select, move, resize, turn, delete | **Working.** Click an image (also one placed on the tablet) for the app's selection box: drag it to move, a corner to resize, the round handle to turn (saved when the selection closes, as one edit); Delete, Backspace or the bin deletes. Saved as the tablet saves it (a moved image replaces its old item and records a `moveId`; a deleted one leaves a deleted item and its file leaves the document). Verified on a reMarkable: moved, resized and turned images sync and show there. |
 | Images: copy, cut, paste | **Working.** Ctrl+C, Ctrl+X, Ctrl+V or the selection menu. A pasted image is a new copy (its picture stored again under a new file name and key) placed at the mouse. A picture copied in another program (an image, an image file, a picture from a web page) pastes onto the page. As in the official app, copying here puts nothing on the system clipboard. |
-| Upload | **Working, by hand.** `client/tools/push_edits.py` prints exactly what would be sent (document and page ids, the `.content`/`.metadata` fields that change, every file), without connecting; `--confirm DOCUMENT_ID` uploads, re-applying the edits to the cloud's latest version if another device synced meanwhile; `--discard DOCUMENT_ID` forgets them. |
+| Upload | **Working.** In the app: automatic (Settings > Editing > Upload edits automatically), **Upload now**, or **Check sync**, in the background; offline or when another device keeps syncing it retries with backoff, and nothing pending is dropped. From a terminal, `client/tools/push_edits.py` prints exactly what would be sent (document and page ids, the `.content`/`.metadata` fields that change, every file), without connecting; `--confirm DOCUMENT_ID` uploads; `--discard DOCUMENT_ID` forgets them. Both upload through the same code (`core/outbox.py`), one at a time. |
 | Drawing (pens, highlighter) | **Working, not yet tried on a tablet.** A pen toolbar at the left of the page (in the notebook that may be edited): Fineliner, Ballpoint, Marker, Pencil, Mechanical pencil, Paintbrush, Highlighter, Calligraphy pen, Shader; Thin, Medium, Thick; Black, Grey, White, Blue, Red, Green, Yellow, Pink, Cyan (the highlighter has its own colours). Click a tool, then draw with the mouse or a stylus (pressure and tilt are used); click it again or press Escape to put it down. Each stroke's points are made as the app's pen code makes them and stored byte for byte as the tablet stores them. The tool, size and colour are kept with the notebook, as the tablet keeps them. On a page with typed text, strokes are drawn beside the text, not attached to it: on the tablet they will not move when the text reflows (the tablet attaches its own strokes to the text), and the eraser does not reach the tablet's strokes on such pages yet. Straight lines: hold the pen still for half a second at the end of a stroke and it becomes a straight line from where it started; keep dragging to place its end (nearly level or upright lines snap level or upright), then lift. Shapes (rectangles, circles, ...): not yet. |
 | Eraser | **Working, not yet tried on a tablet.** The eraser tool (or Alt, or a stylus's eraser end) deletes what it crosses and leaves the pieces the app leaves, handwriting the tablet anchored to typed text included (the pieces stay in their group, where the page draws them; the tablet's re-anchoring after an erase is not done). The tablet's other two eraser modes are in the pen toolbar too: **Erase selection** (draw round an area: what lies inside goes, what crosses its edge is cut there) and **Erase all** (a button: every stroke of the active layer goes at once, images stay). Each is one undo step, active layer only. An undone erase puts the strokes back exactly where they were in the stacking order. |
 | Hide template | **Working.** View > Hide template (or the Layers panel's Template/Background row) draws the page without its template, or without the PDF page, until shown again. On edit-enabled pages it persists to the page's `SceneInfo` (field 2, undoable); on read-only pages it toggles live without writing. |
