@@ -1210,6 +1210,64 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
     return Erased(w.join(header, blocks), tuple(item.item for item, _, _ in hit), tuple(made))
 
 
+@dataclass(frozen=True)
+class Cleared:
+    """A layer cleared (ClearPage): the page after it, and what it deleted as
+    (node, item id, line value bytes), in the order the app deletes them: the layer's
+    own items, then each group below it, each node's in its sequence order."""
+
+    page: bytes
+    deleted: tuple[tuple[tuple[int, int], tuple[int, int], bytes], ...]
+
+    def undo_order(self) -> tuple[tuple[tuple[int, int], bytes], ...]:
+        """(item, value) as the app's undo puts them back, each taking the next id: the
+        macro's node actions last first (0x1408f52b0), each node's items in order."""
+        nodes: list[tuple[int, int]] = []
+        for node, _, _ in self.deleted:
+            if node not in nodes:
+                nodes.append(node)
+        return tuple((item, value) for node in reversed(nodes)
+                     for n, item, value in self.deleted if n == node)
+
+
+def clear_layer(page: bytes, *, layer: tuple[int, int] | None = None) -> Cleared:
+    """`page` with the strokes of `layer` (default: the current layer) deleted, as the
+    app's ClearPage does it (SceneController::clearLinesInLayer 0x140439c50 -> 0x140995ad0
+    -> scene::eraser::createEraseItemsActions 0x1409931c0): the layer and every group
+    node below it at any depth (group_nodes), each node's live items that are neither
+    images nor groups (the filter 0x140433d20: value type 7 or 2 stays) deleted as
+    delete_strokes deletes them, one SceneDeleteItemsActionCrdt per node in one
+    SceneMacroAction. Nothing is cut and no id is taken. Every item a real page has of
+    that kind is a line; glyph ranges (none in any cached page) and strokes stored with
+    version 1 points (which this client cannot put back) are left. The app also detaches
+    a group node that is left empty (SceneDeleteGroupActionCrdt, a SceneTreeMove to 0:0)
+    and drops its anchor; the client leaves such a group in place, empty, as its eraser
+    does. Untouched when the layer holds no stroke."""
+    header, blocks = w.split(page)
+    layer = _layer(blocks, layer)
+    nodes = [layer] + [node for node, _ in group_nodes(blocks, layer)]
+    found: list[tuple[tuple[int, int], tuple[int, int], bytes]] = []
+    for node in nodes:
+        seen: set[int] = set()
+        for item_id, block in w.sequence(blocks, node):
+            if block.type != w.BLOCK_LINE_ITEM or id(block) in seen or block.version < 2:
+                continue
+            seen.add(id(block))
+            item = w.decode_item(block.payload)
+            if item.value is not None and not item.deleted_length:
+                found.append((node, item.item, item.value))
+    if not found:
+        return Cleared(page, ())
+    chains: dict[tuple[int, int], _Chain] = {}
+    for node, item, _ in found:
+        if node not in chains:
+            chains[node] = _Chain(blocks, node)
+        chains[node].delete(item)
+    for chain in chains.values():
+        blocks = chain.write(blocks)
+    return Cleared(w.join(header, blocks), tuple(found))
+
+
 def restore_stroke(page: bytes, *, author: bytes, item: tuple[int, int], line: LineValue,
                    move_id: tuple[int, int] | None = None) -> tuple[bytes, tuple[int, int]]:
     """(`page` with a deleted stroke put back, its new id), as the app's undo and redo
@@ -1249,11 +1307,11 @@ def eraser_line(samples: Iterable[tuple], thickness: float = MEDIUM, tool: int =
     return pen.line()
 
 
-__all__ = ["BALLPOINT_V2", "CALLIGRAPHY", "COLOR_ARGB", "DEFAULT_TIMESTAMP", "ERASER", "ERASE_SECTION", "Erased",
+__all__ = ["BALLPOINT_V2", "CALLIGRAPHY", "CLEAR_PAGE", "COLOR_ARGB", "Cleared", "DEFAULT_TIMESTAMP", "ERASER", "ERASE_SECTION", "Erased",
            "FINELINER_V2", "HIGHLIGHTER_V2", "LineValue", "anchored_nodes", "group_nodes", "MARKER_V2", "MEDIUM", "MOUSE_PRESSURE", "NOT_DRAWN",
            "Outline", "PAINTBRUSH_V2", "PENCIL_V2", "PENS", "Point", "SHADING_MARKER", "SHARP_PENCIL_V2",
            "StrokeBuilder", "StrokeError", "StrokeItem", "THICK", "THIN", "append_stroke", "append_strokes", "can_join",
-           "decode_line_value", "delete_strokes", "draw", "erase", "erase_line", "eraser_line", "eraser_outline",
+           "clear_layer", "decode_line_value", "delete_strokes", "draw", "erase", "erase_line", "eraser_line", "eraser_outline",
            "find_strokes", "has_text", "restore_stroke",
            "line_bounds", "make_point", "new_line", "pack_points", "rotation_of", "simplify", "simplify_points",
            "straighten", "strokes",

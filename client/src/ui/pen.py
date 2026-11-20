@@ -9,7 +9,7 @@ A document keeps the settings in its .content "extraMetadata" (DocumentToolSetti
 
     LastTool          the tool in hand: "Ballpointv2", ..., "Eraser"
     LastPen           the last pen (not the eraser)
-    LastEraserTool    "Eraser" (or "EraseSection")
+    LastEraserTool    "Eraser" or "EraseSection" (Erase selection)
     Last<Tool>Size    "1" | "2" | "3"
     Last<Tool>Color   "Black", "Gray", ..., "HighlighterYellow", or "ArgbCode" with
     Last<Tool>ColorCode  the ARGB colour, decimal
@@ -40,6 +40,16 @@ class PenTool:
         return self.tool in (s.ERASER, s.ERASE_SECTION)
 
     @property
+    def is_area(self) -> bool:
+        """An eraser whose line is the outline of the area it takes (EraseSection)."""
+        return self.tool == s.ERASE_SECTION
+
+    @property
+    def sizes(self) -> bool:
+        """Whether the tool comes in sizes (all but the area eraser)."""
+        return not self.is_area
+
+    @property
     def colors(self) -> tuple["PenColor", ...]:
         """The colours the tool offers (none for the eraser; the highlighter's own)."""
         if self.is_eraser:
@@ -62,7 +72,14 @@ TOOLS: tuple[PenTool, ...] = (
     # reMarkable.exe: it offers the pen colours, grey first, which is this client's choice.
     PenTool("shader", "Shader", s.SHADING_MARKER, "ShadingMarker", "shader", 2, "grey"),
     PenTool("eraser", "Eraser", s.ERASER, "Eraser", "eraser"),
+    # The tablet's other two eraser modes (its icons erase_selection and erase_all are in
+    # the app's qrc:/ark/icons). Erase selection (Line::Tool EraseSection) erases what a
+    # drawn area covers: the line is the area's outline (rm_stroke.eraser_outline), with
+    # no size or colour. Erase all (ClearPage) is no tool in hand but an action:
+    # clearLinesInLayer on the current layer (CLEAR_ALL below).
+    PenTool("erase_section", "Erase selection", s.ERASE_SECTION, "EraseSection", "erase_selection"),
 )
+CLEAR_ALL = ("erase_all", "Erase all", "erase_all")       # key, label, icon of the ClearPage action
 BY_KEY = {t.key: t for t in TOOLS}
 BY_NAME = {t.name: t for t in TOOLS}
 DEFAULT_TOOL = BY_KEY["ballpoint"]          # LastPen of 75 of the 92 cached documents

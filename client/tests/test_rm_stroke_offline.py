@@ -127,7 +127,10 @@ class LineValueTests(unittest.TestCase):
     def test_the_parser_keeps_what_it_used_to_drop(self):
         value = s.LineValue(17, 0, 2.0, 12.5, DOT, (1, 40), (1, 16), None, (1, 9), b"\xaf\x01\x02")
         block = w.new_block(w.BLOCK_LINE_ITEM, w.ItemHeader(LAYER, (1, 20), (1, 16), (1, 17), 0, value.encode()).encode())
-        [found] = parse(page(gone((1, 15), length=2), stroke((1, 17), (1, 16)), block.encode())).strokes[-1:]
+        # A put-back item (left 1:16, right 1:17) stands between them in the stacking order.
+        scene = parse(page(gone((1, 15), length=2), stroke((1, 17), (1, 16)), block.encode()))
+        self.assertEqual([x.item_id for x in scene.strokes], [(1, 20), (1, 17)])
+        found = scene.strokes[0]
         self.assertEqual((found.item_id, found.left, found.right, found.timestamp, found.move_id, found.source_id,
                           found.tail, found.starting_length),
                          ((1, 20), (1, 16), (1, 17), (1, 40), (1, 16), (1, 9), b"\xaf\x01\x02", 12.5))

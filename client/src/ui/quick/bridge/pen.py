@@ -104,6 +104,7 @@ class PenTools(QObject):
     availableChanged = Signal()
     lassoChanged = Signal()
     lassoSelected = Signal()        # a lasso took something: the toolbar turns selection mode on
+    clearRequested = Signal()       # Erase all: the page's current layer is cleared (ClearPage)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -177,6 +178,9 @@ class PenTools(QObject):
     size = Property(int, lambda self: self.pen().size, notify=changed)
     color = Property(str, lambda self: (self.pen().color.key if self.pen().color is not None else ""), notify=changed)
     isEraser = Property(bool, lambda self: self._tool.is_eraser, notify=changed)
+    hasOptions = Property(bool, lambda self: self._tool.sizes, notify=changed)
+    clearAll = Property("QVariantMap", lambda self: dict(zip(("key", "label", "icon"), pens.CLEAR_ALL)),
+                        constant=True)
     tools = Property("QVariantList", lambda self: [{"key": t.key, "label": t.label, "icon": t.icon}
                                                     for t in pens.TOOLS], constant=True)
     sizes = Property("QVariantList", lambda self: [{"size": n, "label": pens.SIZE_LABELS[n],
@@ -229,6 +233,14 @@ class PenTools(QObject):
         self._set_active(True)
 
     @Slot()
+    def eraseAll(self) -> None:
+        """The Erase all button (the tablet's ClearPage): the strokes of the page's current
+        layer are deleted at once, one undo step (SceneController::clearLinesInLayer).
+        The tool in hand stays as it is."""
+        if self._available:
+            self.clearRequested.emit()
+
+    @Slot()
     def deactivate(self) -> None:
         self._set_active(False)
         self._set_lasso(False)
@@ -243,6 +255,9 @@ class _Drawing:
     def __init__(self, pen: pens.Pen, eraser: bool, scale: float, stylus: bool, lasso: bool = False, *,
                  right_handed: bool = True, rotation: float = 0.0) -> None:
         self.pen, self.eraser, self.scale, self.stylus, self.lasso = pen, eraser, scale, stylus, lasso
+        # Erase selection in hand (not the stylus's eraser end over another tool): the
+        # samples outline the area to erase.
+        self.area = bool(eraser and pen.tool.is_area)
         self.size = pen.size
         self.samples: list[tuple] = []
         self.end: tuple[float, float] | None = None     # held: the straight line's end (scene)
@@ -270,6 +285,12 @@ class _Drawing:
         return s.straighten(self.builder.line(), self.end, self.scale)
 
     def line(self):
+        if self.area:
+            # An EraseSection line: its points are the outline (closed back to the first),
+            # as the tablet's eraseWithLine takes it; under three points it covers nothing.
+            if len({(x, y) for x, y, *_ in self.samples}) < 3:
+                return None
+            return s.eraser_line(self.samples, s.MEDIUM, tool=s.ERASE_SECTION, scale=self.scale)
         if self.eraser:
             return s.eraser_line(self.samples, self.size, scale=self.scale)
         straight = self.straight()
@@ -309,6 +330,7 @@ class PenSurface(QQuickPaintedItem):
         viewport.heightChanged.connect(self._fit)
         pen_tools.activeChanged.connect(self._mode)
         pen_tools.availableChanged.connect(self._mode)
+        pen_tools.clearRequested.connect(self._erase_all)
         self._fit()
         self._mode()
 
@@ -357,6 +379,18 @@ class PenSurface(QQuickPaintedItem):
 
     def _view_ok(self) -> bool:
         return self.view is not None and shiboken6.isValid(self.view)
+
+    def _erase_all(self) -> None:
+        """Erase all: clear the current layer of the page shown (ClearPage)."""
+        if self._drawing is not None:
+            self._end(commit=True)
+        if not self._view_ok():
+            return
+        refusal = self.view.pen_refusal()
+        if refusal:
+            _notify(refusal)
+            return
+        self.view.clear_current_layer()
 
     # -- samples --
     def _scene(self, pos: QPointF) -> QPointF:
@@ -451,7 +485,9 @@ class PenSurface(QQuickPaintedItem):
             self.update()
             return
         self._seq += 1
-        if drawing.eraser:
+        if drawing.area:
+            self._previews.append((self._seq, ("area", drawing.samples)))
+        elif drawing.eraser:
             self._previews.append((self._seq, ("eraser", drawing.samples, line.unpacked()[0].width / 4)))
         else:
             self._previews.append((self._seq, preview_scene(line.tool, line.color, line.thickness_scale, line.argb,
@@ -550,6 +586,8 @@ class PenSurface(QQuickPaintedItem):
         if d is not None:
             if d.lasso:
                 self._paint_lasso(painter, d.samples)
+            elif d.area:
+                self._paint_area(painter, d.samples)
             elif d.eraser:
                 width = max(10.0 * d.size, 2.0)
                 self._paint_one(painter, ("eraser", d.samples, width))
@@ -578,13 +616,34 @@ class PenSurface(QQuickPaintedItem):
         painter.restore()
 
     @staticmethod
-    def _paint_one(painter: QPainter, preview) -> None:
+    def _paint_area(painter: QPainter, samples) -> None:
+        """The area an Erase selection takes, so far: grey, closed back to its start."""
+        if len(samples) < 2:
+            return
+        path = QPainterPath(QPointF(samples[0][0], samples[0][1]))
+        for sample in samples[1:]:
+            path.lineTo(sample[0], sample[1])
+        path.closeSubpath()
+        painter.save()
+        painter.setBrush(QColor(0, 0, 0, 40))
+        pen = QPen(QColor(0, 0, 0, 120), 0, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        pen.setWidthF(1.5)
+        painter.setPen(pen)
+        painter.drawPath(path)
+        painter.restore()
+
+    @classmethod
+    def _paint_one(cls, painter: QPainter, preview) -> None:
         if isinstance(preview, PageScene):
             painter.save()
             if preview.layers[0].strokes[0].tool.family == "highlighter":
                 painter.setOpacity(0.6)         # the page draws it Darken-blended under the ink
             renderer.paint(painter, preview, blend_modes=False)
             painter.restore()
+            return
+        if preview[0] == "area":
+            cls._paint_area(painter, preview[1])
             return
         _, samples, width = preview
         if not samples:
@@ -733,6 +792,28 @@ Item {
                     }
                 }
                 Rectangle {
+                    objectName: "penTool_" + penTools.clearAll.key
+                    width: 40; height: 40; radius: 4
+                    color: eraseAllMouse.hovered ? bar.hover : "transparent"
+                    ArkControls.Icon {
+                        anchors.centerIn: parent
+                        source: "qrc:/ark/icons/" + penTools.clearAll.icon
+                        size: 24
+                        color: "#000000"
+                    }
+                    TapHandler {
+                        objectName: "tap"
+                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                        onTapped: penTools.eraseAll()
+                    }
+                    HoverHandler {
+                        id: eraseAllMouse
+                    }
+                    ToolTip.visible: eraseAllMouse.hovered
+                    ToolTip.delay: 600
+                    ToolTip.text: penTools.clearAll.label
+                }
+                Rectangle {
                     objectName: "penTool_lasso"
                     readonly property bool inHand: penTools.active && penTools.lasso
                     width: 40; height: 40; radius: 4
@@ -761,7 +842,7 @@ Item {
         Rectangle {
             id: options
             objectName: "penOptions"
-            visible: penTools.active && !penTools.lasso
+            visible: penTools.active && !penTools.lasso && penTools.hasOptions
             width: 3 * 36 + 8
             height: optionColumn.height + 8
             radius: 6

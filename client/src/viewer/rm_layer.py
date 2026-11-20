@@ -720,23 +720,17 @@ def unmerge_layer(page: bytes, *, author: bytes, src: tuple[int, int], dst: tupl
 
 def clear_lines_in_layer(page: bytes, *, author: bytes,
                          layer: tuple[int, int]) -> tuple[bytes, list[tuple[tuple[int, int], bytes]]]:
-    """Delete every live line item in `layer` and any groups below it. Returns
-    (new page, [(deleted_item_id, raw_line_value_bytes)])."""
-    header, blocks = w.split(page)
+    """ClearPage on the live layer `layer` (rm_stroke.clear_layer: its strokes and those
+    of the groups below it deleted, as SceneController::clearLinesInLayer does).
+    Returns (new page, [(deleted item id, line value bytes)]) in the order the app's
+    undo puts them back (rm_stroke.Cleared.undo_order). `author` is not used: a
+    clear takes no id."""
+    _, blocks = w.split(page)
     layer = tuple(layer)
     if layer not in w.layers(blocks):
         raise LayerError(f"{layer} is not a live layer of the page")
-    nodes = [layer] + [node for node, _ in rs.group_nodes(blocks, layer)]
-    node_set = set(nodes)
-    to_delete: list[tuple[tuple[int, int], bytes]] = []
-    for block in blocks:
-        if block.type == w.BLOCK_LINE_ITEM:
-            item = w.decode_item(block.payload)
-            if item.parent in node_set and item.value is not None and not item.deleted_length:
-                to_delete.append((item.item, item.value))
-    if not to_delete:
-        return page, []
-    return rs.delete_strokes(page, [i for i, _ in to_delete]), to_delete
+    cleared = rs.clear_layer(page, layer=layer)
+    return cleared.page, list(cleared.undo_order())
 
 
 __all__ = [

@@ -1323,9 +1323,13 @@ class LibrarySource:
             history.seen = self._seen(doc.id, page_id)
         return edit
 
-    def clear_lines_in_layer(self, doc: Document, page_id: str, layer_index: int,
+    def clear_lines_in_layer(self, doc: Document, page_id: str, layer_index: int | None,
                              now_ms: int) -> StrokeDelete | None:
-        """Delete all strokes in layer `layer_index` (and groups below it), as one undo step."""
+        """ClearPage on layer `layer_index` (None: the page's current layer): its strokes
+        and those of the groups below it deleted (rm_layer.clear_lines_in_layer, as
+        SceneController::clearLinesInLayer does), kept as one StrokeDelete and one undo
+        step, whose undo puts each stroke back right after its deleted self in the app's
+        order. None, with nothing kept, when the layer holds no stroke."""
         with self._history_lock:
             doc = self._editable(doc, page_id)
             history = self._history(doc.id, page_id)
@@ -1333,6 +1337,9 @@ class LibrarySource:
             if before.page is None:
                 return None
             infos = rm_layer.layers_info(before.page)
+            if layer_index is None:
+                current = rm_writer.current_layer(rm_writer.split(before.page)[1])
+                layer_index = [info.node_id for info in infos].index(current)
             idx = int(layer_index)
             if not 0 <= idx < len(infos):
                 raise EditError(f"no layer {idx} of {len(infos)}")

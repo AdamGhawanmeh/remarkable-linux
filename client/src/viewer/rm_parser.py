@@ -215,12 +215,13 @@ class Stroke:
 class Layer:
     name: str = ""
     visible: bool = True
-    strokes: list[Stroke] = field(default_factory=list)
+    strokes: list[Stroke] = field(default_factory=list)     # bottom to top (v6: stacking order)
     node_id: tuple[int, int] | None = None
     images: list["ImageItem"] = field(default_factory=list)
 
     def items(self) -> list:
-        """Strokes and images bottom to top, in the order the file lists them."""
+        """Strokes and images bottom to top: their stacking order (each node's CRDT
+        sequence; the file's order when that cannot be worked out)."""
         return sorted([*self.strokes, *self.images], key=lambda item: item.seq)
 
 
@@ -1187,7 +1188,12 @@ def _parse_v6(data: bytes) -> PageScene:
         if not layer.name:
             layer.name = f"Layer {list(layers).index(node) + 1}"
     root_strokes = []
-    for layer, stroke in placed:
+    # Each layer's strokes bottom to top: its stacking order (seq), not the file's. The two
+    # differ wherever an item was put back by undo or redo (rm_stroke.restore_stroke,
+    # 0x1408cbd60): it takes the page's next id, so its block is stored last (items are
+    # sorted by parent and id), while its place in the sequence is right after its own
+    # deleted self. Read in file order, an erase undone came back on top of everything.
+    for layer, stroke in sorted(placed, key=lambda p: p[1].seq):
         if stroke.item_id in deleted:
             continue
         (layers[layer].strokes if layer in layers else root_strokes).append(stroke)
@@ -1195,7 +1201,7 @@ def _parse_v6(data: bytes) -> PageScene:
     if root_strokes:
         result.insert(0, Layer(name="Root", strokes=root_strokes, node_id=ROOT_NODE))
     live_images: list[ImageItem] = []
-    for image in images:
+    for image in sorted(images, key=lambda i: i.seq):       # stacking order, as the strokes
         if image.item_id in deleted:
             continue
         image.file_name = image_files.get(image.image_ref, "")

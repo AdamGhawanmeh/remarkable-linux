@@ -1744,7 +1744,7 @@ class PenTests(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: self.pens(view).toolbar.property("visible")))
         self.assertEqual([t["key"] for t in tools.property("tools")],
                          ["fineliner", "ballpoint", "marker", "pencil", "mechanical_pencil", "paintbrush",
-                          "highlighter", "calligraphy", "shader", "eraser"])
+                          "highlighter", "calligraphy", "shader", "eraser", "erase_section"])
         self.assertFalse(tools.property("active"))
         self.assertEqual(real_warnings(self.app.warnings), [])
 

@@ -1030,6 +1030,66 @@ code is in the binary, mouse path included:
   value (`rm_stroke.rotation_of`). The client's view only translates and scales the page
   (landscape documents are shown as stored, as in reMarkable.exe), so its rotation is 0;
   `SceneView.pen_rotation` reads it off the view transform all the same.
+- **Stacking order after an undo** (client fix, 2026-11-20). An item put back by undo or
+  redo takes the page's next id, and item blocks are stored sorted by (parent, id), so its
+  block is the **last** of its node in the file while its place in the CRDT sequence is
+  right after its own deleted self (left = that id, right = what followed). Nothing in the
+  file shifts: ids, left/right and the value (timestamp `6F` included; moveId set to the
+  first item) are what the app writes. But `rm_parser` handed each layer's strokes out in
+  file order (`Layer.strokes`; only `Layer.items()`, which the renderer uses, sorted by
+  stacking rank), so after erase + undo the scene model listed the same strokes in another
+  order than before the erase, and anything reading `Layer.strokes` (tests, the
+  `PageScene.strokes` users) saw the strokes put back on top. The pixels were right. Each
+  layer's strokes and images are now listed in stacking order (the node sequences
+  `_stacking` works out; file order only when a sequence cannot be worked out). Checked
+  read-only on 150 cached tablet pages: 449 eraser passes over the current layer (946
+  strokes hit), each undone, redone and undone again with `rm_stroke.delete_strokes` /
+  `restore_stroke` as the undo stack does, gave back the page's own stacking order every
+  time; and offline with a seeded random draw/erase/erase-selection/clear/undo/redo model
+  through `LibrarySource` (`tests/test_erase_undo_clear_offline.py`), which fails
+  without the fix.
+
+**Erase selection and Erase all** [O] (`rm_stroke.clear_layer`, `Cleared`,
+`rm_layer.clear_lines_in_layer`, `LibrarySource.clear_lines_in_layer`; toolbar in
+`ui/pen.py`, `ui/quick/bridge/pen.py`).
+
+- The tablet's eraser has three modes (icons `eraser`, `erase_selection`, `erase_all` in
+  `qrc:/ark/icons`). **Erase selection** is Line::Tool EraseSection (8): the line drawn is
+  handed to `SceneController::eraseWithLine` (slot 102, 0x14041a8e0, lambda
+  0x140434480) like the Eraser's, with the controller's current layer index (+0xac) →
+  `Scene::erase` (0x14094d9d0 → 0x140996ae0). Only the outline differs (0x140a5f380):
+  the path through the points, `toFillPolygon()`, no stroker, so the line's width and
+  size do not matter. Everything after (cuts, margins, pieces, ids, undo) is the
+  Eraser's. Kept as a `StrokeErase` with tool 8; `LastTool`/`LastEraserTool` =
+  `EraseSection`.
+- **Erase all** is ClearPage (Line::Tool 9), an action, not a stroke:
+  `SceneController::clearLinesInLayer(int layer)` (slot 78, 0x140439c50) resolves the
+  index to the layer's node (0x1404438c0; nothing when there is none) and posts a lambda
+  (0x140433ee0) to the scene: 0x140995ad0 makes a `SceneMacroAction`, fills it with
+  `scene::eraser::createEraseItemsActions` (0x1409931c0) and pushes it only when it
+  holds something. That walks the layer node and every group node below it (visitor
+  0x1408d1670, as the eraser) and, per node, makes one `SceneDeleteItemsActionCrdt`
+  (vtable 0x140d6b430; redo/undo are the item actions' shared 0x14095e690/0x14095f520)
+  for the node's live items the filter keeps (0x140433d20: everything but value type 7,
+  images, and 2, groups; `0x140412400`, which decides whether there is a filter, always
+  returns 1). A group node all of whose items went gets a `SceneDeleteGroupActionCrdt`
+  (vtable 0x140d6b468: redo detaches the node, a SceneTreeMove to `0:0`; undo
+  0x14095eed0 moves it back under its parent) and, when anchored, the anchor manager's
+  action (0x14096f3a0). Redo of the macro runs its actions in order (0x1408f48a0), undo
+  last first (0x1408f52b0). `SceneController::clearLines()` (slot 108, 0x140439c00)
+  calls `clearLinesInLayer(i)` for i = 0..4: every layer, one undo step per layer.
+- So a clear deletes, takes no id, and its undo puts each item back as a new item right
+  after its deleted self, the group nodes' items first, then the layer's, each node's in
+  its sequence order (`Cleared.undo_order`). The client clears the **current layer**
+  (the toolbar's Erase all button → `SceneView.clear_current_layer` →
+  `clearLinesInLayer(currentLayer)`; the Layers foldout's slot keeps its index), keeps
+  it as one `StrokeDelete` (pending edit) and one undo step (`StrokeChange` readd in
+  that order), and nothing when the layer holds no stroke.
+- Deviations: an emptied group node is left attached and anchored (as the client's
+  eraser leaves it); glyph ranges (PDF highlights, block 0x03; none in any cached page)
+  and strokes stored with version-1 points (which the client cannot put back) stay.
+  Checked read-only on the same 150 cached pages: every current-layer clear takes no
+  id, and putting the strokes back in `undo_order` gives the page's own stacking order.
 
 **Text-anchored stroke groups** [O, checked on the 710 anchored nodes of a real library,
 all on pages with a RootText block]. `scene::AnchorManager` (ctor 0x1409690f0, log category

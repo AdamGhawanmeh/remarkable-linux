@@ -128,7 +128,7 @@ class ShaderTests(unittest.TestCase):
     def test_the_toolbar_offers_the_shader(self):
         shader = pens.BY_KEY["shader"]
         self.assertEqual((shader.tool, shader.name, shader.icon, shader.label), (23, "ShadingMarker", "shader", "Shader"))
-        self.assertEqual([t.key for t in pens.TOOLS][-2:], ["shader", "eraser"])
+        self.assertEqual([t.key for t in pens.TOOLS][-3:], ["shader", "eraser", "erase_section"])
         self.assertEqual([c.key for c in shader.colors], [c.key for c in pens.PEN_COLORS])
         pen = pens.pen_of({}, shader)
         self.assertEqual((pen.size, pen.color.name, pen.line_color), (2, "Gray", int(Color.GRAY)))

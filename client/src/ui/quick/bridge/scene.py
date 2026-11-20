@@ -1868,6 +1868,11 @@ class _SceneView:
         now_ms = _now_ms()
         self._run_layer_edit("clear layer", lambda: source.clear_lines_in_layer(node, page_id, index, now_ms))
 
+    def clear_current_layer(self) -> None:
+        """Erase all (ClearPage): clearLinesInLayer on the current layer, as the eraser
+        and the pens take the current layer."""
+        self.clear_lines_in_layer(self._active_layer())
+
     def set_current_layer(self, index: int) -> None:
         if not 0 <= index < len(self._controller.layers):
             return
