@@ -74,6 +74,11 @@ class FakeCloud:
         self.device_tokens = {"device"}      # paired_auth's
         self.revoked = False                 # the account no longer accepts this device
         self.offline = False                 # no network: every request fails to connect
+        # POST /convert/v1/handwriting: the request bodies (JSON) received, and the answer:
+        # None -> synthetic JIIX of `handwriting_text`; a callable(request) -> HttpResponse.
+        self.handwriting_requests: list[dict] = []
+        self.handwriting_text = "hello world"
+        self.handwriting = None
 
     # -- content ------------------------------------------------------------
 
@@ -140,6 +145,8 @@ class FakeCloud:
             return HttpResponse(self.fail_next.pop(0), {}, b"")
         if self.revoked:
             return HttpResponse(401, {}, b"")
+        if method == "POST" and path == "/convert/v1/handwriting":
+            return self._handwriting(headers, body)
         if method == "PUT":
             return self._put(path, headers, body)
         if path == "/sync/v4/root":
@@ -159,6 +166,21 @@ class FakeCloud:
             data = self.blobs.get(blob_hash)
             return HttpResponse(200, {}, data) if data is not None else HttpResponse(404, {}, b"")
         return HttpResponse(404, {}, b"")
+
+    def _handwriting(self, headers: dict, body: bytes | None) -> HttpResponse:
+        """The cloud's MyScript recogniser, synthetic: JIIX whose one Text element is
+        `handwriting_text` (one word per space, boxes made up), as MyScript answers a
+        "Raw Content" request with text recognition and words export on."""
+        if headers.get("Accept") != "application/vnd.myscript.jiix":
+            return HttpResponse(406, {}, b"")
+        try:
+            request = json.loads(body or b"")
+        except ValueError:
+            return HttpResponse(400, {}, b'{"message":"invalid JSON"}')
+        self.handwriting_requests.append(request)
+        if self.handwriting is not None:
+            return self.handwriting(request)
+        return HttpResponse(200, {"Content-Type": "application/vnd.myscript.jiix"}, synthetic_jiix(self.handwriting_text))
 
     def _auth(self, path: str, headers: dict, body: bytes | None) -> HttpResponse:
         bearer = headers.get("Authorization", "").removeprefix("Bearer ")
@@ -243,6 +265,28 @@ class FakeCloud:
 
     def blob_requests(self) -> list[str]:
         return [p for p in self.requests if p.startswith("/sync/v3/files/")]
+
+
+def synthetic_jiix(text: str, y: float = 10.0) -> bytes:
+    """A JIIX answer as MyScript's iink REST API gives it for Raw Content: lines of
+    `text` in one Text element, its words with made-up bounding boxes (mm)."""
+    words, x = [], 5.0
+    for line_no, line in enumerate(text.split("\n")):
+        for n, word in enumerate(line.split(" ")):
+            if n:
+                words.append({"label": " "})
+            words.append({"label": word, "candidates": [word, word.lower()],
+                          "bounding-box": {"x": x, "y": y + 9.0 * line_no, "width": 4.0 * len(word), "height": 7.5}})
+            x += 4.0 * len(word) + 2.0
+        words.append({"label": "\n"})
+        x = 5.0
+    if words:
+        words.pop()
+    element = {"type": "Text", "label": text, "words": words, "id": "MainBlock/1",
+               "bounding-box": {"x": 5.0, "y": y, "width": 120.0, "height": 9.0 * (text.count("\n") + 1)}}
+    return json.dumps({"type": "Raw Content", "version": "3", "id": "MainBlock",
+                       "bounding-box": element["bounding-box"],
+                       "elements": [element, {"type": "Raw Content", "kind": "drawing", "id": "MainBlock/2"}]}).encode()
 
 
 def paired_auth(config_dir: Path, transport, **claims) -> AuthClient:

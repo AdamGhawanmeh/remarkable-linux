@@ -140,8 +140,8 @@ undefined: the code page showed "Service environment: Prod" and the sort order w
   (SceneView renders the page with `ui/pages.py` through the tile manager's transform;
   the tile manager maps view ↔ scene, zooms and clamps scrolling to the paper;
   `linkAt` returns the PDF's links; `DocumentSearchController` and
-  `PageSearchResultOverlayItem` search and highlight, §5.7). Handwriting conversion
-  members exist and do nothing.
+  `PageSearchResultOverlayItem` search and highlight, §5.7). `Recognizer` and
+  `RecognitionJob` convert handwriting through the cloud (§5.12).
 
 **Behaviour recovered from the binary**, where the QML does not define it:
 `LibraryView::Filter` flags (`NativeDocuments=1, Collections=2, PDFs=4, Ebooks=8,
@@ -152,7 +152,9 @@ relative last-modified time (`StringUtils`, shared.cpp 0x140bc4e20: "just now" <
 then minutes/hours/days/30-day months/365-day years, `round`); `whatsNewJson` =
 `:/misc/whatsnew_desktop.json`; language names `QLocale::nativeLanguageName` with the
 first letter capitalised; 33 handwriting-conversion languages; `UserInfo.featureToggles
-.clientEdit` (notebook editing, off here).
+.clientEdit` (the editing interface: on while every document shown is one the library
+lets this client edit, and in the library while editing is turned on at all;
+`QuickApp._update_editing`).
 
 **Documents without a page list.** DocumentViewport opens pages by id
 (`goToPageId(document.idForPage(n))`), and SceneView loads nothing without one. A PDF or
@@ -2621,6 +2623,90 @@ types on such a page in a PDF of A4 and 16:9 pages, clicks the caret position of
 character where the window shows it (the caret lands there), and paints the page at
 device pixel ratios 1 and 2 (the text's box agrees within 2 px). Not traced: whether the
 tablet's own firmware lets text onto PDF pages (only the desktop binary is here).
+
+### 5.12 Handwriting conversion (Convert to text)
+
+Traced in reMarkable.exe 3.29 (`src/handwritingconversion/src/{recognizer,recognitionqueue,
+recognitiontask,recognitionjob,jiixparser,hwcanalyzer}.cpp`) and the app's QML
+(DocumentView.qml `hwcFullPage`/`hwcSelection`, DocumentViewport.qml, PageOverview.qml,
+common/HwcNotificationBar.qml). Client: `core/handwriting.py` (request, JIIX parser,
+error mapping) and `Recognizer`/`RecognitionJob` in `ui/quick/bridge/scene.py`.
+
+**Request** (RecognitionTask, built at 0x1401a5300; posted at 0x14017e8e1):
+`POST /convert/v1/handwriting` on the gateway with the user token, `Accept:
+application/vnd.myscript.jiix`, a 70 s timeout (0x11170 ms), up to 3 attempts per task
+(`cmp eax,3` at 0x14017dde7; "Failed to convert page {} after {} attempts: {}"). Body
+(QJsonObject; the dotted keys are set through a path helper, 0x1401a4c20; each value is
+made before its key, so the booleans read `mov dl,1` = true):
+
+```json
+{"xDPI": 2280, "yDPI": 2280, "width": 14040, "height": 18720,
+ "contentType": "Raw Content",
+ "configuration": {"lang": "en_US",
+   "export": {"jiix": {"strokes": false, "text": {"chars": false, "words": true}}},
+   "raw-content": {"recognition": {"text": true, "shape": false}}},
+ "strokeGroups": [{"strokes": [{"x": [...], "y": [...]}]}]}
+```
+
+DPI 2280.0 (0x14102b788), width/height 14040.0/18720.0 (0x14102b790/798, the 1404 × 1872
+screen × 10); point coordinates are the scene's × 10.0 (0x14102b758), only `x` and `y`.
+**Deviation**: the client sends each stroke's points as the page stores them (anchored
+groups not offset to their text line); recognition only depends on the shapes.
+
+**Answer** (jiixparser.cpp): `elements` of type `Text` (`label`, `words`, `bounding-box`;
+also `reflow-label`), applied to the page's root document ("No root document
+available", "page {} already has a root document!"). List paragraphs come from two
+regular expressions on each line (0x1008cf8, 0x1008d20): `^(\*\s|•\s|°\s|◦\s|→\s|-\s)` a
+bullet, `^(0\s|o\s|O\s|✓\s|☐\s|☑\s|☒\s)` a checkbox. The client makes a paragraph of
+each line of the Text elements (top to bottom), takes the marker off and gives the
+paragraph that style (✓ ☑ ☒ ticked); `plainText` writes markers back as `•`/`☐`/`☑`.
+
+**Jobs.** `RecognitionJob` {status Processing 0 / Done 1 / Error 2; error `ConvertError`
+Unknown 0, NoError 1, NoTasks 2, NoText 3, NetworkError 4, ServerError 5,
+AuthenticationError 6; `progress`, `finishedPages`, `pages`, `newPage`, `plainText`}.
+One task per page ("Creating task for page {}"), run in turn (RecognitionQueue "{} task
+left, {} finished"). Client mapping: no strokes → NoTasks; HTTP 401/403 or no token →
+AuthenticationError; connection failures on all 3 attempts → NetworkError; other
+refusals, 5xx after 3 attempts, or an answer that is not JIIX → ServerError; JIIX
+without text → NoText. A job's tasks combine as: the first hard error wins, pages
+without text are skipped while another has text. Offline (`--offline`, logged out,
+network known down) a job fails with NetworkError without a request. The language is
+`Settings.handwritingConversionLanguage` (the HwcLanguagePicker's), aliases as
+`HandwritingLanguageModel` (en_UK → en_GB, no_DK/no_SV → no_NO).
+
+- *Full page* (Convert to text in the viewport or the page overview,
+  `startRecognitionJob(id, pages, language)`): `newPage` = last page + 1. On Done,
+  DocumentView adds a page there (`addPageWithTemplateAndPageSize`) and calls
+  `applyFormattedText(worker)`: the client opens a text box of body text on the new
+  page, types the paragraphs and their styles as one undo step, kept as pending edits
+  (`LibrarySource.add_text_edits` → PendingEdits → the outbox). The bar's Undo deletes
+  the page (`DocumentController.deletePages`); `abortRecognitionJob` drops the job
+  (late answers ignored).
+- *Selection* (`startSelectionToolJob(items, language)`): DocumentViewport clones the
+  selection, starts the job, **then deletes the selection**. On finish DocumentView
+  sets `Clipboard.text = formattedTextToClipboardText()` and, on a note page,
+  `selectionConversionFinished()` puts the cursor under the selection and calls
+  `pasteClipboardContent(text, KeepStyle, MergeWithPreviousAction)`: the text, with
+  its list styles, and the delete are one undo step (client: `add_text_edits(...,
+  merge=(depth, step))` folds the paste's step into the delete's while the page's undo
+  stack is still that deep).
+
+**The app's gap, and the client's guard.** On failure the app undoes the delete only
+`if (failed && textMode)` (DocumentView.qml `hwcSelection.onFailedChanged`), so outside
+text mode a NetworkError/ServerError/NoText leaves the strokes deleted unless the user
+presses Close (`abortSelectionToolJob(); undo()`); in text mode Close then undoes a
+second time (the previous edit). The client's `_ConversionGuard` links the job to the
+delete that follows it (the page's undo depth after it) and, when the job fails or is
+aborted, undoes exactly that step itself on the view's worker (after the delete;
+`LibrarySource.revert_top`, also dropping it from redo), whatever the mode; the QML's
+own `undo()` calls during the failed status change and right after an abort are
+ignored, so nothing else is undone. A failed job's `formattedTextToClipboardText`
+returns the clipboard as it was (the app would empty it) and its merged paste is
+dropped. A worker exception ends the task as Unknown, so no job is left hanging with
+the strokes deleted.
+
+Verified offline only (tests/test_handwriting_offline.py, a fake recogniser in
+tests/fakecloud.py answering synthetic JIIX); never sent to the real cloud.
 
 ## 6. Implications for the Linux client
 

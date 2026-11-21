@@ -29,7 +29,9 @@ which hands each finished stroke or eraser pass to the view (pen_commit). A PDF 
 ebook page is the same scene as a notebook page, only wider or longer: the PDF page
 fills x in [-W/2, W/2], y in [0, H] at 226/72 px per point (ui/pages.py), and nothing
 is clipped to the 1404 x 1872 screen (ARCHITECTURE.md 5.4). Handwriting conversion
-exists so the QML binds, and does nothing yet (generated.py).
+(Recognizer, RecognitionJob; core.handwriting): a page converted to a new page of
+typed text, a selection converted to text pasted in its place (one undo step with
+the delete), the strokes always put back when that fails or is cancelled (5.12).
 
 Scene coordinates are the app's: tablet pixels at 226 DPI, x = 0 on the page's vertical
 centre line, y = 0 at its top (ui/pages.py uses x = 0 at the left edge). The tile
@@ -51,9 +53,12 @@ from PySide6.QtCore import (QAbstractListModel, QCoreApplication, QModelIndex, Q
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
+from core import handwriting as hwc
 from core.edits import EditError
 from core.models import FileType
-from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, Layer
+from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, Layer, Tool
+from viewer.rm_parser import parse as parse_page
+from viewer import rm_stroke
 from viewer.rm_parser import ParagraphStyle as StyleType
 from viewer import rm_select as rsel
 from viewer import rm_text
@@ -316,8 +321,349 @@ SceneKeyHandlerAction = qml_class("SceneKeyHandlerAction")
 SceneParticipant = qml_class("SceneParticipant")
 SceneRenderContext = qml_class("SceneRenderContext")
 SceneKeyHandler = qml_class("SceneKeyHandler", register=("com.remarkable", "SceneKeyHandler", "uncreatable"))
-RecognitionJob = qml_class("RecognitionJob")
-Recognizer = qml_class("Recognizer")
+# -- handwriting conversion (src/handwritingconversion, ARCHITECTURE.md 5.12) ----------
+
+# Strokes that are not writing: the app's analyser leaves highlighter and eraser out.
+_NOT_WRITING = {int(Tool.HIGHLIGHTER), int(Tool.HIGHLIGHTER_V2), int(Tool.ERASER), int(Tool.MASKED_ERASER)}
+_PARAGRAPH_STYLES = {hwc.Kind.TEXT: StyleType.PARAGRAPH, hwc.Kind.BULLET: StyleType.BULLETPOINT,
+                     hwc.Kind.CHECKBOX: StyleType.CHECKBOX_UNCHECKED,
+                     hwc.Kind.CHECKBOX_CHECKED: StyleType.CHECKBOX_CHECKED}
+# SceneViews whose SceneController.undo() is ignored for now: the strokes a failed or
+# aborted selection conversion deleted are put back by the bridge itself (exactly once),
+# so DocumentView's own undo() calls on failure and on Cancel/Close must not undo again.
+_undo_swallowed: set = set()
+# The SceneView that last cloned its selection (cloneSelectedItems): the one a selection
+# conversion started right after it converts (DocumentViewport clones, then starts).
+_last_clone_view = None
+# The latest conversion's (plain text, paragraphs): pasting that text keeps its styles.
+_last_conversion: tuple[str, list] | None = None
+
+
+def page_strokes(source, node, page_id: str) -> list[list[tuple[float, float]]]:
+    """The writing on a page as the library shows it (pending edits included): each
+    stroke's points in scene coordinates, highlighters and erasers left out."""
+    data = source.staged(node).page(page_id)
+    if not data:
+        return []
+    out = []
+    for layer in parse_page(data).layers:
+        if not getattr(layer, "visible", True):
+            continue
+        for stroke in layer.strokes:
+            if int(getattr(stroke, "tool", 0)) not in _NOT_WRITING and stroke.points:
+                out.append([(float(p.x), float(p.y)) for p in stroke.points])
+    return out
+
+
+def clip_strokes(items) -> list[list[tuple[float, float]]]:
+    """The writing among clipboard records (cloneSelectedItems), as page_strokes."""
+    out = []
+    for value in editing.clip_lines(items):
+        if int(value.tool) in _NOT_WRITING:
+            continue
+        points = [(float(p.x), float(p.y)) for p in rm_stroke.unpack_points(value.points)]
+        if points:
+            out.append(points)
+    return out
+
+
+def paste_paragraphs(session, paragraphs) -> None:
+    """Converted paragraphs typed at the cursor (RecognitionJob::applyFormattedText via
+    jiixparser's applyTextToScene): the text in one go, then each list paragraph given
+    its style; one undo step for all of it."""
+    texts = [p.text for p in paragraphs]
+    joined = "\n".join(texts)
+    if not joined.strip():
+        return
+    first = len(session.steps)
+    session.paste(joined)
+    end = session.cursor
+    offset = end - len(joined)
+    if offset >= 0 and any(p.kind != hwc.Kind.TEXT for p in paragraphs):
+        for p in paragraphs:
+            if p.kind != hwc.Kind.TEXT:
+                session.place(offset)
+                session.set_style(_PARAGRAPH_STYLES[p.kind])
+            offset += len(p.text) + 1
+        session.place(end)
+    if len(session.steps) - first > 1:
+        session.steps[first:] = [[change for step in session.steps[first:] for change in step]]
+
+
+class _ConversionGuard:
+    """A selection conversion's hold on the strokes it deleted (DocumentViewport deletes
+    the selection right after starting the job): `depth` is the page's undo depth once
+    the delete is kept. If the job fails or is aborted, the delete is undone here (and
+    dropped from redo), whatever text mode is in: the app undoes it only in text mode,
+    leaving the strokes gone otherwise (DocumentView.qml hwcSelection.onFailedChanged)."""
+
+    def __init__(self, view, node, page_id: str) -> None:
+        self.view, self.node, self.page_id = view, node, page_id
+        self.armed = True           # the view's next deleteSelectedItems is the conversion's
+        self.depth: int | None = None
+        self.reverted = False
+        self.done = False
+
+    def swallowing(self, fn) -> None:
+        """Run `fn` (the job's status change: DocumentView undoes on failure in it)
+        with this view's undo() ignored."""
+        _undo_swallowed.add(self.view)
+        try:
+            fn()
+        finally:
+            _undo_swallowed.discard(self.view)
+
+    def swallow_briefly(self) -> None:
+        """Ignore this view's undo() until the event loop runs again (Cancel and Close
+        call abortSelectionToolJob, then undo)."""
+        view = self.view
+        _undo_swallowed.add(view)
+        QTimer.singleShot(0, lambda: _undo_swallowed.discard(view))
+
+    def revert(self) -> None:
+        self.armed = False
+        if self.reverted or self.done:
+            return
+        self.reverted = True
+        view = self.view
+        if view is not None and shiboken6.isValid(view):
+            view.revert_conversion(self)
+        else:                       # the document was closed meanwhile
+            source = _source()
+            if source is not None and self.depth is not None:
+                source.revert_top(self.node, self.page_id, self.depth, _now_ms())
+
+
+class _RecognitionJob:
+    """RecognitionJob (recognitionjob.cpp): one task per page (or one for a selection),
+    run one after another on the recogniser's worker; progress, then Done with the
+    converted text or Error with a ConvertError."""
+
+    _task_done = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        QObject.__init__(self, parent)
+        self.paragraphs: list = []
+        self.doc_id = ""
+        self.aborted = False
+        self.results: list = []
+        self.guard: _ConversionGuard | None = None
+        self._task_done.connect(self._on_task)
+
+    def begin(self, pool: QThreadPool, tasks: list, language: str, request, online) -> None:
+        self.results = [None] * len(tasks)
+        self._set("progress", 0.0)
+        if not tasks:
+            QTimer.singleShot(0, lambda: self._end(hwc.Recognition(error=hwc.ConvertError.NoTasks)))
+            return
+
+        def work():
+            for index, strokes in enumerate(tasks):
+                if self.aborted:
+                    return
+                try:            # a task always ends: a job left hanging would keep strokes deleted
+                    if request is None:
+                        result = hwc.Recognition(error=hwc.ConvertError.AuthenticationError)
+                    elif not online():
+                        result = hwc.Recognition(error=hwc.ConvertError.NetworkError)
+                    else:
+                        result = hwc.recognize(request, strokes, language, lambda: self.aborted)
+                except hwc.RecognitionFailed:
+                    return
+                except Exception:
+                    log.exception("handwriting conversion task %d", index)
+                    result = hwc.Recognition(error=hwc.ConvertError.Unknown)
+                emit_from_worker(self, lambda i=index, r=result: self._task_done.emit((i, r)))
+        pool.start(_Job(work))
+
+    def _on_task(self, payload) -> None:
+        index, result = payload
+        if self.aborted or not 0 <= index < len(self.results):
+            return
+        self.results[index] = result
+        done = sum(r is not None for r in self.results)
+        self._set("finishedPages", done)
+        self._set("progress", done / len(self.results))
+        self.progressUpdated.emit()
+        self.subtaskFinished.emit()
+        if done == len(self.results):
+            self._end(hwc.combine(self.results))
+
+    def _end(self, outcome) -> None:
+        if self.aborted:
+            return
+        global _last_conversion
+        guard = self.guard
+        if outcome.error == hwc.ConvertError.NoError:
+            self.paragraphs = list(outcome.paragraphs)
+            self._set("plainText", outcome.plain)
+            _last_conversion = (outcome.plain, self.paragraphs)
+            self._set("error", int(hwc.ConvertError.NoError))
+            if guard is not None:
+                guard.done, guard.armed = True, False
+                if shiboken6.isValid(guard.view):
+                    guard.view._conversion = ("done", guard)
+            self._set("status", 1)
+        else:
+            log.info("handwriting conversion failed: %s", outcome.error.name)
+            self._set("error", int(outcome.error))
+            self.errorChanged.emit()
+            if guard is None:
+                self._set("status", 2)
+            else:
+                if shiboken6.isValid(guard.view):
+                    guard.view._conversion = ("failed", guard)
+                guard.swallowing(lambda: self._set("status", 2))
+                guard.revert()
+        self.finished.emit()
+
+    def abort(self) -> None:
+        if self.aborted:
+            return
+        processing = int(self._get("status") or 0) == 0
+        self.aborted = True
+        guard = self.guard
+        if guard is not None and not guard.done:
+            guard.swallow_briefly()
+            if processing or not guard.reverted:
+                if shiboken6.isValid(guard.view):
+                    guard.view._conversion = ("failed", guard)
+                guard.revert()
+
+    @Slot("QVariant")
+    def applyFormattedText(self, worker=None) -> None:
+        """The converted text typed on the job's new page (DocumentView adds the page,
+        then calls this): a text box of body text with the paragraphs, kept as pending
+        edits of that page with one undo step (LibrarySource.add_text_edits)."""
+        source, node_of = _source(), _recognizer_node_of
+        node = node_of(self.doc_id) if node_of is not None else None
+        if source is None or node is None or not self.paragraphs:
+            return
+        try:
+            ids = source.page_ids(node)
+            index = int(self._get("newPage"))
+            if not 0 <= index < len(ids):
+                raise EditError(f"there is no page {index + 1}")
+            page_id = ids[index]
+            done = source.text_page(node, page_id)
+            if rm_text.page_text(done.page) is not None and rm_text.page_text(done.page).length:
+                log.warning("page %d with id %s already has a root document!", index, page_id)
+                return
+            log.info("applyFormattedText on page %d with id %s", index, page_id)
+            session = textedit.TextSession.open(node.id, page_id, done.page, done, source.sync.author(), None,
+                                                qt_measure, _now_ms, StyleType.PARAGRAPH)
+            paste_paragraphs(session, self.paragraphs)
+            edits, steps = session.take()
+            source.add_text_edits(node, page_id, edits, steps)
+        except (EditError, rm_text.TextError, *EXPECTED_ERRORS) as err:
+            _notify(f"The converted text could not be added: {err}")
+
+    @Slot(result="QVariant")
+    def formattedTextToClipboardText(self):
+        """SceneClipboardText of the converted text; a job without text leaves the
+        clipboard as it is (DocumentView sets Clipboard.text from this on failure too)."""
+        if self.paragraphs:
+            return hwc.clipboard_text(self.paragraphs)
+        return dict(_clipboard._content) if _clipboard is not None else {"text": "", "html": ""}
+
+
+RecognitionJob = qml_class("RecognitionJob", QObject, _RecognitionJob)
+
+# Set by the app: doc id -> library node; the request function and whether it is online.
+_recognizer_node_of: Callable[[str], object] | None = None
+
+
+class _Recognizer:
+    """Recognizer (recognizer.cpp): the full-page job (page overview's and the
+    viewport's Convert to text) and the selection job (the selection's Convert),
+    each replacing the one before it."""
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        QObject.__init__(self, parent)
+        self.request = None                 # core.handwriting Request, or None (not logged in)
+        self.online: Callable[[], bool] = lambda: True
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        self._jobs: dict[str, object] = {"recognitionJob": None, "selectionToolJob": None}
+
+    def set_node_of(self, node_of) -> None:
+        global _recognizer_node_of
+        _recognizer_node_of = node_of
+
+    def _replace(self, name: str, job) -> None:
+        old = self._jobs.get(name)
+        if old is not None and shiboken6.isValid(old):
+            old.abort()
+        self._jobs[name] = job
+        self._set(name, job)
+
+    @Slot(str, "QVariant", str)
+    def startRecognitionJob(self, doc_id: str, pages, language: str) -> None:
+        source, node_of = _source(), _recognizer_node_of
+        node = node_of(str(doc_id)) if node_of is not None else None
+        pages = sorted({int(p) for p in (_js(pages) or [])})
+        job = RecognitionJob(self)
+        job.doc_id = str(doc_id)
+        job._set("pages", pages)
+        job._set("newPage", (max(pages) + 1) if pages else 0)
+        tasks = []
+        if source is None or node is None:
+            log.warning("Trying to convert something that isn't a document")
+        else:
+            try:
+                ids = source.page_ids(node)
+                for page in pages:
+                    if 0 <= page < len(ids):
+                        log.info("Creating task for page %d", page)
+                        strokes = page_strokes(source, node, ids[page])
+                        if strokes:
+                            tasks.append(strokes)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                log.warning("handwriting conversion: %s", err)
+        self._replace("recognitionJob", job)
+        job.begin(self._pool, tasks, hwc_language(language), self.request, self.online)
+
+    @Slot()
+    def abortRecognitionJob(self) -> None:
+        job = self._jobs.get("recognitionJob")
+        if job is not None:
+            job.abort()
+        self._jobs["recognitionJob"] = None
+        self._set("recognitionJob", None)
+
+    @Slot("QVariant", str)
+    def startSelectionToolJob(self, items, language: str) -> None:
+        view = _last_clone_view if _last_clone_view is not None and shiboken6.isValid(_last_clone_view) else None
+        job = RecognitionJob(self)
+        job._set("pages", [])
+        job._set("newPage", -1)
+        node = getattr(view._get("document"), "node", None) if view is not None else None
+        if view is not None and node is not None and view._page_id:
+            job.guard = _ConversionGuard(view, node, view._page_id)
+            view._conversion_guard = job.guard
+            view._conversion = None
+            job.doc_id = node.id
+        strokes = clip_strokes(_js(items) or [])
+        self._replace("selectionToolJob", job)
+        job.begin(self._pool, [strokes] if strokes else [], hwc_language(language), self.request, self.online)
+
+    @Slot()
+    def abortSelectionToolJob(self) -> None:
+        job = self._jobs.get("selectionToolJob")
+        if job is not None:
+            job.abort()
+        self._jobs["selectionToolJob"] = None
+        self._set("selectionToolJob", None)
+
+
+def hwc_language(code: str) -> str:
+    """The MyScript locale of a handwriting conversion language setting."""
+    from .platform import HWC_ALIASES
+    code = str(code or "en_US")
+    return HWC_ALIASES.get(code, code)
+
+
+Recognizer = qml_class("Recognizer", QObject, _Recognizer)
 DocumentLockManager = qml_class("DocumentLockManager")
 
 
@@ -947,6 +1293,7 @@ class _Controller:
         self.insert_image: Callable[[QUrl, QPointF], None] | None = None
         self.view = None                    # that SceneView: selecting and changing images
         self.last_area: tuple[float, float] | None = None   # corner of the area last selected
+        self._cursor_request: QPointF | None = None          # where text mode was last asked to put the cursor
 
     def set_page(self, frame: QRectF, bounds: QRectF, layers: list, links: list[dict]) -> None:
         """The loaded page: its frame (paper), content bounds and links, in scene
@@ -1136,6 +1483,8 @@ class _Controller:
     def cloneSelectedItems(self, layer: int, scale_factor: float) -> list:
         """Clones of the selected items for Clipboard.items, scaled by `scale_factor`
         (0x14043a320). Cut is this, then deleteSelectedItems."""
+        global _last_clone_view
+        _last_clone_view = self.view
         return self.view.copy_selection(int(layer), float(scale_factor)) if self.view is not None else []
 
     @Slot("QVariant", result=QRectF)
@@ -1171,13 +1520,42 @@ class _Controller:
     @Slot("QVariant", int)
     @Slot("QVariant", int, int)
     def pasteClipboardContent(self, content, mode: int = 0, merge: int = 0) -> None:
-        """Text pasted in text mode, typed at the cursor (as plain text)."""
+        """Text pasted in text mode, typed at the cursor (as plain text; the text of the
+        latest handwriting conversion with its list styles). MergeWithPreviousAction (a
+        selection conversion's text, DocumentViewport.selectionConversionFinished) makes
+        it one undo step with the delete of the converted strokes; after a failed
+        conversion that paste is dropped (DocumentView calls it on failure too)."""
         content = _js(content) or {}
         text = content.get("text") if hasattr(content, "get") else None
-        if not text or self.view is None or self.view.text_session is None:
+        view = self.view
+        conversion = getattr(view, "_conversion", None) if int(merge) == 1 else None
+        if int(merge) == 1 and view is not None:
+            view._conversion = None
+            if conversion is None or conversion[0] != "done":
+                return                      # nothing converted: nothing to paste
+        if not text and conversion is not None:
+            return
+        if not text or view is None or (view.text_session is None and not view._text_opening
+                                        and conversion is None):
             _notify("Only plain text can be pasted into typed text on Linux yet")
             return
-        self.view.text_do(lambda t: t.paste(str(text)))
+        styled = _last_conversion[1] if _last_conversion is not None and _last_conversion[0] == str(text) \
+            and int(mode) == 0 else None
+        guard = conversion[1] if conversion is not None else None
+
+        def paste(t) -> None:
+            first = len(t.steps)
+            if styled is not None:
+                paste_paragraphs(t, styled)
+            else:
+                t.paste(str(text))
+            if guard is not None and guard.depth is not None and len(t.steps) > first:
+                view._text_merge = (guard.depth, first)
+        if view.text_session is None and not view._text_opening:
+            view.start_text(StyleType.PARAGRAPH, self._cursor_request)
+        view.text_do(paste)
+        if guard is not None and view.text_session is not None:
+            view._keep_text()
 
     @Slot(result="QVariantList")
     @Slot(QRect, result="QVariantList")
@@ -1225,6 +1603,7 @@ class _Controller:
     @Slot(QPointF, int)
     @Slot(QPointF, int, int)
     def setCursorPosition(self, pos: QPointF, mode: int = 0, overscroll: int = 0) -> None:
+        self._cursor_request = QPointF(pos)
         if self.view is not None:
             self.view.text_place(QPointF(pos), int(mode))
 
@@ -1309,6 +1688,9 @@ class _Controller:
     # -- undo and redo (DocumentViewport's undo and redo actions) --
     @Slot()
     def undo(self) -> None:
+        if self.view is not None and self.view in _undo_swallowed:
+            log.info("undo left to the handwriting conversion, which puts the strokes back")
+            return
         if self.view is not None:
             self.view.history_step(redo=False)
 
@@ -1407,6 +1789,9 @@ class _SceneView:
         self.text_session: textedit.TextSession | None = None
         self._text_opening = False
         self._text_then: list = []
+        self._conversion_guard = None      # a selection conversion's hold on the next delete
+        self._conversion = None            # ("done" | "failed", guard) of the last one, until pasted
+        self._text_merge: tuple[int, int] | None = None   # (undo depth, step) a paste merges into
         self._text_keep = QTimer(self, singleShot=True, interval=TEXT_KEEP_MS)
         self._text_keep.timeout.connect(self._keep_text)
         self._text_opened.connect(self._on_text_opened)
@@ -2266,16 +2651,43 @@ class _SceneView:
         self._hidden = items
         self._set_selection(None)
         self._controller.selectionCleared.emit()
+        guard, self._conversion_guard = self._conversion_guard, None
+        guard = guard if guard is not None and guard.armed and guard.page_id == page_id else None
+        if guard is not None:
+            guard.armed = False
 
         def job():
             error = None
             try:
-                source.delete_items(node, page_id, items, now_ms)
+                if source.delete_items(node, page_id, items, now_ms) and guard is not None:
+                    guard.depth = source.undo_depth(node, page_id)
             except (EditError, *EXPECTED_ERRORS) as err:
                 error = str(err)
             except Exception as err:
                 log.exception("deleting the selection on page %s", page_id)
                 error = f"The selection could not be deleted: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._edited.emit((error, None)))
+        self._pool.start(_Job(job))
+
+    def revert_conversion(self, guard) -> None:
+        """Put back the strokes a failed or aborted selection conversion deleted: its
+        delete undone (on this view's worker, so after the delete itself) and dropped
+        from redo, then the page shown again. Said so when it cannot be done."""
+        source = _source()
+        if source is None:
+            return
+        node, page_id = guard.node, guard.page_id
+
+        def job():
+            error = None
+            try:
+                if guard.depth is not None and not source.revert_top(node, page_id, guard.depth, _now_ms()):
+                    error = "The converted strokes were not put back: undo to restore them"
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:
+                log.exception("putting back the strokes of a selection conversion on page %s", page_id)
+                error = f"The converted strokes were not put back: {type(err).__name__}"
             emit_from_worker(self, lambda: self._edited.emit((error, None)))
         self._pool.start(_Job(job))
 
@@ -2587,11 +2999,12 @@ class _SceneView:
                 then()
             return
         page_id = session.page_id
+        merge, self._text_merge = self._text_merge, None
 
         def job():
             error = None
             try:
-                source.add_text_edits(node, page_id, edits, steps)
+                source.add_text_edits(node, page_id, edits, steps, merge=merge)
             except (EditError, *EXPECTED_ERRORS) as err:
                 error = str(err)
             except Exception as err:

@@ -144,6 +144,11 @@ class QuickApp:
             handwriting=HandwritingLanguageModel(), recognizer=Recognizer())
         self.item_inspector = QObject()
         s = self.singletons
+        # Handwriting conversion: the cloud's recogniser with the user token, only online.
+        s.recognizer.set_node_of(lambda doc_id: self.library.tree.get(doc_id))
+        s.recognizer.request = self._hwc_request
+        s.recognizer.online = lambda: (self.logged_in and not self.source.cached_only
+                                       and not self.closing and not s.link.known_offline)
         toc_bridge.set_controller(s.controller)     # the injected contents panel asks it
         self.engine: QQmlApplicationEngine | None = None
         self.translator: QTranslator | None = None
@@ -191,6 +196,17 @@ class QuickApp:
         self.library.openDocumentsChanged.connect(
             lambda: out.documents_open(d.id for d in self.library.open_documents()))
         s.link.availabilityChanged.connect(lambda _: out.network_available() if s.link.isOnline else None)
+
+    def _hwc_request(self, method: str, path: str, headers=None, body=None):
+        """core.handwriting's request: the gateway with the user token; a token that
+        cannot be had is an authentication error, a network failure getting it an OSError."""
+        from core.auth import AuthError, AuthNetworkError
+        try:
+            return self.auth.authorized_request(method, path, headers=headers, body=body)
+        except AuthNetworkError as err:
+            raise OSError(str(err)) from err
+        except AuthError as err:
+            raise PermissionError(str(err)) from err
 
     def _save_reading_position(self, doc_id: str, page: int, opened_ms: int | None) -> None:
         """Library.save_reading_position: lastOpenedPage/lastOpened to the cloud, as the app

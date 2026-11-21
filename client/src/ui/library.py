@@ -1145,16 +1145,24 @@ class LibrarySource:
         doc = self._editable(doc, page_id)
         return self.staged(doc).replay(page_id)
 
-    def add_text_edits(self, doc: Document, page_id: str, edits: list, steps: list) -> None:
+    def add_text_edits(self, doc: Document, page_id: str, edits: list, steps: list,
+                       merge: tuple[int, int] | None = None) -> None:
         """Keep text edits typed on a page (ui.textedit.TextSession.take), and their
-        undo steps, each one action for undo, as the app's text actions are."""
+        undo steps, each one action for undo, as the app's text actions are.
+        `merge` = (undo depth, n): step n joins the step on top of the undo stack when
+        the stack is still that deep (SceneController::MergeWithPreviousAction: a
+        selection conversion's text and the delete of its strokes are one step)."""
         if not edits:
             return
         with self._history_lock:
             doc = self._editable(doc, page_id)
             history = self._history(doc.id, page_id)
             self._add_edits(doc, [(e, None) for e in edits])
-            for step in steps:
+            for n, step in enumerate(steps):
+                if merge is not None and n == merge[1] and step and history.undo and len(history.undo) == merge[0]:
+                    history.undo[-1] = tuple(history.undo[-1]) + tuple(history.rename(tuple(step)))
+                    history.redo.clear()
+                    continue
                 history.push(step)
             history.seen = self._seen(doc.id, page_id)
 
@@ -1237,6 +1245,26 @@ class LibrarySource:
         with self._history_lock:
             history = self._history(doc.id, page_id)
             return history.undo[-1] if history.undo else None
+
+    def undo_depth(self, doc: Document, page_id: str) -> int:
+        """How many steps a page's undo stack holds."""
+        with self._history_lock:
+            return len(self._history(doc.id, page_id).undo)
+
+    def revert_top(self, doc: Document, page_id: str, depth: int, now_ms: int) -> bool:
+        """Undo the step on top of a page's undo stack if the stack is still `depth`
+        deep (nothing done since), and forget it (no redo): a selection conversion that
+        failed puts its strokes back so. False when the stack has changed."""
+        with self._history_lock:
+            history = self._history(doc.id, page_id)
+            if depth <= 0 or len(history.undo) != depth:
+                return False
+            if not self._step(doc, page_id, now_ms, redo=False):
+                return False
+            history = self._history(doc.id, page_id)
+            if history.redo:
+                history.redo.pop()
+            return True
 
     def _items(self, doc: Document, page_id: str):
         try:
