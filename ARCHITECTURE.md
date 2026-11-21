@@ -2260,6 +2260,54 @@ back if one has stepped on; the client shows it once. The page's tile image is n
 redrawn under the boxes: the overlay draws over the page instead (same tint on white
 paper). Handwriting is not searched.
 
+**Handwriting search (hws): traced, not implemented** [O]. What 3.29 has, and why the
+client cannot search handwriting:
+- *`.searchablepages`.* The only reference to the string (0x140d02fb8) is
+  0x14065d4f0, which builds `<document base path>.searchablepages` (0x14065eb70 +
+  suffix, i.e. `<uuid>.searchablepages`) and removes it through the app's filesystem
+  interface (vtable +0x08 exists, +0x60 remove); its one caller is the document-delete
+  routine 0x14065cde0, which logs it as "searchable pages" beside the page data,
+  thumbnails and other per-document files. **No code in reMarkable.exe 3.29 reads,
+  parses or writes the file**, and nothing builds a handwriting index (no recogniser
+  for search, no index database, no search endpoint: §5.12's recogniser only converts).
+  The format is therefore not traceable from this binary.
+- *Cache* (read-only, 2026-11-21): none of the 392 cached document indexes lists a
+  `.searchablepages` file or any other search/word-index entry (suffixes: `.rm` 4,699,
+  `.metadata` 392, `.content` 367, `.pagedata` 118, `.pdf` 112, `.epub` 5), so the
+  cloud does not carry it either: it is presumably made and kept on a tablet that has
+  handwriting search [I]. No public description of it was found.
+- *The search side that exists.* `DocumentSearchController` (`documentsearchcontroller.cpp`)
+  runs "searchMixed" — "Doing hws inside doc search {} from page {} there is {}
+  documentSearcher" — only when a `LibrarySearcher` was given to
+  `forwardLibrarySearcher` (slot 20). `LibrarySearcher` is a QObject with no members of
+  its own (moc 0x140e9c430, smc 0x140ba4f60); the desktop QML never calls
+  `forwardLibrarySearcher`, so on the desktop hws never runs. Its results are
+  `ContentSearchResults{order, origSearchStr, docWordHits, details}` and per page
+  `PageSearchDetails(pageNumber, wordStrokes, typedSpans)` (`pagesearchdetails.cpp`,
+  0x140508960). `typedSpans` come from `tokenSpansToWordSpans` (0x140509370): the page
+  text split on `\s+`, spans of (first token, token count) turned into character spans.
+  `wordStrokes` is a vector of `xofm::libs::search::WordStrokes`, each a list of scene
+  item ids (CrdtIds: `extractAllWordStrokes` 0x1408158a0 pushes 16-byte ids through its
+  two lambdas 0x140814f10/0x140814f30).
+- *Highlights.* `searchAndHighlightPages` (0x1405eeac0) → `emitWordStrokesFromScene`
+  (0x1405eb980; "Unable to get a Scene lock, skipping word stroke highlighting on page
+  {}") → `accumulateHandwrittenHighlights` (0x1405e9be0): for each WordStrokes the
+  scene is walked (0x1405f7640) with the lambda 0x1405f2a00: an item whose id is in the
+  set contributes its bounding rect (0x140b3d760) translated by its group's offset
+  (+0x1f0, the anchor position for text-anchored groups); the rects of one word are
+  united into one highlight, kept with `y + height · 4/3` (0x140c8d528 / 0x140c8d420) of
+  the last item as its key. A word none of whose ids is on the page logs "didn't find
+  scene nodes corresponding to wordStrokes {}" and gives nothing.
+- *`SearchIndexUpdated`.* `Notifications::onNotificationReceived` (0x1402e9270)
+  compares the message type with "SearchIndexUpdated" (0x14101cae8) and emits signal 6
+  `searchIndexUpdated()` (0x1402ef3a0, no arguments); other unknown types log "Received
+  an unknown notification from server". Nothing connects to signal 6 (its only
+  references are the emitter and the moc dispatcher; no desktop QML handler).
+- *Client:* unchanged (handwriting is not searched; a `SearchIndexUpdated` message is
+  one more notification the live-sync listener, §3.6, ignores). Building it needs the
+  file's real bytes from a tablet that has handwriting search: the match and highlight
+  rules above would then apply as traced.
+
 **Tables of contents.** `LibraryController.loadTableOfContents(entry::Id)` (moc slot;
 the document worker's `LoadTableOfContents` job, `requestLoadTableOfContents`
 0x14056c7d0 → `doLoadTableOfContents` 0x14055e090, `LoadToCTask`) ends in the
