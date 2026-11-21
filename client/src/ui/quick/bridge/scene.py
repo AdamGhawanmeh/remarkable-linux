@@ -1504,6 +1504,17 @@ class _Controller:
         if self.view is not None:
             self.view.paste_items(int(layer), _js(items), float(scale_factor), QPointF(pos))
 
+    @Slot("QVariant")
+    def insertItemsAtCursorPosition(self, items) -> None:
+        """Ctrl+V in text mode with strokes or images copied (DocumentViewport's paste
+        action when Clipboard.lastCopiedType is Items). The app (0x1404425c0) posts a
+        SceneInsertItemsAfterActionCrdt to the page's worker: the items go in a group
+        anchored to the text after the cursor. Here they are placed with their box's
+        top-left at the caret (kept on the paper), unanchored, as pen strokes on a page
+        with text are here: one undo step, pending edits, then the selection."""
+        if self.view is not None:
+            self.view.insert_items_at_cursor(_js(items) or [])
+
     @Slot("QVariant", result=bool)
     def shouldPasteClipboardContentInTextMode(self, content) -> bool:
         """Text (or HTML) is pasted as text; a picture copied in another program, which
@@ -2641,6 +2652,30 @@ class _SceneView:
                                        layer_index=layer)
             return bytes.fromhex(edit.key)
         self._run_insertion(page_id, insert)
+
+    def insert_items_at_cursor(self, items) -> None:
+        """SceneController.insertItemsAtCursorPosition: what was typed is kept first (so
+        undo takes the items, then the text), then the items are pasted at the caret."""
+        bounds = editing.items_bounds(items) if items else None
+        if not bounds:
+            return
+        c = self._controller
+        caret = c._get("textCursorPosition")
+        caret = QPointF(caret) if isinstance(caret, QPointF) else QPointF()
+        scale = 1.0 / float(self._get("defaultScale") or 1.0)
+        width, height = bounds[2] * scale, bounds[3] * scale
+        frame = c._get("primaryContentRect")
+        frame = QRectF(frame) if isinstance(frame, QRectF) and not frame.isEmpty() else QRectF(PORTRAIT)
+        left = min(max(caret.x(), frame.left()), max(frame.left(), frame.right() - width))
+        pos = QPointF(left + width / 2, caret.y() + height / 2)
+        layer = self._active_layer()
+
+        def paste() -> None:
+            self.paste_items(layer, items, scale, pos)
+        if self.text_session is not None:
+            self._keep_text(then=paste)
+        else:
+            paste()
 
     def delete_selection(self, layer: int) -> None:
         target = self._selection_target(layer)

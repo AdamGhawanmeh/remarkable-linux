@@ -450,6 +450,11 @@ class AuthClient:
             return True
         return exp - self.settings.refresh_margin_s <= self._clock()
 
+    def cached_user_token(self) -> str:
+        """The user token held now, without any request ("" when there is none)."""
+        with self._lock:
+            return self._state.user_token or ""
+
     def get_user_token(self, force: bool = False) -> str:
         """Return a valid user token, renewing it first if it is expired or about to."""
         with self._lock:

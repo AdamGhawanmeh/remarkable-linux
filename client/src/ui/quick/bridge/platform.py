@@ -7,6 +7,8 @@ does not have (app updates, What's new, scanning, page editing) report
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import json
 import logging
 import os
@@ -764,10 +766,72 @@ class UserInfo(QObject):
 
     def __init__(self, email: str = "", parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self._values = {"id": "", "name": "", "username": "", "email": email, "tectonic": ""}
+        self._values = {"id": "", "name": "", "username": "", "email": email, "tectonic": "",
+                        "subscriptionLevel": ""}
         self._account_type = 2
         self._created_at = 0
+        self._scopes: list[str] = []
         self._client_edit = False
+
+    # Subscription levels that are not a subscription (an assumption: the getter of
+    # isSubscribed was not traced; the cache's token says "connect" for Connect).
+    UNSUBSCRIBED = ("", "free", "none")
+
+    def set_from_token(self, token: str) -> bool:
+        """Fill in the user from the user token's claims, as the app's
+        legacy.cpp parseUserToken / toUserInfoData read them: "auth0-profile" {UserID,
+        Name, Nickname, Email, CreatedAt}, "scopes", "level" (subscriptionLevel),
+        "tectonic"; the account type is Google or Facebook as the UserID names one
+        (0x1403735cd, 0x140373613), else Undefined. False (and nothing changed) when the
+        token is not a JWT. Nothing of it is logged."""
+        from core.auth import decode_jwt_claims
+        try:
+            claims = decode_jwt_claims(token or "")
+        except ValueError:
+            log.info("Invalid user token: not a JWT")
+            return False
+        profile = claims.get("auth0-profile")
+        profile = profile if isinstance(profile, dict) else {}
+        text = lambda v: v if isinstance(v, str) else ""          # noqa: E731
+        user_id = text(profile.get("UserID")) or text(claims.get("sub"))
+        self.setId(user_id)
+        self.setName(text(profile.get("Name")))
+        self.setUsername(text(profile.get("Nickname")))
+        self.setEmail(text(profile.get("Email")))
+        self.setTectonic(text(claims.get("tectonic")))
+        lowered = user_id.lower()
+        self.setAccountType(0 if "google" in lowered else 1 if "facebook" in lowered else 2)
+        scopes = claims.get("scopes")
+        self._scopes = scopes.split() if isinstance(scopes, str) else [str(x) for x in scopes or []] \
+            if isinstance(scopes, list) else []
+        self.scopesChanged.emit(list(self._scopes))
+        created = text(profile.get("CreatedAt"))
+        try:
+            stamp = datetime.fromisoformat(created.replace("Z", "+00:00")) if created else None
+            self.setCreatedAt(int(stamp.timestamp() * 1000) if stamp is not None else 0)
+        except ValueError:
+            self.setCreatedAt(0)
+        self.setSubscriptionLevel(text(claims.get("level")))
+        log.info("user info set from the user token (account type %s)", self.getAccountTypeString() or "Undefined")
+        return True
+
+    def clear(self) -> None:
+        """Logged out: no user."""
+        for setter in (self.setId, self.setName, self.setUsername, self.setEmail, self.setTectonic,
+                       self.setSubscriptionLevel):
+            setter("")
+        self.setAccountType(2)
+        self.setCreatedAt(0)
+        self._scopes = []
+        self.scopesChanged.emit([])
+
+    @Slot(str)
+    def setSubscriptionLevel(self, value: str) -> None:
+        was = self.isSubscribed
+        self._values["subscriptionLevel"] = value
+        self.subscriptionLevelStringSet.emit()
+        if was != self.isSubscribed:
+            self.isSubscribedChanged.emit()
 
     def _value(key: str):
         return lambda self: self._values[key]
@@ -821,9 +885,12 @@ class UserInfo(QObject):
     username = Property(str, _value("username"), notify=usernameChanged)
     email = Property(str, _value("email"), setEmail, notify=emailChanged)
     accountType = Property(int, lambda self: self._account_type, setAccountType, notify=accountTypeChanged)
-    subscriptionLevel = Property(str, lambda self: "", notify=subscriptionLevelStringSet)
+    subscriptionLevel = Property(str, _value("subscriptionLevel"), notify=subscriptionLevelStringSet)
     tectonic = Property(str, _value("tectonic"), notify=tectonicChanged)
-    isSubscribed = Property(bool, lambda self: False, notify=isSubscribedChanged)
+    isSubscribed = Property(bool, lambda self: self._values["subscriptionLevel"].lower() not in UserInfo.UNSUBSCRIBED,
+                            notify=isSubscribedChanged)
+    scopes = Property("QStringList", lambda self: list(self._scopes), notify=scopesChanged)
+    createdAt = Property("qlonglong", lambda self: self._created_at, notify=createdAtChanged)
 
     @Slot(result=str)
     def getAccountTypeString(self) -> str:
@@ -831,7 +898,9 @@ class UserInfo(QObject):
 
     @Slot(result=int)
     def daysSinceCreation(self) -> int:
-        return 0
+        if not self._created_at:
+            return 0
+        return max(0, int((datetime.now(timezone.utc).timestamp() * 1000 - self._created_at) // 86_400_000))
 
 
 class NetworkClient(QObject):

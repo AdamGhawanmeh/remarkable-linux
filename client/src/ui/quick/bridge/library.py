@@ -512,6 +512,8 @@ class EntryWrapper(QObject):
             return self._status_override
         if self._export_progress() is not None:
             return int(EntryWrapper.Status.Exporting)
+        if self._library.downloading(self._node.id):
+            return int(EntryWrapper.Status.Downloading)
         upload = self._library.upload_status(self._node.id)
         return upload[0] if upload is not None else _OK
 
@@ -532,7 +534,7 @@ class EntryWrapper(QObject):
                            if self._node.metadata.created_time else "", notify=createdTextChanged)
     createdTime = Property("qlonglong", lambda self: _ms(self._node.metadata.created_time), notify=createdTimeChanged)
     isExporting = Property(bool, lambda self: self._export_progress() is not None, notify=statusChanged)
-    isDownloading = Property(bool, lambda self: False, notify=statusChanged)
+    isDownloading = Property(bool, lambda self: self._library.downloading(self._node.id), notify=statusChanged)
     isExcludedFromSync = Property(bool, lambda self: False, notify=excludedFromSyncChanged)
     isNew = Property(bool, _is_new, notify=isNewChanged)
     source = Property(str, lambda self: "", notify=sourceChanged)
@@ -913,6 +915,11 @@ class Library(QObject):
     """The Library singleton (xofm::libs::library::qml::LibraryFacade)."""
 
     downgradeDetected = Signal()
+    # An export or a download began or ended (DocumentSelection's includesExporting and
+    # includesDownloading follow it).
+    busyChanged = Signal()
+    # From any thread: a download of an entry's files began (True) or ended.
+    downloadActivity = Signal(str, bool)
     entriesDeleted = Signal("QStringList")
     entriesRestored = Signal("QStringList")
     entriesTrashed = Signal("QStringList")
@@ -933,6 +940,8 @@ class Library(QObject):
         self._retired: list[EntryWrapper] = []
         self._ready = False
         self._exports: dict[str, float] = {}       # document id -> export progress, 0..1
+        self._downloads: dict[str, int] = {}       # document id -> downloads running
+        self.downloadActivity.connect(self.set_downloading)    # queued from workers
         # Reading positions (lastOpenedPage, lastOpened) not in the tree yet, by document id:
         # shown at once, saved to the cloud shortly after the document is closed.
         self._reading: dict[str, dict[str, int]] = {}
@@ -1033,6 +1042,26 @@ class Library(QObject):
                     and str(record.get("lastOpened", raw.get("lastOpened"))) == str(raw.get("lastOpened"))):
                 del self._reading[doc_id]
 
+    def downloading(self, entry_id: str) -> bool:
+        """Whether files of `entry_id` are being downloaded (Entry.Downloading)."""
+        return self._downloads.get(entry_id, 0) > 0
+
+    @Slot(str, bool)
+    def set_downloading(self, entry_id: str, active: bool) -> None:
+        """A download of files of `entry_id` began or ended (LibrarySource's download
+        listener; counted, as several pages may be fetched at once)."""
+        was = self.downloading(entry_id)
+        count = self._downloads.get(entry_id, 0) + (1 if active else -1)
+        if count > 0:
+            self._downloads[entry_id] = count
+        else:
+            self._downloads.pop(entry_id, None)
+        if was != self.downloading(entry_id):
+            entry = self._entries.get(entry_id)
+            if entry is not None:
+                entry.statusChanged.emit()
+            self.busyChanged.emit()
+
     def export_progress(self, entry_id: str) -> float | None:
         """How far the export of `entry_id` is (0..1), or None if it is not being exported."""
         return self._exports.get(entry_id)
@@ -1045,6 +1074,8 @@ class Library(QObject):
             self._exports.pop(entry_id, None)
         else:
             self._exports[entry_id] = min(max(float(progress), 0.0), 1.0)
+        if was_exporting != (progress is not None):
+            self.busyChanged.emit()
         entry = self._entries.get(entry_id)
         if entry is None:
             return
@@ -1214,8 +1245,21 @@ class DocumentSelection(QObject):
     stash = Property(str, lambda self: self._stash, notify=selectionChanged)
     hasContent = Property(bool, lambda self: bool(self._ids), notify=selectionChanged)
     hasStash = Property(bool, lambda self: bool(self._stash), notify=selectionChanged)
-    includesDownloading = Property(bool, lambda self: False, notify=selectionChanged)
-    includesExporting = Property(bool, lambda self: False, notify=selectionChanged)
+    def _busy(self, what: str) -> bool:
+        library = _current_library()
+        if library is None:
+            return False
+        test = library.downloading if what == "download" else (lambda i: library.export_progress(i) is not None)
+        return any(test(n.id) for n in self._nodes() if not n.is_folder)
+
+    @Slot()
+    def busy_changed(self) -> None:
+        """Library.busyChanged: an export or download of an entry began or ended."""
+        self.selectionChanged.emit()
+
+    # ActionManager's rename/move/delete/export/... are off while these are set.
+    includesDownloading = Property(bool, lambda self: self._busy("download"), notify=selectionChanged)
+    includesExporting = Property(bool, lambda self: self._busy("export"), notify=selectionChanged)
     includesFolders = Property(bool, lambda self: any(n.is_folder for n in self._nodes()), notify=selectionChanged)
     includesOnlyPinned = Property(bool, lambda self: bool(self._ids) and all(n.pinned for n in self._nodes()),
                                   notify=selectionChanged)

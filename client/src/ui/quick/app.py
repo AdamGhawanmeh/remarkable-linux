@@ -150,6 +150,10 @@ class QuickApp:
         s.recognizer.online = lambda: (self.logged_in and not self.source.cached_only
                                        and not self.closing and not s.link.known_offline)
         toc_bridge.set_controller(s.controller)     # the injected contents panel asks it
+        # Entry.Downloading and DocumentSelection.includesDownloading/includesExporting:
+        # files fetched for a document (any thread) and exports, as ActionManager reads them.
+        source.download_listener = lambda doc_id, active: self.library.downloadActivity.emit(doc_id, bool(active))
+        self.library.busyChanged.connect(s.selection.busy_changed)
         self.engine: QQmlApplicationEngine | None = None
         self.translator: QTranslator | None = None
         self.thumbnails: ThumbnailImageProvider | None = None
@@ -240,8 +244,16 @@ class QuickApp:
             return
         self.account.login(code)
 
+    def _update_user_info(self) -> None:
+        """UserInfo (id, name, email, account type, subscription) from the user token
+        held; nothing when there is none."""
+        token = self.auth.cached_user_token() if hasattr(self.auth, "cached_user_token") else ""
+        if token:
+            self.singletons.user_info.set_from_token(token)
+
     def _logged_in(self) -> None:
         log.info("logged in")
+        self._update_user_info()
         self.singletons.authentication.succeeded()
         self._go_online(sync=self.sync_on_login)
 
@@ -280,6 +292,7 @@ class QuickApp:
         from ..pdflock import forget
         forget()
         self.library.set_tree(DocumentTree(), reset=True)
+        self.singletons.user_info.clear()
         self.singletons.authentication.logged_out()
 
     def _unauthorized(self, message: str) -> None:
@@ -418,6 +431,7 @@ class QuickApp:
         cleared)."""
         self.set_tree(self.source.load_cached())
         if self.logged_in:
+            self._update_user_info()
             # Offline (cached_only) a "sync" would only reload the cache just shown.
             self._go_online(sync and not self.source.cached_only)
         self.outgoing.start()

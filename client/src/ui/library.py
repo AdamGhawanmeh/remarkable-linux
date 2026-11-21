@@ -415,6 +415,9 @@ class LibrarySource:
         # Documents worked out with their pending edits, by id: (key, Staged).
         self._staged: dict[str, tuple[tuple, Staged]] = {}
         self._history_lock = threading.RLock()
+        # (document id, True when a download of its files begins / False when it ends),
+        # called on the thread that reads the file (the app shows Entry.Downloading).
+        self.download_listener: Callable[[str, bool], None] | None = None
         # Documents made here (createDocument, Quick sheets) until the cloud has them, by
         # id: their node, files and folder, and whether their upload has started.
         self._created: dict[str, dict] = {}
@@ -461,7 +464,14 @@ class LibrarySource:
         created = self._created.get(doc.id)
         if created is not None and name in created["files"]:
             return created["files"][name]
-        return self.sync.get_blob(doc.files[name], name, cached_only=self.cached_only)
+        blob_hash, listener = doc.files[name], self.download_listener
+        if listener is None or self.cached_only or self.sync.blobs.has(blob_hash):
+            return self.sync.get_blob(blob_hash, name, cached_only=self.cached_only)
+        listener(doc.id, True)          # not cached: downloaded now (Entry.Downloading)
+        try:
+            return self.sync.get_blob(blob_hash, name, cached_only=self.cached_only)
+        finally:
+            listener(doc.id, False)
 
     # -- documents made here (core.create) ------------------------------------------
 

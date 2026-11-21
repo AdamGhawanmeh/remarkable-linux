@@ -1561,8 +1561,8 @@ line goes through the usual RDP thinning and is kept as one StrokeAdd. Points ar
 along the segment by the length drawn up to them, as 0x14046be20 does, not projected.
 **Deviation**: shapes (types 2–5) are not made, as their recogniser is not in this binary.
 
-Not traced yet: sync upload rules, `insertItemsAtCursorPosition` (paste in text mode),
-which tablet operation writes a moved stroke with one generation of ids, and the tablet-side
+Not traced yet: sync upload rules (`insertItemsAtCursorPosition`, paste in text mode, is
+§5.13), which tablet operation writes a moved stroke with one generation of ids, and the tablet-side
 hold detection and shape recogniser that drive `ShapesOverlay`.
 
 Validation: a real library's v6 pages (hundreds of thousands of strokes, up to 22 layers) parse with zero errors.
@@ -2707,6 +2707,53 @@ the strokes deleted.
 
 Verified offline only (tests/test_handwriting_offline.py, a fake recogniser in
 tests/fakecloud.py answering synthetic JIIX); never sent to the real cloud.
+
+### 5.13 Bridge polish: paste in text mode, UserInfo, busy entries, thumbnails
+
+**Paste of strokes in text mode** (`SceneController::insertItemsAtCursorPosition`,
+0x1404425c0; the moc dispatcher's slot order puts it after `createImageSnippetFromStroke`
+0x14043c090). DocumentViewport's paste action calls it instead of `pasteLines()` when
+text mode is on and the clipboard last took items. It does nothing for an empty list,
+then posts a `std::function<bool(Scene*)>` (RTTI `<lambda_1>@…insertItemsAtCursorPosition`)
+to the page's worker that adds a `SceneInsertItemsAfterActionCrdt`: the items go in a
+group anchored to the text after the cursor (strings "copied {} anchored groups along with
+the text", "anchored %lld items total"), one undoable action. Client
+(`_SceneView.insert_items_at_cursor`): what was typed is kept first, then the items are
+pasted (`paste_items`: one StrokePaste/ImageInsert action, pending edits, the pasted
+items selected) with their box's top-left at the caret (`textCursorPosition`), scaled by
+1/`defaultScale` as `pasteLines` does and kept on the paper horizontally.
+**Deviation**: unanchored (the client writes no anchored groups; pen strokes on pages
+with text are unanchored here too), so they do not move when the text above reflows.
+
+**UserInfo from the user token** (`src/xofm/libs/user/src/legacy.cpp` parseUserToken →
+toUserInfoData, rm.user.legacy): the JWT's `auth0-profile` {`UserID` → id, `Name` → name,
+`Nickname` → username, `Email` → email, `CreatedAt` → createdAt}, `scopes`, `level` →
+subscriptionLevel ("Subscription changed from: {} to: {}"), `tectonic`. The account
+type is Google when the UserID names "google" (0x1403735cd), Facebook for "facebook"
+(0x140373613), else Undefined (the comparing import at 0x140c700f8 was not resolved: the
+client tests "contains", which also covers a prefix). The claim names were checked
+read-only against the cached token's structure (key names only). `isSubscribed`'s
+getter was not traced: the client reads a level other than "", "free" or "none" as
+subscribed. `QuickApp` fills UserInfo at start and on log-in (`AuthClient
+.cached_user_token`, no request) and clears it on log-out; nothing of it is logged.
+
+**Busy entries.** ActionManager turns copy, move, delete, rename, export and share off
+while `selection.includesExporting` / `includesDownloading` (DocumentSelection) are set;
+LibraryHelpers and ContentEntriesBase also read `Entry.isExporting` / `isDownloading`.
+Client: `Library.set_downloading` counts downloads per document, fed by
+`LibrarySource.download_listener`, which `LibrarySource.blob` calls (begin, end, also on
+failure) only when a file is not in the blob cache and the library is online; the entry
+then reads `Entry.Downloading` (8) and `isDownloading`. Exports already set
+`isExporting`. `Library.busyChanged` re-emits the selection's `selectionChanged`, so the
+two `includes*` flags follow both.
+
+**Thumbnails after editing** (`requestDeferredCompleted`, called by DocumentViewport on
+close and by DocumentView when the page overview opens, "Make sure that thumbnail gets
+updated"). Checked: a page edited here and not uploaded already gets a new thumbnail
+source (`image://rmthumb/<id>/<page>?v=…`) by the time the document closes, as the
+library's node for it changes with the pending edits (test
+`test_an_edited_page_not_uploaded_gets_a_new_thumbnail_on_close`), so the slot stays a
+no-op here.
 
 ## 6. Implications for the Linux client
 
