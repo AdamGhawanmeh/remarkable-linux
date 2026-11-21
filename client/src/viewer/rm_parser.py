@@ -531,10 +531,13 @@ class ImageItem:
 class PageScene:
     version: int
     layers: list[Layer] = field(default_factory=list)
-    # Added to raw x to get page coordinates (v6 is centred).
+    # Added to raw x to get page coordinates (v6 is centred: half the paper width).
     x_origin: float = 0.0
-    width: int = PAGE_WIDTH
-    height: int = PAGE_HEIGHT
+    # The page's paper size (v6: SceneInfo fields 8, 7, 5 as the app's loader resolves
+    # them, paper_size_of; 1404 x 1872 when the page does not say). Page coordinates
+    # span [0, width] x [0, height]; the scene's x = 0 is the paper's centre line.
+    width: float = PAGE_WIDTH
+    height: float = PAGE_HEIGHT
     text: TextBlock | None = None
     images: list[ImageItem] = field(default_factory=list)
     # Every v6 block seen, by block type.
@@ -704,6 +707,43 @@ def _lww_string(sub: bytes) -> str:
 
 def _lww_bool(sub: bytes) -> bool:
     return bool(_field(_read_fields(sub), 2, TAG_BYTE1, "visible").raw)
+
+
+DEFAULT_PAPER = (float(PAGE_WIDTH), float(PAGE_HEIGHT))
+
+
+def paper_size_of(fields: dict[int, _Field]) -> tuple[float, float]:
+    """The paper size a SceneInfo (0x0D) gives its page, as reMarkable.exe 3.29's reader
+    (0x1409ef220) resolves it. Field 8 is the size itself, a last-write-wins pair of
+    f64 that Scene::setPaperSize (0x1408aa520) stamps with the next id; the writer
+    (0x1409f92f0) also stores it as field 5 (two u32, rounded) and field 7 (two f64).
+    The loader starts from 1404 x 1872 at 0:0 (0x140a04225); when field 8 is absent or
+    stamped 0:0 (counter 0), field 7 is taken if both are > 0, else field 5 if both
+    are >= 1. Fields not shaped so are passed over, as a page without them is."""
+    size, stamped = DEFAULT_PAPER, False
+    f8 = fields.get(8)
+    if f8 is not None and f8.type == TAG_LENGTH4:
+        try:
+            inner = _read_fields(f8.raw)
+        except (RmParseError, struct.error, IndexError):
+            inner = {}
+        stamp, value = inner.get(1), inner.get(2)
+        if value is not None and value.type == TAG_LENGTH4 and len(value.raw) == 16:
+            size = struct.unpack("<dd", value.raw)
+            stamped = stamp is not None and stamp.type == TAG_ID and stamp.raw[1] != 0
+    if stamped:
+        return size
+    f7 = fields.get(7)
+    if f7 is not None and f7.type == TAG_LENGTH4 and len(f7.raw) == 16:
+        width, height = struct.unpack("<dd", f7.raw)
+        if width > 0 and height > 0:
+            return width, height
+    f5 = fields.get(5)
+    if f5 is not None and f5.type == TAG_LENGTH4 and len(f5.raw) == 8:
+        width, height = struct.unpack("<ii", f5.raw)
+        if width >= 1 and height >= 1:
+            return float(width), float(height)
+    return size
 
 
 def _decode_points(data: bytes, block_version: int) -> list[Point]:
@@ -1103,6 +1143,7 @@ def _parse_v6(data: bytes) -> PageScene:
     visible: dict[tuple, bool] = {}
     background_visible = True
     root_document_visible = True
+    paper = DEFAULT_PAPER
     current_layer: tuple[int, int] | None = None
     tree_moves: list[tuple[tuple, tuple, tuple]] = []  # (move_id, target_node, parent)
     root_groups_file_order: list[tuple] = [] # child node ids under the root, in file order
@@ -1180,6 +1221,7 @@ def _parse_v6(data: bytes) -> PageScene:
                     background_visible = _lww_bool(f[2].raw)
                 if 3 in f and f[3].type == TAG_LENGTH4:
                     root_document_visible = _lww_bool(f[3].raw)
+                paper = paper_size_of(f)
             elif block_type == BLOCK_IMAGE_ITEM:
                 # Same item header as other scene items; the value is kept raw.
                 f = _read_fields(payload)
@@ -1331,7 +1373,7 @@ def _parse_v6(data: bytes) -> PageScene:
                 result.insert(0, Layer(name="Root", node_id=ROOT_NODE))
             target = result[0]
         target.glyphs.append(glyph)
-    return PageScene(version=6, layers=result, x_origin=PAGE_WIDTH / 2, text=text,
+    return PageScene(version=6, layers=result, x_origin=paper[0] / 2, width=paper[0], height=paper[1], text=text,
                      images=live_images, block_counts=counts, skipped_blocks=skipped,
                      background_visible=background_visible, root_document_visible=root_document_visible,
                      current_layer=current_layer)

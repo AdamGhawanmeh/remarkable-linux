@@ -57,12 +57,11 @@ from PySide6.QtCore import QModelIndex, QRectF
 from ui.pdftext import MIN_BOX_PT, pdf_frame, selection_boxes, to_scene
 from ui.pdftext import solid as _solid
 from viewer.renderer import BASELINE_AT, caret_x, layout_text, qt_measure
-from viewer.rm_parser import PAGE_WIDTH, PageScene
+from viewer.rm_parser import PageScene
 
 log = logging.getLogger("rm.ui.docsearch")
 
 PDF_PX_PER_PT = 226 / 72
-HALF_WIDTH = PAGE_WIDTH / 2
 
 
 # -- matching ---------------------------------------------------------------------------
@@ -188,7 +187,7 @@ def text_hits(scene: PageScene | None, term: str, measure=qt_measure) -> list[li
     if not found:
         return []
     lines = layout_text(scene, measure)
-    origin = HALF_WIDTH       # page -> scene, as the viewer places pages (bridge/scene.to_scene)
+    origin = scene.x_origin   # page -> scene: half the page's paper width (bridge/scene.to_scene)
     hits = []
     for start, end in found:
         metrics = []

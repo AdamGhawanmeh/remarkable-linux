@@ -9,9 +9,12 @@ top-aligned. An A4 page is therefore 1868 px wide, wider than the 1404 px screen
 Verified against real annotated A4 and US Letter PDFs (handwriting lands in the form
 boxes); fit-to-page and fit-width placements visibly do not (ARCHITECTURE.md §5.2).
 
-Page frame: the area a page "is": the PDF page for PDF-backed pages, else the
-1404 × 1872 screen page. Thumbnails clip to it; the viewer shows the frame plus any
-ink or text beyond it.
+Page frame: the area a page "is": the PDF page for PDF-backed pages, else the page's
+paper (its SceneInfo paper size, 1404 × 1872 unless it says otherwise: 1620 × 2160,
+954 × 1696 or any other the tablet set, ARCHITECTURE.md §5.6). Page coordinates put the
+paper's top left at (0, 0), so the scene's x = 0, the paper's centre line, is page
+x = width / 2. Thumbnails clip to the frame; the viewer shows the frame plus any ink or
+text beyond it.
 """
 
 from __future__ import annotations
@@ -84,12 +87,13 @@ class PdfFile:
             self.doc.close()
 
 
-def pdf_target_rect(page_size: QSizeF) -> QRectF:
-    """Where a PDF page of `page_size` points lands, in page pixels."""
+def pdf_target_rect(page_size: QSizeF, paper: tuple[float, float] = (PAGE_WIDTH, PAGE_HEIGHT)) -> QRectF:
+    """Where a PDF page of `page_size` points lands, in page pixels of a page whose
+    paper is `paper` (the PDF is centred on the scene's x = 0, page x = paper width / 2)."""
     if page_size.width() <= 0 or page_size.height() <= 0:
-        return QRectF(0, 0, PAGE_WIDTH, PAGE_HEIGHT)
+        return QRectF(0, 0, paper[0], paper[1])
     w, h = page_size.width() * PDF_PX_PER_PT, page_size.height() * PDF_PX_PER_PT
-    return QRectF(PAGE_WIDTH / 2 - w / 2, 0, w, h)
+    return QRectF(paper[0] / 2 - w / 2, 0, w, h)
 
 
 @dataclass
@@ -104,10 +108,22 @@ class PageContent:
         return (self.pdf is not None and self.pdf_page is not None
                 and 0 <= self.pdf_page < self.pdf.page_count)
 
+    @property
+    def paper(self) -> tuple[float, float]:
+        """The page's paper size (PageScene.width x height; 1404 x 1872 without a file)."""
+        if self.scene is None:
+            return float(PAGE_WIDTH), float(PAGE_HEIGHT)
+        return float(self.scene.width), float(self.scene.height)
+
+    @property
+    def origin(self) -> float:
+        """Page x of the scene's x = 0: half the paper's width."""
+        return self.paper[0] / 2
+
     def frame(self) -> QRectF:
         if self.has_pdf_page:
-            return pdf_target_rect(self.pdf.page_size(self.pdf_page))
-        return QRectF(0, 0, PAGE_WIDTH, PAGE_HEIGHT)
+            return pdf_target_rect(self.pdf.page_size(self.pdf_page), self.paper)
+        return QRectF(0, 0, *self.paper)
 
     def bounds(self, crop: str) -> tuple[float, float, float, float]:
         """"clip": the page frame; "page": the frame plus any ink/text beyond it."""
@@ -152,7 +168,7 @@ def render_content(content: PageContent, scale: float, crop: str = "page", backg
         painter.scale(scale, scale)
         painter.translate(-x, -y)
         if background and content.template is not None and not content.has_pdf_page:
-            paint_template(painter, content.template, (x, y, w, h))
+            paint_template(painter, content.template, (x, y, w, h), *content.paper)
         if background and content.has_pdf_page:
             _draw_pdf_page(painter, content)
         if content.scene is not None:

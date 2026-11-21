@@ -860,6 +860,60 @@ class LibrarySource:
         self._add_edit(doc, PageTemplate.new(doc.id, page_id, template, now_ms))
         return True
 
+    def page_paper(self, doc: Document, page_id: str) -> tuple[float, float]:
+        """The paper size of a page as it is now (pending edits included): its SceneInfo's
+        (rm_layer.paper_size), 1404 x 1872 for a page with no file."""
+        created = self._created_page(doc.id, page_id)
+        if created is not False:
+            return rm_layer.paper_size(created)
+        return rm_layer.paper_size(self.staged(self._editable(doc, page_id)).replay(page_id).page)
+
+    def _created_page(self, doc_id: str, page_id: str):
+        """The .rm of a page of a document made here whose upload has not started (None
+        when it has none), or False when the document is not such a document or its
+        .content does not list the page (a page added later is a pending edit)."""
+        with self._lock:
+            created = self._created.get(doc_id)
+            if created is None or created["uploading"] or doc_id in self.sync.tree:
+                return False
+            if not any(p.id == page_id for p in created["node"].content.pages):
+                return False
+            return created["files"].get(f"{doc_id}/{page_id}.rm")
+
+    def set_page_paper(self, doc: Document, page_id: str, paper: tuple[float, float], now_ms: int) -> bool:
+        """Scene::setPaperSize (0x1408aa520) on a page, as the app's template and
+        Quick sheets tasks and doAddPage run it: nothing when the page already has that
+        size (qFuzzyCompare), else SceneInfo field 8 takes the size, stamped with the
+        page's next id, and fields 5 and 7 follow it (rm_layer.set_scene_info). A page
+        with no file gets one then (an empty page of that paper size). Not an undo step,
+        and lastModified does not move for it. A document made here and not uploaded
+        yet gets the page file at once; otherwise it is a pending SceneFlags edit.
+        Whether anything changed."""
+        paper = (float(paper[0]), float(paper[1]))
+        if not (paper[0] > 0 and paper[1] > 0):
+            raise EditError(f"invalid paper size {paper[0]:g} x {paper[1]:g}")
+        created = self._created_page(doc.id, page_id)
+        if created is not False:
+            page = rm_layer.set_scene_info(created, author=self.sync.author(), paper=paper)
+            if page is None or page == created:
+                return False
+            with self._lock:
+                entry = self._created.get(doc.id)
+                if entry is None or entry["uploading"]:
+                    raise EditError("the document is being uploaded")
+                files = {**entry["files"], f"{doc.id}/{page_id}.rm": page}
+                entry.update(files=files, node=self._created_node(doc.id, files))
+                self._staged.pop(doc.id, None)
+                self._scenes.clear()
+            return True
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            before = self.staged(doc).replay(page_id)
+            if rm_layer.same_paper(paper, rm_layer.paper_size(before.page)):
+                return False
+            self._add_edit(doc, SceneFlags.new(doc.id, page_id, now_ms, paper_size=paper))
+        return True
+
     def add_page(self, doc: Document, index: int, template: str, now_ms: int, page_uuid: str = "") -> PageAdd:
         """Add an empty page at `index` (past the end or negative: at the end, as
         doAddPage clamps it), here only until pushed. The app passes the template; the

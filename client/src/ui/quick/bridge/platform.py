@@ -989,30 +989,38 @@ class DocumentController(QObject):
         """The page's template (LibrarySource.set_page_template: written only when it
         differs; lastModified moves), as the app's template task makes it. With a paper
         size, as the new-notebook dialog and Quick sheets pass Settings.paperSize, the
-        app also sets the page scene's paper size; an empty size refuses the whole call
-        ("invalid paper size when setting template"). A page's paper size here is the
-        scene default, 1404 x 1872 (every cached page has it): setting that one changes
-        nothing (Scene::setPaperSize compares first, 0x1408aa520); another one is not
-        made yet and is only logged."""
+        task first sets the page scene's paper size (functor 0x14068d6e0 ->
+        Scene::setPaperSize 0x1408aa520: nothing when the page has that size already,
+        else SceneInfo fields 5, 7, 8; LibrarySource.set_page_paper); an empty size
+        refuses the whole call ("invalid paper size when setting template")."""
+        paper = None
         if paper_size is not None:
             size = QSizeF(paper_size)
             if size.isEmpty():
                 log.warning("setTemplateForPage(%r, page %d): invalid paper size when setting template",
                             document_id, page)
                 return False
-            if (size.width(), size.height()) != PAGE_PAPER_SIZE:
-                self._unsupported(f"setTemplateForPage({document_id!r}, page {page}): paper size "
-                                  f"{size.width():g} x {size.height():g}")
-        return self._edit(document_id, "set template",
-                          lambda source, node: source.set_page_template(node, int(page), str(template or ""),
-                                                                        self._now_ms()),
+            paper = (size.width(), size.height())
+
+        def run(source, node):
+            changed = False
+            if paper is not None:
+                ids = source.page_ids(source.synced(node.id) or node)
+                if 0 <= int(page) < len(ids):
+                    changed = source.set_page_paper(node, ids[int(page)], paper, self._now_ms())
+            return source.set_page_template(node, int(page), str(template or ""), self._now_ms()) or changed
+
+        return self._edit(document_id, "set template", run,
                           None, lambda entry, changed: entry.templatesChanged.emit() if changed else None)
 
     def _add_page(self, document_id: str, insert_index: int = -1, template=None, callback=None,
-                  page_uuid: str = "") -> bool:
+                  page_uuid: str = "", paper=None, paper_from_page: int = -1) -> bool:
         """doAddPage (0x140558ea0): no template given (or an empty one) takes the page
-        before's, or "Blank" at the front. The paper size is the scene's, which a new page
-        does not have until something is drawn on it (no .rm is written for it)."""
+        before's, or "Blank" at the front. The new page's scene then gets a paper size
+        (0x140559533): that of page `paper_from_page` when it is a page of the document,
+        else `paper` when it is a valid size; else it keeps 1404 x 1872. Setting
+        1404 x 1872 writes nothing (Scene::setPaperSize returns at once), so a default
+        page still has no .rm until something is drawn on it."""
         def run(source, node):
             ids = source.page_ids(node)
             index = len(ids) if insert_index < 0 or insert_index > len(ids) else insert_index
@@ -1021,7 +1029,14 @@ class DocumentController(QObject):
                 pages = node.content.pages
                 before = next((p for p in pages if index > 0 and p.id == ids[index - 1]), None)
                 name = before.template if before is not None and before.template else "Blank"
+            size = None
+            if 0 <= paper_from_page < len(ids):
+                size = source.page_paper(node, ids[paper_from_page])
+            elif paper is not None and paper[0] > 0 and paper[1] > 0:
+                size = paper
             edit = source.add_page(node, index, name, self._now_ms(), page_uuid)
+            if size is not None:
+                source.set_page_paper(node, edit.new_id, size, self._now_ms())
             return source.page_ids(node).index(edit.new_id)
 
         return self._edit(document_id, "add page", run, callback,
@@ -1035,7 +1050,12 @@ class DocumentController(QObject):
     @Slot(str, int, str, QSizeF, "QJSValue", str, result=bool)
     def addPageWithTemplateAndPageSize(self, document_id: str, insert_index: int = -1, template=None,
                                        paper_size=None, callback=None, page_uuid: str = "") -> bool:
-        return self._add_page(document_id, insert_index, template, callback, page_uuid)
+        paper = None
+        if paper_size is not None:
+            size = QSizeF(paper_size)
+            if size.isValid():
+                paper = (size.width(), size.height())
+        return self._add_page(document_id, insert_index, template, callback, page_uuid, paper=paper)
 
     @Slot(str, result=bool)
     @Slot(str, int, result=bool)
@@ -1044,7 +1064,8 @@ class DocumentController(QObject):
     @Slot(str, int, str, int, "QJSValue", result=bool)
     def addPageWithTemplateAndPaperSizeFromPage(self, document_id: str, insert_index: int = -1, template=None,
                                                 paper_size_from_page: int = -1, callback=None) -> bool:
-        return self._add_page(document_id, insert_index, template, callback)
+        return self._add_page(document_id, insert_index, template, callback,
+                              paper_from_page=int(paper_size_from_page))
 
     def _external(self, document_id: str, target_id: str, what: str, run, callback=None, moved: bool = False) -> bool:
         """Pages of `document_id` copied (or moved) into another document `target_id`,
@@ -1131,10 +1152,9 @@ class DocumentController(QObject):
     def setPaperSizeForQuickSheetPage(self, document_id: str, size: QSizeF, callback=None) -> bool:
         """DocumentController::setPaperSizeForQuickSheetPage (0x140492cd0 -> 0x140492a80):
         only for the Quick sheets document while it has fewer than 2 pages, it sets the
-        paper size of its first page's scene, then calls back. The scene keeps its size
-        when it is the same (0x1408aa520): with 1404 x 1872, the size every page here
-        has, nothing changes and the callback runs; another size would rewrite the page's
-        SceneInfo, which is not made yet (logged, no callback)."""
+        paper size of its first page's scene (task 0x14068f1c0 -> functor 0x14068d6b0 ->
+        Scene::setPaperSize 0x1408aa520; LibrarySource.set_page_paper), then calls back.
+        The task warns and stops on an invalid size."""
         from core.create import is_quick_sheet
         from .library import tr
         library = self._library
@@ -1147,9 +1167,23 @@ class DocumentController(QObject):
             log.warning("Changing paper size is only allowed for Quick sheets that has one page.")
             return False
         size = QSizeF(size)
-        if (size.width(), size.height()) != PAGE_PAPER_SIZE:
-            self._unsupported(f"setPaperSizeForQuickSheetPage({document_id!r}, {size.width():g} x {size.height():g})")
+        if not size.isValid():
+            log.warning("setPaperSizeForQuickSheetPage(%r): invalid paper size", document_id)
             return False
+        source = self.source()
+        if source is None:
+            return False
+        from core.edits import EditError
+        from core.sync import SyncError
+        try:
+            ids = source.page_ids(source.synced(node.id) or node)
+            if ids:
+                source.set_page_paper(node, ids[0], (size.width(), size.height()), self._now_ms())
+        except (EditError, SyncError) as err:
+            log.warning("setPaperSizeForQuickSheetPage(%r): %s", document_id, err)
+            self.notify(str(err))
+            return False
+        self.refresh()
         log.info("Set paper size for Quick sheet finished")
         if callback is not None and callable(getattr(callback, "call", None)) and not callback.isUndefined():
             QTimer.singleShot(0, self, lambda: callback.call([]))

@@ -140,7 +140,7 @@ def _paint_layer(painter: QPainter, layer: str, content: PageContent,
                        max(1, round(frame.height() * background_scale)))
         painter.drawImage(frame, content.pdf.render(content.pdf_page, pixels))
     elif content.template is not None:
-        paint_template(painter, content.template, bounds)
+        paint_template(painter, content.template, bounds, *content.paper)
     return True
 
 
@@ -346,7 +346,8 @@ def _num(value: float) -> str:
 
 def page_svg(content: PageContent, background_scale: float = 1.0) -> str:
     """One page as an SVG document, in the tablet's page pixels (226 DPI user units): a
-    notebook page is 1404 × 1872, a PDF page its PDF size at 226/72 px per pt, both
+    notebook page is its paper (1404 × 1872 unless its SceneInfo gives another size,
+    such as 1620 × 2160 or 954 × 1696), a PDF page its PDF size at 226/72 px per pt, both
     grown by any ink or text beyond them (the PDF and PNG exports' bounds).
 
     Bottom to top: white paper; the page template (vector paths), or for a PDF-backed
@@ -372,7 +373,7 @@ def page_svg(content: PageContent, background_scale: float = 1.0) -> str:
                    f'y="{_num(frame.y())}" width="{_num(frame.width())}" height="{_num(frame.height())}" '
                    f'preserveAspectRatio="none" href="data:image/png;base64,{data}"/>')
     elif content.template is not None:
-        out += template_svg(content.template, (x, y, w, h))
+        out += template_svg(content.template, (x, y, w, h), *content.paper)
     if content.scene is not None:
         # One decimal: 0.1 page pixel is 0.011 mm, and the file is a tenth smaller.
         out += svg_scene(content.scene, background=PAPER, measure=qt_measure, decimals=1)

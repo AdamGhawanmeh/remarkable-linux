@@ -1780,10 +1780,10 @@ PDF / EPUB-backed):
   |---|---|---|---|
   | 1 | current layer (LWW id) | ✓ | ✓ |
   | 2, 3 | LWW bools (background visible, root text visible [I: SceneController `backgroundVisible`, `isRootDocumentVisible`]) | ✓ | ✓ |
-  | 5 | paper size, 2 × u32 | 1404 × 1872 (all) | **1404 × 1872 (all)** |
+  | 5 | paper size, 2 × u32 (rounded copy of field 8, §5.6) | 1404 × 1872 (all) | **1404 × 1872 (all)** |
   | 6 | LWW `QRectF` (4 × f64: x, y, w, h) | **0,0,0,0** (3034/3034) | **non-zero** (41/41 that have it) |
-  | 7 | 2 × f64 | 1404.0 × 1872.0 | 1404.0 × 1872.0 |
-  | 8 | LWW 2 × f64 | 1404.0 × 1872.0 | 1404.0 × 1872.0 |
+  | 7 | 2 × f64 (copy of field 8) | 1404.0 × 1872.0 | 1404.0 × 1872.0 |
+  | 8 | LWW 2 × f64: the paper size (`Scene::setPaperSize`) | 1404.0 × 1872.0 | 1404.0 × 1872.0 |
   | 9 | LWW u8 (preferred text layout [I]) | 1 / 3 | 1 / 3 |
 
   The paper size does **not** become the PDF's size: an A4 page still says 1404 × 1872.
@@ -1797,8 +1797,8 @@ PDF / EPUB-backed):
   area the PDF page opens up (`SceneController.sceneExteriorBoundary`/`paperPortraitBounds`
   are candidates) [?: name and exact formula not traced]. Pages inserted into a PDF carry
   zeros, like notebooks. 46 PDF pages and the one annotated EPUB page have no field 6 at all (older writers), so
-  it is optional. The client only writes SceneInfo when it creates a page (`rm_writer.blank_page`:
-  zeros); it never rewrites an existing one.
+  it is optional. The client writes field 6 only when it creates a page (`rm_writer.blank_page`:
+  zeros); the paper fields (5, 7, 8) are traced and set as §5.6 describes.
 - **Field 2 is "Hide template"** [O + corpus]: of 4,256 cached v6 pages, 4,253 have it at
   `0:0`, true; 3 carry a later timestamp (1:15, 1:18, 1:170) and are true again: the
   tablet saves the toggle in the page. The desktop QML's View > Hide template and the
@@ -2083,10 +2083,9 @@ own, not marked opened**), then three tasks on the new document's worker, the se
   tutorial shows the first time a notebook opens, as in the official app.
 - `setTemplateForPage` writes the template into an un-uploaded new notebook's `.content`,
   otherwise it is a pending page edit (`edits.PageTemplate`, uploaded by push_edits);
-  a template the page already has changes nothing. A paper size other than 1404 × 1872
-  is not applied (logged): writing a page's SceneInfo paper size is not traced
-  (0x1408aa520 also updates fields 6–8). `setPaperSizeForQuickSheetPage` follows the
-  checks above and succeeds when the size is 1404 × 1872, the size every page here has.
+  a template the page already has changes nothing. With a paper size, the page gets it
+  as below (*Paper sizes*); `setPaperSizeForQuickSheetPage` follows the checks above
+  and sets page 0's paper the same way.
 - `setOrientation`, `setCoverPageNumber`, `clearIsNew` are shown at once
   (`LibrarySource.show_fields`) and committed (`set_document_settings`, `clear_new`) with
   `lastModified` untouched; orientation also drops the `.thumbnails` files.
@@ -2094,6 +2093,78 @@ own, not marked opened**), then three tasks on the new document's worker, the se
   each page's `.rm` (with pending edits), images and page files copied, the pages deleted
   from the source as a pending `PageDelete`; note pages only (a PDF page is refused).
 - Deviation, unchanged: the client does not bump `lastModified` on a page turn (§5.5).
+
+**Paper sizes** (Settings › "Document paper width": `Settings.paperSize`, table
+0x14102b900: 1404 × 1872, 1620 × 2160, 954 × 1696) [O; byte layout from the writer,
+since no cached page has another size]:
+- *Where a page keeps it.* `Scene` holds the SceneInfo struct at +0xf8 (the reader
+  0x1409ef220 and writer 0x1409f92f0 use the same offsets: field 2 at +0x110, field 6 at
+  +0x130, the paper at +0x158/+0x160 with its stamp at +0x168). The paper size is
+  **field 8**, an LWW pair of f64. The writer derives two more fields from it: **field 5**
+  = u32 `round(w)`, u32 `round(h)` (CRT `round`, halves away from zero) and **field 7** =
+  f64 w, f64 h; field 4 is never written; unknown trailing fields are kept (+0x88).
+  Order on disk: 1, 2, 3, 5, 6, 7, 8, 9.
+- *How it is read.* The page loader starts from QSize(1404, 1872) at 0:0 (0x140a04225).
+  After reading, when field 8's stamp has counter 0 (absent or 0:0), field 7 is taken if
+  both are > 0, else field 5 if both are ≥ 1 (signed), else the default stays.
+- *How it is set.* `Scene::setPaperSize` (0x1408aa520): nothing when both sides are
+  qFuzzyCompare-equal; else field 8 = the size, stamped `++clock` (0x1408e43e0), then
+  `primaryContentRect`/`extendedContentRect` (unless the page has a content rect of
+  its own, +0x320: PDF pages), `explicitPaperSizeChanged`, `paperPortraitBoundsChanged`,
+  `paperNoteBoundsChanged`. Callers: the template task (functor 0x14068d6e0), the Quick
+  sheets task (0x14068d6b0), doAddPage (0x140559584: the paper of page
+  `paperSizeFromPage` when that is a page, else the explicit `QSizeF` when valid) and two
+  more functors (0x140688b50, 0x14068c640). These go through the scene worker
+  (request 0x18, 0x14056dd20), which saves the scene, so a page set to a size other than
+  1404 × 1872 gets a `.rm` (an empty page then: on a page made from nothing, whose last id
+  is 0:14, field 8 is stamped 1:15). Setting 1404 × 1872 on a page without a file writes
+  nothing. The page map is not changed, so `lastModified` does not move for it.
+- *What follows from it.* `Scene` 0x1408a8eb0 `paperPortraitBounds` = QRectF(−w/2, 0, w,
+  h); 0x1408a8df0 `paperNoteBounds` = QRectF(−h/2, 0, h, w) (the "landscape" bounds the
+  desktop's `DocumentViewport.updateSceneBoundingRect` gives every note page: x ±h/2,
+  bottom at least 4/3 · h; fit-to-width uses them); both are (−702…)/(−936…) for an empty
+  size. When a scene is shown (0x14044a4d0) these and `explicitPaperSize` are announced from
+  the page's paper, on PDF pages too (their SceneInfo keeps 1404 × 1872; the PDF page
+  is the content rect +0x300, not the paper).
+- *Templates.* `SceneTemplateRenderer` (0x140a0de10) builds the template context from the
+  page's paper (transposed when the document is landscape, +0xa8 == 1), its
+  `paperNoteBounds` and physicalDpi 226 (0x140d6f670); the variable resolver 0x140a8ebd0
+  (names table 0x140d72ef0, jump table 0x140a8ee7c) gives `templateWidth`/`Height` = the
+  paper, `paperOriginX` = templateWidth/2 + bounds.x (= w/2 − h/2: −234 on 1404 × 1872),
+  `paperOriginY` = bounds.y = 0, `paperWidth`/`Height` = the bounds' width and height (h
+  and w), `pixelRatio` = physicalDpi / 227, `textWidth` from a text size when set, and
+  `parent*` from the group being laid out. Template x = 0 is the paper's left edge
+  (scene −w/2). "P Lines small" thus spans w/2 ± h/2 on any paper.
+- *Typed text does not follow the paper.* `createRootDocument` (Scene 0x1408a55f0)
+  sizes a new text box from a fixed QSize(1404, 1872): width h/2 = 936 (740 or 1152 for
+  the other device modes, +0x330), at x −width/2, y 234 (0x140d654c0).
+
+*Client* (`rm_parser.paper_size_of`, `rm_layer.set_scene_info(paper=)`, `paper_size`,
+`same_paper`; `LibrarySource.set_page_paper`/`page_paper`; `SceneFlags.paper_size`):
+- `PageScene.width`/`height` are the page's paper as the loader resolves it and
+  `x_origin` is width/2; page coordinates put the paper's top left at (0, 0). Frames
+  (`PageContent.frame`), thumbnails, the viewer's tiles, PNG/SVG/PDF export, PDF
+  placement (`pdf_target_rect(size, paper)`), the template variables
+  (`templates.base_environment`, as the resolver binds them: this also moves
+  `paperOriginX` from w/2 to w/2 − h/2, a 1 px shift of "P Dots S" and 1.6 px of
+  "Isometric" on 1404 × 1872), typed-text search hits, checkboxes and PDF links use the
+  page's own origin. `SceneController` publishes `explicitPaperSize`, `paperPortraitBounds`
+  and `paperNoteBounds` from the paper (so `DocumentViewport` scrolls and fits note pages
+  in their landscape bounds as 3.29 does); `primaryContentRect` stays the frame.
+- `setTemplateForPage(..., paperSize)` sets the paper first, then the template;
+  `addPageWithTemplateAndPageSize` and `addPageWithTemplateAndPaperSizeFromPage` give
+  the new page its size as doAddPage does; `setPaperSizeForQuickSheetPage` sets page 0's.
+  A document made here and not uploaded yet gets the page's `.rm` in its files; another
+  one gets a pending `SceneFlags` edit (not an undo step) that `push_edits` applies with
+  `rm_layer.set_scene_info`, keeping every other block byte for byte. Push plans now
+  describe `SceneFlags` and layer edits (describing one used to fail).
+- Not done: landscape notebooks (the template context's transposition, and turning the
+  page) are not drawn turned; `customZoom*` in a new notebook's `.content` stay
+  1404 × 1872 (their writer was not found from the key strings) [I].
+- Checked: `tests/test_paper_sizes_offline.py`; a read-only scan of the cache
+  (4,282 distinct v6 pages, `.rm` files and blobs): fields 5/7/8 are 1404 × 1872 on every
+  page that has them, field 8 always at 0:0; 498 pages stop after field 3, 695 after
+  field 5. No page has another size, so the layout above rests on the writer's code.
 
 ### 5.7 In-document search and tables of contents
 

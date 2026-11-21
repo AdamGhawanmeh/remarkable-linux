@@ -66,7 +66,7 @@ from viewer.rm_parser import Color, Tool
 
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, ItemsTransform, PageAdd,
                     PageCopy, PageDelete, PageImport, PageMove, PageTemplate, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
-                    TextEdit, ToolSettings,
+                    TextEdit, ToolSettings, LAYER_EDITS, SceneFlags,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
@@ -484,6 +484,20 @@ def describe_edit(e) -> str:
         return f"  delete image {e.key} on page {e.page_id}"
     if isinstance(e, ImageRestore):
         return f"  put back image {e.key} on page {e.page_id} (undo/redo)"
+    if isinstance(e, SceneFlags):
+        parts = []
+        if e.current_layer is not None:
+            parts.append(f"current layer {e.current_layer}")
+        if e.background_visible is not None:
+            parts.append(f"template {'shown' if e.background_visible else 'hidden'}")
+        if e.root_document_visible is not None:
+            parts.append(f"typed text {'shown' if e.root_document_visible else 'hidden'}")
+        if e.paper_size is not None:
+            parts.append(f"paper size {e.paper_size[0]:g} x {e.paper_size[1]:g}")
+        return f"  page {e.page_id}: {', '.join(parts)}"
+    if isinstance(e, LAYER_EDITS):
+        what = type(e).__name__.removeprefix("Layer").lower() or "change"
+        return f"  layer {what} on page {e.page_id}"
     xs, ys = [v[0] for v in e.vertices], [v[1] for v in e.vertices]
     where = f"x {min(xs):g}..{max(xs):g}, y {min(ys):g}..{max(ys):g} (scene units, x 0 = page centre)"
     if isinstance(e, ImageTransform):

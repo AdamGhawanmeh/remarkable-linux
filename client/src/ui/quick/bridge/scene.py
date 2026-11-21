@@ -102,6 +102,7 @@ def _changed_end(before: str, after: str, cursor: int) -> int:
         end += 1
     return rm_text.units(after[:len(after) - end])
 PORTRAIT = QRectF(-HALF_WIDTH, 0, PAGE_WIDTH, PAGE_HEIGHT)
+NOTE_BOUNDS = QRectF(-PAGE_HEIGHT / 2, 0, PAGE_HEIGHT, PAGE_WIDTH)     # Scene 0x1408a8df0 for 1404 x 1872
 # Largest page image kept per zoom (pixels); deeper zooms upscale it.
 MAX_PIXELS = 32_000_000
 
@@ -229,9 +230,10 @@ def forget_history(doc_id: str) -> None:
         source.forget_history(doc_id)
 
 
-def to_scene(rect: QRectF) -> QRectF:
-    """ui/pages.py page coordinates -> scene coordinates."""
-    return rect.translated(-HALF_WIDTH, 0)
+def to_scene(rect: QRectF, origin: float = HALF_WIDTH) -> QRectF:
+    """ui/pages.py page coordinates -> scene coordinates: `origin` is the page x of the
+    scene's x = 0, half the page's paper width (PageContent.origin)."""
+    return rect.translated(-origin, 0)
 
 
 def anchor_offsets(scene) -> dict:
@@ -696,7 +698,8 @@ class _LinkHandler:
 SceneLinkHandler = qml_class("SceneLinkHandler", behaviour=_LinkHandler)
 
 
-def pdf_links(pdf, pdf_page: int, frame: QRectF, page_of_pdf: dict[int, int]) -> list[dict]:
+def pdf_links(pdf, pdf_page: int, frame: QRectF, page_of_pdf: dict[int, int],
+              origin: float = HALF_WIDTH) -> list[dict]:
     """The links on a PDF page, in scene coordinates (QtPdf's link model).
 
     Runs on the view's worker (SceneView._load). The document's signals are
@@ -720,7 +723,7 @@ def pdf_links(pdf, pdf_page: int, frame: QRectF, page_of_pdf: dict[int, int]) ->
             target = model.data(index, roles["page"])
             area = QRectF(frame.x() + rect.x() * scale, frame.y() + rect.y() * scale, rect.width() * scale,
                           rect.height() * scale)
-            links.append({"valid": True, "index": row, "rect": to_scene(area),
+            links.append({"valid": True, "index": row, "rect": to_scene(area, origin),
                           "url": url.toString() if url is not None and not url.isEmpty() else "",
                           "page": page_of_pdf.get(int(target), -1) if target is not None and target >= 0 else -1})
         return links
@@ -1280,9 +1283,10 @@ SceneTileManager = qml_class("SceneTileManager", QObject, _TileManager,
 # -- controller -----------------------------------------------------------------------
 
 class _Controller:
-    _DEFAULTS = {"defaultPortraitBounds": PORTRAIT, "paperPortraitBounds": PORTRAIT, "paperNoteBounds": PORTRAIT,
+    _DEFAULTS = {"defaultPortraitBounds": PORTRAIT, "defaultNoteBounds": NOTE_BOUNDS,
+                 "paperPortraitBounds": PORTRAIT, "paperNoteBounds": NOTE_BOUNDS,
                  "boundingRect": PORTRAIT, "primaryContentRect": PORTRAIT,
-                 "explicitPaperSize": QSize(PAGE_WIDTH, PAGE_HEIGHT), "backgroundVisible": True,
+                 "explicitPaperSize": QSizeF(PAGE_WIDTH, PAGE_HEIGHT), "backgroundVisible": True,
                  "isRootDocumentVisible": True, "layerCount": 0, "currentLayer": 0}
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -1295,12 +1299,23 @@ class _Controller:
         self.last_area: tuple[float, float] | None = None   # corner of the area last selected
         self._cursor_request: QPointF | None = None          # where text mode was last asked to put the cursor
 
-    def set_page(self, frame: QRectF, bounds: QRectF, layers: list, links: list[dict]) -> None:
-        """The loaded page: its frame (paper), content bounds and links, in scene
-        coordinates."""
+    def set_page(self, frame: QRectF, bounds: QRectF, layers: list, links: list[dict],
+                 paper: tuple[float, float] = (PAGE_WIDTH, PAGE_HEIGHT)) -> None:
+        """The loaded page: its frame (the paper, or the PDF page), content bounds and
+        links, in scene coordinates, and its SceneInfo paper size. As 3.29's Scene
+        announces a scene (0x14044a4d0) and setPaperSize (0x1408aa520) does:
+        explicitPaperSize is the paper size, on PDF pages too (their SceneInfo keeps
+        1404 x 1872); paperPortraitBounds QRectF(-w/2, 0, w, h) (0x1408a8eb0) and
+        paperNoteBounds QRectF(-h/2, 0, h, w) (0x1408a8df0), the "landscape" bounds
+        DocumentViewport.updateSceneBoundingRect gives note pages (scroll range and
+        fit-to-width). primaryContentRect stays the frame here (the app's is the note
+        bounds on note pages, not used by the desktop QML there)."""
         self.layers = list(layers)
         self.links = links
-        self._set("explicitPaperSize", QSize(round(frame.width()), round(frame.height())))
+        width, height = float(paper[0]), float(paper[1])
+        self._set("explicitPaperSize", QSizeF(width, height))
+        self._set("paperPortraitBounds", QRectF(-width / 2, 0, width, height))
+        self._set("paperNoteBounds", QRectF(-height / 2, 0, height, width))
         self._set("primaryContentRect", frame)
         if not self._set("boundingRect", bounds):
             # Unchanged, but the page was loaded again: DocumentViewport re-applies its
@@ -1884,8 +1899,9 @@ class _SceneView:
                 links = []
                 if content.has_pdf_page:
                     page_of_pdf = {p.pdf_page: i for i, p in enumerate(pages.pages) if p.pdf_page is not None}
-                    links = pdf_links(content.pdf, content.pdf_page, frame, page_of_pdf)
-                result = (pages, content, to_scene(frame), to_scene(bounds), links, None, ids[index])
+                    links = pdf_links(content.pdf, content.pdf_page, frame, page_of_pdf, content.origin)
+                result = (pages, content, to_scene(frame, content.origin), to_scene(bounds, content.origin),
+                          links, None, ids[index])
             except Exception as err:      # anything left unreported would keep the loading dots up
                 if not isinstance(err, EXPECTED_ERRORS):
                     log.exception("loading page %r of %s", page_id, node.id)
@@ -1908,6 +1924,7 @@ class _SceneView:
             return
         if self._pages is not None:
             self._pages.close()
+        reload = shown == self._page_id
         # Another page: its PDF text selection goes (DocumentViewport also clears it on
         # currentPageChanged); a reload of the same page after an edit keeps it.
         if shown != self._page_id:
@@ -1925,10 +1942,16 @@ class _SceneView:
         layers = (list(content.scene.layers) if content.scene is not None and content.scene.layers
                   else [Layer(name="Layer 1", visible=True, node_id=(0, 11))])
         # The page's own bounds first: set_page then tells DocumentViewport, whose
-        # updateSceneBoundingRect widens them on note pages (a margin below the paper).
-        # The other way round, a reload after an edit put the bare bounds back and the
-        # view jumped.
-        self._tiles._set("sceneBoundingRect", bounds)
+        # updateSceneBoundingRect widens them on note pages (to the paper's "landscape"
+        # note bounds, and a margin below). The other way round, a reload after an edit
+        # put the bare bounds back and the view jumped. On a reload of a note page the
+        # bounds already widened are kept meanwhile (united): set alone, the bare bounds,
+        # narrower and shorter than those, re-centred a zoomed-out view on them first.
+        current = self._tiles._get("sceneBoundingRect")
+        if reload and not content.has_pdf_page and isinstance(current, QRectF) and current.isValid():
+            self._tiles._set("sceneBoundingRect", bounds.united(current))
+        else:
+            self._tiles._set("sceneBoundingRect", bounds)
         # Active layer: SceneInfo field 1 when still live, else Layer 1 (0:11), else top.
         node_ids = [layer.node_id for layer in layers]
         cur_node = content.scene.current_layer if content.scene is not None else None
@@ -1939,7 +1962,7 @@ class _SceneView:
         else:
             cur_idx = max(len(layers) - 1, 0)
         self._controller._set("currentLayer", cur_idx)
-        self._controller.set_page(frame, bounds, layers, links)
+        self._controller.set_page(frame, bounds, layers, links, content.paper)
         bg = content.scene.background_visible if content.scene is not None else True
         rd = content.scene.root_document_visible if content.scene is not None else True
         if self._editable() or shown != getattr(self, "_background_page", None):
@@ -2879,7 +2902,8 @@ class _SceneView:
             return []
         if lines is None:
             lines = layout_text(scene, qt_measure)
-        boxes = [(start, to_scene(QRectF(*box))) for start, box in checkbox_boxes(scene, lines, qt_measure)]
+        boxes = [(start, to_scene(QRectF(*box), scene.x_origin))
+                 for start, box in checkbox_boxes(scene, lines, qt_measure)]
         self._checkboxes = (token, boxes)
         return boxes
 

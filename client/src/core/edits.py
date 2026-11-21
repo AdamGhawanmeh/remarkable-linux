@@ -695,7 +695,8 @@ class LayerUnmerge:
 @dataclass(frozen=True)
 class SceneFlags:
     """SceneInfo (0x0D) LWW fields updated: currentLayer (1), backgroundVisible (2),
-    and/or rootDocumentVisible (3)."""
+    rootDocumentVisible (3), and/or the paper size (field 8, with fields 5 and 7 that
+    the writer derives from it: Scene::setPaperSize, ARCHITECTURE.md 5.6)."""
 
     doc_id: str
     page_id: str
@@ -703,15 +704,23 @@ class SceneFlags:
     current_layer: ItemRef | None = None
     background_visible: bool | None = None
     root_document_visible: bool | None = None
+    paper_size: tuple[float, float] | None = None
 
     @classmethod
     def new(cls, doc_id: str, page_id: str, created_ms: int, *, current_layer=None,
-            background_visible: bool | None = None, root_document_visible: bool | None = None) -> "SceneFlags":
-        if current_layer is None and background_visible is None and root_document_visible is None:
+            background_visible: bool | None = None, root_document_visible: bool | None = None,
+            paper_size=None) -> "SceneFlags":
+        if current_layer is None and background_visible is None and root_document_visible is None \
+                and paper_size is None:
             raise EditError("a SceneFlags edit must change at least one field")
+        paper = None
+        if paper_size is not None:
+            paper = (float(paper_size[0]), float(paper_size[1]))
+            if not (paper[0] > 0 and paper[1] > 0):
+                raise EditError(f"invalid paper size {paper_size!r}")
         return cls(str(doc_id), str(page_id), int(created_ms), _opt_ref(current_layer),
                    None if background_visible is None else bool(background_visible),
-                   None if root_document_visible is None else bool(root_document_visible))
+                   None if root_document_visible is None else bool(root_document_visible), paper)
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "SceneFlags":
@@ -720,7 +729,8 @@ class SceneFlags:
         return cls.new(raw["doc_id"], raw["page_id"], raw["created_ms"],
                        current_layer=raw.get("current_layer"),
                        background_visible=None if bg is None else bool(bg),
-                       root_document_visible=None if rd is None else bool(rd))
+                       root_document_visible=None if rd is None else bool(rd),
+                       paper_size=raw.get("paper_size"))
 
 
 LAYER_EDITS = (LayerAdd, LayerDelete, LayerReattach, LayerRename, LayerVisibility,
@@ -1472,7 +1482,8 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                     page = rm_layer.set_scene_info(
                         page, author=author, current_layer=cur,
                         background_visible=edit.background_visible,
-                        root_document_visible=edit.root_document_visible)
+                        root_document_visible=edit.root_document_visible,
+                        paper=edit.paper_size)
             except (rm_layer.LayerError, RmParseError, ValueError) as err:
                 raise EditError(f"the layer edit does not fit the page: {err}") from err
             continue

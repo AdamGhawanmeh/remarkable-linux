@@ -19,11 +19,13 @@ templateHeight, parentX/Y/Width/Height, physicalDpi, pixelRatio, paperOriginX/Y,
 paperWidth/Height, textWidth) plus the template's constants. They are parsed here,
 never passed to eval().
 
-Coordinates are page pixels (1404 × 1872 portrait). Children are positioned relative
-to their parent group instance. Repeats fill the area being drawn, so a lined template
+Coordinates are page pixels: (0, 0) is the top left of the page's paper (1404 × 1872
+portrait unless the page's SceneInfo gives another paper size, ARCHITECTURE.md §5.6),
+whose centre line is the scene's x = 0. Children are positioned relative to their
+parent group instance. Repeats fill the area being drawn, so a lined template
 continues down an extended page, as on the tablet. Defaults not stated in the files
-(stroke black, 1 px, no fill; text black, top-left anchored) are assumptions; the
-paper origin is the scene origin (page x 702, y 0).
+(stroke black, 1 px, no fill; text black, top-left anchored) are assumptions;
+paperOriginX is the left edge of the scene's "note bounds" (base_environment).
 """
 
 from __future__ import annotations
@@ -230,9 +232,21 @@ def default_library() -> TemplateLibrary:
 
 # ------------------------------------------------------------------------ painting
 
+PHYSICAL_DPI = 226.0       # the template context's dpi (0x140a0de10, the double at 0x140d6f670)
+
+
 def base_environment(width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT) -> dict:
-    return {"templateWidth": width, "templateHeight": height, "physicalDpi": 226.0, "pixelRatio": 1.0,
-            "paperOriginX": width / 2, "paperOriginY": 0.0, "paperWidth": width, "paperHeight": height,
+    """The variables of a page of paper `width` x `height`, as 3.29 binds them
+    (SceneTemplateRenderer 0x140a0de10 makes the context: the scene's paper size, and
+    Scene's paperNoteBounds (0x1408a8df0), QRectF(-h/2, 0, h, w); the resolver
+    0x140a8ebd0 reads it): templateWidth/Height the paper size, paperOriginX
+    templateWidth / 2 + bounds.x (= w/2 - h/2, the left edge of those bounds in template
+    coordinates), paperOriginY bounds.y, paperWidth/Height the bounds' width and height
+    (h and w), physicalDpi 226, pixelRatio physicalDpi / 227. parent* are the area of the
+    group being laid out, here the page at the top level."""
+    return {"templateWidth": width, "templateHeight": height, "physicalDpi": PHYSICAL_DPI,
+            "pixelRatio": PHYSICAL_DPI / 227.0,
+            "paperOriginX": width / 2 - height / 2, "paperOriginY": 0.0, "paperWidth": height, "paperHeight": width,
             "parentX": 0.0, "parentY": 0.0, "parentWidth": width, "parentHeight": height}
 
 

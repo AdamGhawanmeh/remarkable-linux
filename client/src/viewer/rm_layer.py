@@ -27,7 +27,9 @@ Traced in reMarkable.exe 3.29 and checked on real cached multi-layer pages (ARCH
     dst and deleted from src; then src is detached via SceneTreeMove to 0:0.
   - SceneInfo (0x0D): field 1 currentLayer (LWW id), field 2 backgroundVisible (LWW bool),
     field 3 rootDocumentVisible (LWW bool), each stamped with ++clock (0x1408aa470,
-    0x1408aa340, 0x1408aad70).
+    0x1408aa340, 0x1408aad70). The paper size (Scene::setPaperSize 0x1408aa520): field 8
+    (LWW pair of f64) stamped with ++clock, and with it field 5 (u32 round(w), round(h))
+    and field 7 (f64 w, h), the three as the SceneInfo writer 0x1409f92f0 derives them.
 """
 
 from __future__ import annotations
@@ -37,7 +39,10 @@ from dataclasses import dataclass, replace
 from . import rm_select as rsel
 from . import rm_stroke as rs
 from . import rm_writer as w
-from .rm_parser import RmParseError, _lww_bool, _lww_string
+import math
+import struct
+
+from .rm_parser import DEFAULT_PAPER, RmParseError, _lww_bool, _lww_string, _read_fields, paper_size_of
 
 MAX_LAYERS = 5
 ZERO_ID = w.ZERO_ID
@@ -139,6 +144,37 @@ def scene_info(page: bytes | None) -> tuple[tuple[int, int] | None, bool, bool]:
     return cur, bg, root_doc
 
 
+def paper_size(page: bytes | None) -> tuple[float, float]:
+    """The page's paper size (rm_parser.paper_size_of): 1404 x 1872 for a page with no
+    file, as the app's loader makes the scene of a page it has nothing stored for."""
+    if page is None:
+        return DEFAULT_PAPER
+    for block in w.split(page)[1]:
+        if block.type == w.BLOCK_SCENE_INFO:
+            return paper_size_of(_read_fields(block.payload))
+    return DEFAULT_PAPER
+
+
+def same_paper(a, b) -> bool:
+    """Scene::setPaperSize's test (0x1408aa520): both sides qFuzzyCompare-equal (Qt's
+    relative 1e-12, the form 0x1400a6640 inlines)."""
+    def fuzzy(x: float, y: float) -> bool:
+        return abs(x - y) * 1000000000000.0 <= min(abs(x), abs(y))
+    return fuzzy(float(a[0]), float(b[0])) and fuzzy(float(a[1]), float(b[1]))
+
+
+def _round_half_away(value: float) -> int:
+    """The CRT round() the writer calls: halves go away from zero."""
+    return int(math.floor(value + 0.5)) if value >= 0 else -int(math.floor(-value + 0.5))
+
+
+def paper_fields(width: float, height: float) -> tuple[bytes, bytes]:
+    """SceneInfo fields 5 and 7 of a paper size, as the writer (0x1409f92f0) stores
+    them: u32 round(width), round(height) and f64 width, height."""
+    return (struct.pack("<ii", _round_half_away(width), _round_half_away(height)),
+            struct.pack("<dd", float(width), float(height)))
+
+
 def next_layer_name(blocks: list[w.Block]) -> str:
     """Next unused default layer name ("Layer N", starting at len(live) + 1: 0x1408a88d0)."""
     live = w.layers(blocks)
@@ -202,7 +238,8 @@ def _set_lww_field(values: list[tuple[int, int, object]], field_index: int,
 def _update_scene_info(blocks: list[w.Block], me: int, clock: int, *,
                        current_layer: tuple[int, int] | None = None,
                        background_visible: bool | None = None,
-                       root_document_visible: bool | None = None) -> int:
+                       root_document_visible: bool | None = None,
+                       paper: tuple[float, float] | None = None) -> int:
     """Update SceneInfo (0x0D) LWW fields in `blocks` in-place; returns the updated clock."""
     info_idx = next((n for n, b in enumerate(blocks) if b.type == w.BLOCK_SCENE_INFO), None)
     if info_idx is None:
@@ -240,6 +277,13 @@ def _update_scene_info(blocks: list[w.Block], me: int, clock: int, *,
             clock += 1
             values = _set_lww_field(values, 3, w.f_id(1, (me, clock)) + w.f_u8(2, 1 if root_document_visible else 0))
             changed = True
+    if paper is not None and not same_paper(paper, paper_size_of(_read_fields(w.write_values(values)))):
+        clock += 1
+        size, doubles = paper_fields(*paper)
+        values = _set_lww_field(values, 5, size)
+        values = _set_lww_field(values, 7, doubles)
+        values = _set_lww_field(values, 8, w.lww((me, clock), struct.pack("<dd", float(paper[0]), float(paper[1]))))
+        changed = True
     if changed:
         orig = blocks[info_idx]
         blocks[info_idx] = w.Block(orig.type, orig.min_version, orig.version, w.write_values(values))
@@ -280,9 +324,13 @@ def _group_value(child: tuple[int, int]) -> bytes:
 def set_scene_info(page: bytes | None, *, author: bytes,
                    current_layer: tuple[int, int] | None = None,
                    background_visible: bool | None = None,
-                   root_document_visible: bool | None = None) -> bytes:
+                   root_document_visible: bool | None = None,
+                   paper: tuple[float, float] | None = None) -> bytes:
     """Update SceneInfo (0x0D) fields 1 (currentLayer), 2 (backgroundVisible) and/or 3
-    (rootDocumentVisible), keeping every other block of the page byte for byte."""
+    (rootDocumentVisible), and/or the paper size (fields 5, 7, 8), keeping every other
+    block of the page byte for byte. A page with no file is made (blank_page) only when
+    something changes: setting a page's paper to 1404 x 1872, the size it already has,
+    writes nothing, as Scene::setPaperSize returns at once then (0x1408aa520)."""
     header, blocks = w.split(w.blank_page(author) if page is None else page)
     if current_layer is not None:
         current_layer = tuple(current_layer)
@@ -293,14 +341,18 @@ def set_scene_info(page: bytes | None, *, author: bytes,
     need_layer = current_layer is not None and current_layer != cur_layer
     need_bg = background_visible is not None and bool(background_visible) != cur_bg
     need_rd = root_document_visible is not None and bool(root_document_visible) != cur_rd
-    if page is not None and not (need_layer or need_bg or need_rd):
+    if paper is not None and not (float(paper[0]) > 0 and float(paper[1]) > 0):
+        raise ValueError(f"invalid paper size {paper!r}")
+    need_paper = paper is not None and not same_paper(paper, paper_size(page))
+    if not (need_layer or need_bg or need_rd or need_paper) and (page is not None or paper is not None):
         return page
     me = w._author_index(blocks, author)
     clock = w.highest_counter(blocks)
     _update_scene_info(blocks, me, clock,
                        current_layer=current_layer if need_layer else None,
                        background_visible=background_visible if need_bg else None,
-                       root_document_visible=root_document_visible if need_rd else None)
+                       root_document_visible=root_document_visible if need_rd else None,
+                       paper=tuple(paper) if need_paper else None)
     return w.join(header, blocks)
 
 
