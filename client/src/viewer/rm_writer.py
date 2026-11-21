@@ -366,8 +366,12 @@ def decode_image_value(value: bytes) -> ImageValue:
 
 RAW = None      # a sub-block that holds no ids (a string, points, numbers)
 LWW = {2: RAW}  # a last-write-wins value: {1: timestamp, 2: the value, an id or a plain value}
+# A last-write-wins value whose value names an item instead of being one: a group's
+# anchor character, which may be a sentinel (0:0xfffffffffffe / 0:0xffffffffffff) the
+# page's clock must not take (the tablet's later items on such pages have ordinary ids).
+LWW_REF = "ref"
 _SCENE_INFO = {1: LWW, 2: LWW, 3: LWW, 4: LWW, 5: RAW, 6: LWW, 7: RAW, 8: LWW, 9: LWW}
-_TREE_NODE = {2: LWW, 3: LWW, 7: LWW, 8: LWW, 9: LWW, 10: LWW}
+_TREE_NODE = {2: LWW, 3: LWW, 7: LWW_REF, 8: LWW, 9: LWW, 10: LWW}
 _ITEM_VALUES = {0x02: {}, 0x03: {5: RAW}, 0x07: {1: LWW, 3: RAW, 4: RAW}}
 
 
@@ -381,7 +385,9 @@ def _ids(data: bytes, below: dict) -> list[tuple[int, int]]:
         elif kind == TAG_LENGTH4:
             if index not in below:
                 raise RmParseError(f"sub-block {index} is not understood")
-            if below[index] is not RAW:
+            if below[index] is LWW_REF:
+                out += [v for i, k, v in read_values(value) if i == 1 and k == TAG_ID]
+            elif below[index] is not RAW:
                 out += _ids(value, below[index])
     return out
 

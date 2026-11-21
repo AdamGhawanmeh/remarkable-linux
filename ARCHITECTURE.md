@@ -270,6 +270,64 @@ at 200 %. This client renders the page image at device resolution, so it stays s
 ("Only binding to one of multiple key bindings", same check in the shipped Qt);
 these are the platform's key tables, not binding errors.
 
+### 2.2 What stays a no-op in the bridges
+
+Every member of the app's C++ types is bridged (§2.1), but not every one does something.
+`client/tools/bridge_stub_audit.py` lists the ones that do nothing: generated slots no
+behaviour class replaced (they log at DEBUG and return their type's default; `setX`
+slots of a property `X` set it and are not counted), and hand-written `@Slot`s whose body
+is only `pass`, a constant, a log line or `_unsupported`. `--check` fails on one that is
+not in its `DOCUMENTED` table, and `test_v1_finish_offline` runs the same check, so the
+list below is the whole of it (88 members on 2026-11-22).
+
+**The skip list: dead, OS-only or dangerous features of the official app**, left out on
+purpose:
+- **Sparkle updater** (OS-only): `PlatformApp.checkForUpdate`, `canUpdateThroughSparkle`,
+  `sparkleEnabled` (false). Linux packages update themselves.
+- **USB recovery** (dangerous): `DeviceRecovery` (`xofm.libs.recovery`, reflashing a
+  tablet over USB) is bridged as a whole that never finds a device (discovery answers
+  FAIL, so RecoveryPopup shows its connection error).
+- **Retail demo reset** (dangerous): `Settings.retailDemoReset`.
+- **Native share sheet** (OS-only, disabled): `ShareNative` reports "not available", and
+  `ShareNative.exportFinished` does nothing.
+- **`deleteAccount`** (macOS only): not in the Windows exe's metadata at all, so there is
+  nothing to bridge.
+- **Telemetry**: the app's usage reports (`/sync/reports/v1`) are never sent; no member
+  stands for them.
+
+**Dead in the desktop QML, or OS-only, for other reasons** (each with its reason in
+`DOCUMENTED`):
+- *C++-internal slots* connected only to C++ signals, whose work the bridge does in
+  Python anyway: `DocumentLockManager.setSleepState/pageModified/linesStored`,
+  `SceneController.onJobCompleted/onPagemapChanged/updateHasItemsToEdit/onAnnotationChanged/
+  enableAutoReflow/disableAutoReflow/dumpScene`, `SceneKeyHandler.process`, nine
+  `SceneTileManager` and nine `SceneView` update/on* slots, `DocumentSync.requestProtocol`
+  and its three `on*` slots, `PlatformApp.onSyncProtocolChanged/updateWorkerSettings/
+  onLibraryReady`, `PlatformHelpers.onCompleted`, `Authentication.fetchUserToken/abortLogin`
+  (the sync fetches tokens itself; a pairing request runs to its end),
+  `DocumentController.execute/onFinished/onFailed`.
+- *Input methods, on-screen keyboards and mobile hooks* (OS-only):
+  `SceneController.setPreeditText`, the seven compose-range / input-method-transaction slots,
+  `SceneView.showVirtualKeyboard/hideVirtualKeyboard/inputMethodQuery` (Qt asks the item's
+  own `inputMethodQuery`, not this slot), `PlatformHelpers.isCurrentKeyboard/
+  vibrationFeedback`, `DocumentWrapper.setKeyboardUsedDuringSession`,
+  `SceneController.markKeyboardUsedDuringSession`.
+- *The tablet's scene API* the desktop QML never calls, done here by the client's own pen,
+  selection and text code: `SceneController.addDrawingLine/highlightWithLine/
+  selectWithLine/eraseWithLine/clearLines/pasteText/insertImageAsSceneItem/
+  createImageSnippetFromStroke/deleteText/replaceText`, and `ParagraphStyle`'s eleven
+  predicates (`isNone` … `fontSize`; the text code has its own).
+- *Answered by design*: `SceneController.requestDeferredCompleted` (thumbnails of edited
+  pages already refresh, §5.13), `Settings.defaultValue`,
+  `HandwritingLanguageModel.defaultCode` ("en_US"), `EntryWrapper.baseFilePath/getSource`
+  (there is no local document folder).
+
+The stubs with real behaviour in 3.29 that used to do nothing here are now wired (§5.14):
+`SelectionImage.image`, `Library.countArchivedDocuments/purgeThumbnails`,
+`LibraryController.setScrollPosition/setZoomMode/setCustomZoomFit`,
+`DocumentWrapper.scrollPosition`, `DocumentController.setViewBackgroundFilter`,
+`PlatformHelpers.openFileChooser/setInhibitSleep`, `PlatformApp.shouldShowWhatsNew`.
+
 ## 3. Cloud API
 
 ### 3.1 Hosts [O]
@@ -735,7 +793,11 @@ apart. `SyncClient.push_edits` delegates to it as well.
   `LibrarySource.edit_everything`: every notebook, PDF and ebook not in the trash.
 - **`--edit-notebook NAME`** (or `REMARKABLE_EDIT_NOTEBOOK`, read by `run.py` when no
   option is given) takes precedence. Editing is then on for those names only (the
-  unique-name rule of §5.6 still applies), whatever the setting says.
+  unique-name rule of §5.6 still applies), whatever the setting says. It is only for
+  someone who passes it by hand: no launcher passes it (`install.py`'s desktop entry,
+  and the maintainer's own packaging, start the app with no option), so a normal start
+  leaves editing to these two switches (`test_v1_finish_offline`
+  `SettingsAndLauncherTests`).
 - **The two switches are independent.** Uploading pending edits does not need editing
   to be on.
 - **UI.** The switches live in **Settings > Editing**, an `ArkControls.Cell` that
@@ -1267,6 +1329,15 @@ threshold N+4, originX N (369 real nodes; the other 341 were re-anchored later: 
 and originX carry later, consecutive ids). In memory (node object): +0x170 anchorId, +0x180
 type, +0x190 threshold, +0x1a0 originX, each followed by its timestamp, +0x1f0 the anchor
 position as a QPointF (never stored).
+- **The page's clock does not take the anchor.** The anchorId is a reference, not an id
+  the page made: on the 22 cached pages holding a sentinel anchor (0:0xfffffffffffe) the
+  tablet's later items have ordinary counters (at most 9,746). `rm_writer.block_ids` now
+  counts only field 7's stamp (`LWW_REF`); before, `highest_counter` read such a page's
+  clock as 2⁴⁸ − 2, so an edit there would have taken ids from 2⁴⁸ − 1 on.
+- **Made here** by `viewer.rm_anchor.add_group` (items pasted at the text cursor, §5.13):
+  the three blocks above with N = clock + 1, the group item N + 1, anchorId stamped N + 2,
+  type N + 3, threshold N + 4, originX N, an empty label and visible 1 at 0:0 (as all 710
+  real nodes); checked byte for byte against a real node in `test_v1_finish_offline`.
 
 - **anchorId**: the id of a RootText character, or `0:0xfffffffffffe` (before the text,
   index −1) / `0:0xffffffffffff` (after it, index = length) (0x140972ed0, 0x140972cf0).
@@ -2006,8 +2077,12 @@ a new `QmlDocumentWrapper*`); 17 `setOrientation` → 0x1404e26d0; 18
    (+0x2ac), `sizeInBytes` `QString::number(+0x240 = 0)` = `"0"`, `fontName` "",
    `documentMetadata`/`extraMetadata` `{}`; `viewBackgroundFilter` and the key after the
    table (+0x258 object, likely `keyboardMetadata`) only when non-empty;
-   `lockedByPassword` only when set. `customZoom*` come from the scene defaults [I]: on all
-   232 cached notebooks CenterX 0, CenterY 936, 1404 × 1872, scale 1, portrait.
+   `lockedByPassword` only when set. `customZoom*` [O] are the Document constructor's
+   (0x14064f68a: QRectF(−702, 0, 1404, 1872) → centre (0, 936) at +0x410, size
+   1404 × 1872 at +0x420, scale 1.0 at +0x430, orientation 2 = portrait at +0x438), fixed
+   whatever the paper size; only `setCustomZoomFit` (0x1406676c0) and the loader
+   (0x1406672ac) write them. On all 232 cached notebooks: CenterX 0, CenterY 936,
+   1404 × 1872, scale 1, portrait.
 4. `setVisibleName` (lastModified now), `setFileType(Notebook)` (0x140667aa0).
 5. Page: id a new QUuid or `uuid_page` ("uuid {:?} supplied, using it for page
    creation"); 0x140668010 gives one page with the template list resized to one
@@ -2158,9 +2233,42 @@ since no cached page has another size]:
   one gets a pending `SceneFlags` edit (not an undo step) that `push_edits` applies with
   `rm_layer.set_scene_info`, keeping every other block byte for byte. Push plans now
   describe `SceneFlags` and layer edits (describing one used to fail).
-- Not done: landscape notebooks (the template context's transposition, and turning the
-  page) are not drawn turned; `customZoom*` in a new notebook's `.content` stay
-  1404 × 1872 (their writer was not found from the key strings) [I].
+- `customZoom*` in a new notebook's `.content` stay 1404 × 1872 on any paper: they are
+  the Document constructor's (§5.6 step 3) [O]; the client writes the same.
+
+**Landscape notebooks** [O]. Nothing is turned: a landscape document's pages are drawn
+in the same scene coordinates, and the page simply lies across.
+- *Orientation.* `.content` "orientation" is read by 0x1406cf330 ("landscape" →
+  Qt::Horizontal 1, anything else Qt::Vertical 2) and written by 0x1406cf420; the same
+  reader serves a template's "orientation".
+- *The page.* The thumbnail job (0x14055d170) asks 0x1405633f0 whether a page is
+  landscape: for a document with PDF page sizes, whether that page is wider than tall;
+  otherwise whether the document's orientation (+0x39c) is Horizontal. For a landscape
+  page it transposes the thumbnail size and renders the scene rect `paperNoteBounds`
+  (−h/2, 0, h, w) (or the PDF content rect when there is one); a portrait note page renders
+  `paperPortraitBounds` (−w/2, 0, w, h). On the default paper a landscape page is
+  therefore scene x −936…936, y 0…1404. The desktop QML follows: `PageGridItem` makes
+  landscape cells wide (`height = width / aspect`), and `DocumentViewport.onUpdated` puts
+  the focal point at `primaryContentRect.height / 2` instead of the default paper's.
+- *Templates.* `SceneTemplateRenderer` (0x140a0de10) transposes the paper size when the
+  *template's* orientation is 1 (+0xa8, from the template's own JSON: every "LS …"
+  template says "landscape") and binds `paperNoteBounds` as for any template, so an LS
+  template on 1404 × 1872 has templateWidth 1872, templateHeight 1404, paperOriginX
+  1872/2 − 936 = 0, paperWidth 1872, paperHeight 1404. Its paint (0x140a0c740, case 6:
+  JSON templates) translates by −templateWidth/2, so template x 0 is scene −936: the
+  template covers the note bounds exactly.
+- *Client.* `PageContent.landscape` (`ui.pages.is_landscape_document`) makes the frame of
+  a page without a PDF page the note bounds, in page coordinates (w/2 − h/2, 0, h, w) =
+  (−234, 0, 1872, 1404); everything that uses the frame follows: the viewer
+  (`primaryContentRect`), thumbnails (`ThumbnailService.VERSION` 3), PDF/PNG/SVG export,
+  ink bounds. `viewer.templates.template_size/template_left/template_environment` lay an
+  LS template out on the transposed paper from page x w/2 − templateWidth/2 (`parent*`
+  stay template coordinates, as the app's translated painter has them; no shipped
+  template reads them). The tablet stores landscape strokes in these same scene
+  coordinates, so they need nothing. `tests/test_v1_finish_offline.py` (Landscape*): the
+  template variables, a lines template across the page, strokes across a wide page, wide
+  thumbnails and exports, a landscape notebook opened through main.qml. The cache has no
+  landscape notebook (3 landscape PDFs, whose pages are their PDF pages).
 - Checked: `tests/test_paper_sizes_offline.py`; a read-only scan of the cache
   (4,282 distinct v6 pages, `.rm` files and blobs): fields 5/7/8 are 1404 × 1872 on every
   page that has them, field 8 always at 0:0; 498 pages stop after field 3, 695 after
@@ -2833,16 +2941,56 @@ tests/fakecloud.py answering synthetic JIIX); never sent to the real cloud.
 0x1404425c0; the moc dispatcher's slot order puts it after `createImageSnippetFromStroke`
 0x14043c090). DocumentViewport's paste action calls it instead of `pasteLines()` when
 text mode is on and the clipboard last took items. It does nothing for an empty list,
-then posts a `std::function<bool(Scene*)>` (RTTI `<lambda_1>@…insertItemsAtCursorPosition`)
-to the page's worker that adds a `SceneInsertItemsAfterActionCrdt`: the items go in a
-group anchored to the text after the cursor (strings "copied {} anchored groups along with
-the text", "anchored %lld items total"), one undoable action. Client
-(`_SceneView.insert_items_at_cursor`): what was typed is kept first, then the items are
-pasted (`paste_items`: one StrokePaste/ImageInsert action, pending edits, the pasted
-items selected) with their box's top-left at the caret (`textCursorPosition`), scaled by
-1/`defaultScale` as `pasteLines` does and kept on the paper horizontally.
-**Deviation**: unanchored (the client writes no anchored groups; pen strokes on pages
-with text are unanchored here too), so they do not move when the text above reflows.
+then posts a `std::function<bool(Scene*)>` (RTTI `<lambda_1>@…insertItemsAtCursorPosition`,
+`_Do_call` 0x140434630) to the page's worker [O]:
+1. Each item is cloned (id and parent 0:0) and its image file copied (0x1409b1a90).
+2. Nothing more happens unless the scene has a root text (+0x278) and a text editor
+   (+0x380); the position is the editor's cursor (0x1404428b0: a selection is dropped,
+   never below 0).
+3. The box around all items is moved sideways onto x 0, the text box's centre line,
+   unless it is there already (qFuzzyCompare). The first image is then scaled about 0, 0
+   by min(1, text width / its width) (0x140440ce0; the width is the text's +0x500, 740
+   without one, 0x140443d50).
+4. 0x140951040, inside one undo macro (0x140a4f2f0 … 0x140a4f300), asks the text for room
+   (0x140a4ed10) of the items' height + 50 + 38 (0x140c8bf80): at cursor p, with
+   atBlockStart / atBlockEnd / blockIsEmpty ("insertionIndex=%d atBlockStart=%d
+   atBlockEnd=%d blockIsEmpty=%d newlines=%d"), n = ceil((needed − that empty block's
+   height) / line) for an empty block the cursor starts, else ceil(needed / line) + 1 in
+   the middle of a block; line = the default style's line spacing + LineHeight + top and
+   bottom margins (0x140930fd0). n newlines go in at p (one more when p is the end of the
+   text, characterCount − 1), the n + atBlockEnd − u new blocks from p + u (u = 1 unless
+   the cursor started a block with text) get the default style (0x140a41920), and a
+   block split in two gets its style back after the room (0x14092ffa0). The room's y is
+   the block before it (its top when the cursor started it, else its bottom) plus half of
+   (the next block's top − that − needed) ("Incorrect spacing. This is a bug" below 0).
+5. The items are moved down so their top is at 50 + that y, then handed to the anchor
+   manager (0x14096ca70) with type 2 forced and "join an overlapping group" on (the same
+   path as a pen stroke on a page with text, §5.1 "Where a new stroke goes"): they go into
+   a group anchored to the character under the centre of their box, stored less the anchor
+   position. Without an anchor manager a `SceneInsertItemsAfterActionCrdt` (vtable
+   0x140d6d6e0) inserts them unanchored.
+
+Client (`_SceneView.insert_items_at_cursor` → `_paste_anchored`, `ui.textedit.make_room` /
+`anchor_under`, `ui.editing.centred_for_cursor` / `moved_down`, `viewer.rm_anchor.add_group`,
+`LibrarySource.paste_anchored`): what was typed is kept first, then steps 3–5 as above on
+the open text session, and the text's new lines, a new `AnchoredGroupAdd` pending edit
+(anchor = the new line's character, named `("edit", uid, n)`; anchorOriginX = that
+character's x; type 2, threshold 35.748) and a `StrokePaste` into it (`layer` = the
+group, `("edit", uid)`) are kept as **one** undo step (the text's steps and the strokes'
+`StrokeChange`; undo takes the strokes, then the styles, then the lines). The text
+session is read again afterwards (the group and strokes took ids it did not know). The
+strokes then reflow with the text (`renderer.stroke_offsets`). Deviations: the number of
+new lines uses the app's body line (69.546875, §5.1) but positions come from this
+client's layout (71.5 per body line), so the room is slightly taller here; the pasted
+strokes always make one new group (no clustering, no joining a group they overlap);
+images are placed in the room but not anchored (this client draws no anchored images);
+undo leaves the emptied group node (as the eraser does). `AnchoredGroupAdd` replay makes
+no group when its character is not on the page, and the strokes then go on the layer.
+Checked: `test_bridge_polish_offline` (Ctrl+V in text mode through main.qml: the room,
+the anchor fields, the strokes drawn centred in the room, one undo step, reflow when a
+line is typed above), `test_v1_finish_offline` (`MakeRoomTests`, `AnchoredGroupTests`:
+the group's blocks byte for byte against a real node's layout, the edit's round trip and
+replay).
 
 **UserInfo from the user token** (`src/xofm/libs/user/src/legacy.cpp` parseUserToken →
 toUserInfoData, rm.user.legacy): the JWT's `auth0-profile` {`UserID` → id, `Name` → name,
@@ -2851,9 +2999,16 @@ subscriptionLevel ("Subscription changed from: {} to: {}"), `tectonic`. The acco
 type is Google when the UserID names "google" (0x1403735cd), Facebook for "facebook"
 (0x140373613), else Undefined (the comparing import at 0x140c700f8 was not resolved: the
 client tests "contains", which also covers a prefix). The claim names were checked
-read-only against the cached token's structure (key names only). `isSubscribed`'s
-getter was not traced: the client reads a level other than "", "free" or "none" as
-subscribed. `QuickApp` fills UserInfo at start and on log-in (`AuthClient
+read-only against the cached token's structure (key names only).
+**`isSubscribed`** [O] is the bool at UserInfo+0xe8 (getter 0x1403710b0), set only by
+`setSubscriptionLevel` (userinfo.cpp, 0x140370820): nothing when the level equals the
+string shown now; an empty level shows tr("Not subscribed") and clears it; any other
+level sets it (there is no list of free levels: "free" counts as subscribed) and is
+shown split at the regex `( |-|_|:|\t)` (KeepEmptyParts), each part "%1%2 " with its first
+letter upper-cased and the rest lower-cased, trimmed and translated ("connect" →
+"Connect"); then "Subscription changed from: {} to: {}", isSubscribedChanged when it
+changed, subscriptionLevelStringSet. The constructor starts at tr("Not subscribed"),
+false (0x14036cf0e). The client's `UserInfo.setSubscriptionLevel` does the same. `QuickApp` fills UserInfo at start and on log-in (`AuthClient
 .cached_user_token`, no request) and clears it on log-out; nothing of it is logged.
 
 **Busy entries.** ActionManager turns copy, move, delete, rename, export and share off
@@ -2873,6 +3028,79 @@ source (`image://rmthumb/<id>/<page>?v=…`) by the time the document closes, as
 library's node for it changes with the pending edits (test
 `test_an_edited_page_not_uploaded_gets_a_new_thumbnail_on_close`), so the slot stays a
 no-op here.
+
+### 5.14 The last stubs with behaviour: scroll positions, zoom, archives, files, sleep
+
+None of these is called by 3.29's desktop QML; they are wired so that the bridged API
+answers as the app's does (§2.2 lists what stays a no-op). Tests:
+`client/tests/test_v1_finish_offline.py`.
+
+- **`SelectionImage.image()`** (metacall 0x1403cc330 case 3): a copy of the QImage at
+  +0x28; `reset()` empties it. `updateImage` (0x1403eed70) makes it: an
+  ARGB32_Premultiplied image of `sceneRect.toAlignedRect().size()`, filled with
+  Qt::transparent, the selected items of the layer drawn through
+  `previewTransform * translate(−x, −y)`. Client: made on the first `image()` after an
+  update, through the same transform; the item still paints vectors.
+- **`LibraryFacade::countArchivedDocuments`** (0x1404aca80): the library's entries that are
+  documents (type 1) with `Document::archived` (+0x2cc) set. `archived` is set by
+  0x140669d10 = `QFile::exists("<dir>/<id>.cloudarchive")` (FileSystem vtable +8; the
+  suffix is the UTF-16 ".cloudarchive" at 0x141012988). 3.29's sync only ever removes such
+  files ("Failed to remove cloud archive file: {}", transfers-and-removal.cpp); no cached
+  document has one. Client: `DocumentWrapper.archived` = a "<id>.cloudarchive" among the
+  document's files; the count follows.
+- **`Library::purgeThumbnails`** (library-metadata.cpp 0x1404d4df0): for every document,
+  its `<id>.thumbnails` directory removed recursively ("Failed to purge thumbnails for
+  {:?}"), then "Purged thumbnails for {} documents" (all documents counted) and "Thumbnail
+  purge took {:.3f}s". Client: the cached thumbnail images named after each document's
+  hash go (`Library.thumbnail_dir`); they are drawn again when next shown.
+- **`LibraryController::setZoomMode`** (0x1404e3700): a mode above 3 → "Incorrect zoom mode
+  set: {}", false; else (the entry must be lockable, "isEditable") Document 0x140668a70
+  sets +0x2ac when it differs and emits zoomModeChanged. `.content` "zoomMode": the reader
+  0x1406d06c0 maps "fitToWidth" 1, "fitToHeight" 2, "customFit" 3, anything else
+  bestFit 0 (Document::ZoomMode).
+- **`setCustomZoomFit(id, scale, center, pageSize)`** (0x1404e1e70 → Document 0x1406676c0):
+  when the mode is not customFit or any of scale, centre, page size, or
+  customZoomOrientation (copied from the document's orientation, +0x2a8 → +0x438)
+  differs: all set, mode customFit (zoomModeChanged), customZoomChanged.
+- **`setScrollPosition(id, page, position)`** (0x1404e3120 → 0x1404e2e60): "no document
+  specified" without one; the page map must be in the current format (0x14065e7e0: a
+  formatVersion 1 document is upgraded as on load, else "Cannot set scroll position,
+  unable to ensure correct format version"); then Document 0x1406688b0 → page entry
+  0x140877620: `verticalScroll` = position and `scrollTime` =
+  `QDateTime::currentDateTimeUtc().toString(Qt::ISODate)`, each a register write by this
+  device (its counter + 1). Real pages carry both (573 of 7,015 cached page entries, the
+  two stamps always equal). **`DocumentWrapper.scrollPosition(page)`** (0x140666760 →
+  0x1408766d0): the value when the register was ever written and `scrollTime` is less
+  than 8 days ago (`daysTo` < 8; an unreadable time counts as now), else undefined.
+  Client: `core.pagemap.PageMap.set_scroll` / `page_scroll`, `core.create.set_scroll_position`.
+- **`DocumentController::setViewBackgroundFilter(id, value)`** (0x140493250 → 0x1404932d0 →
+  Document 0x140668a10): "invalid document..." and false without one; else the string at
+  +0x2b0 when it differs, viewBackgroundFilterChanged. The `.content` writer leaves
+  "viewBackgroundFilter" out when it is empty, so "" removes the key. Nothing in 3.29
+  draws a filter from it, and nothing here does.
+- All four `.content` setters change their field only and keep `lastModified` (like
+  setOrientation, §5.6); here they go through `LibraryController._set_setting` (shown at
+  once, committed to the cloud; written into the files of a document made here and not
+  uploaded yet).
+- **`PlatformHelpers::openFileChooser`**: 3.29 for Windows does nothing (its metacall,
+  0x140094b10, has no case for slot 12; the desktop QML imports through FileImportDialog,
+  which emits `documentAccepted` per file). Linux: a QFileDialog for PDFs and EPUBs (Qt
+  uses the XDG desktop portal's chooser where there is one); each chosen file goes out
+  through `documentAccepted(url, "", folder, false, false)`, as FileImportDialog sends it.
+- **`PlatformHelpers::setInhibitSleep(inhibit, why)`** (platformhelpers.cpp 0x1400f79b0):
+  `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)` to
+  inhibit, `ES_CONTINUOUS` to restore, then "{} to {} display sleep" (Succeeded/Failed,
+  inhibit/restore). Linux: `org.freedesktop.ScreenSaver` `Inhibit("reMarkable", why)` on
+  the session bus, `UnInhibit(cookie)` to restore, one inhibition at a time
+  (`ScreenSaverInhibitor`), the same log line.
+- **`PlatformApp::shouldShowWhatsNew(version)`** (0x14003d3d0): the stored
+  WhatsNewVersionRead (`getValue(WhatsNewVersionRead, "0")`, logged "Read version:");
+  true when it does not split into two parts at "." (KeepEmptyParts), else when it sorts
+  before `version` UTF-16 unit by unit (a prefix first). WhatsNewDialog
+  (`whatsNewJson.showFirstTime`, version "3.29") then shows the release notes and its
+  `markWhatsNewAsRead` stores the version. Client: the same, so a first start shows the
+  dialog once; `core.config.WHATS_NEW_READ_DEFAULT` is that "0" (the tests' helper raises
+  it, so their windows start clear; `WhatsNewTests` checks the dialog with "0").
 
 ## 6. Implications for the Linux client
 

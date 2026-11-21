@@ -17,8 +17,14 @@ import hashlib
 import json
 from pathlib import Path
 
+from core import config as _config
 from core.auth import AuthClient, HttpResponse, decode_jwt_claims
 from core.config import AuthState, AuthStore, Settings
+
+# Test apps start with a fresh settings.ini, where 3.29 would show its release notes
+# (WhatsNewDialog) over the window. They start as if this version's were read already;
+# test_v1_finish_offline checks the dialog with the real default.
+_config.WHATS_NEW_READ_DEFAULT = "99.99"
 
 COLLECTION = "80000000"
 AUTH_HOST = "auth.invalid"

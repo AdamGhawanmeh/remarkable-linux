@@ -52,6 +52,7 @@ from .bridge.exporter import DocumentExporter
 from .bridge.images import DragIconImageProvider, ThumbnailImageProvider
 from .bridge.importer import DocumentImporter
 from .bridge.library import DocumentSelection, DocumentSync, Library, LibraryController, SyncStatus
+from core import config
 from .bridge.platform import (LOGIN_RESULTS, ArkIconProvider, ArkTokensSettings, Authentication, Clipboard,
                               DocumentController, HandwritingLanguageModel, LanguageSettings, LinkProvider,
                               NetworkClient, PlatformApp, PlatformHelpers, Settings, SettingsStore, UserInfo,
@@ -380,6 +381,11 @@ class QuickApp:
         library_controller = self.singletons.controller
         library_controller.source = lambda: self.source
         library_controller.refresh = lambda: self.set_tree(self.source.sync.tree)
+        controller.set_setting = library_controller.set_document_setting
+        helpers = self.singletons.platform_helpers
+        self.singletons.platform_app.whats_new_read = \
+            lambda: helpers.getValue(int(PlatformHelpers.SettingsKey.WhatsNewVersionRead), config.WHATS_NEW_READ_DEFAULT)
+        self.library.thumbnail_dir = self.cache_dir / "thumbnails"     # Library.purgeThumbnails
         self.library.pdf_locked = self._pdf_locked
         set_clipboard(self.singletons.clipboard)
         self.translator = QTranslator()

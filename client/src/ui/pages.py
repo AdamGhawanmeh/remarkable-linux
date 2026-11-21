@@ -102,6 +102,9 @@ class PageContent:
     pdf: PdfFile | None
     pdf_page: int | None
     template: Template | None = None     # drawn only on pages without a PDF background
+    # The document's orientation is "landscape" (Qt::Horizontal). Its pages without a PDF
+    # page are then the paper's note bounds, wide: see frame().
+    landscape: bool = False
 
     @property
     def has_pdf_page(self) -> bool:
@@ -120,10 +123,24 @@ class PageContent:
         """Page x of the scene's x = 0: half the paper's width."""
         return self.paper[0] / 2
 
+    @property
+    def is_landscape(self) -> bool:
+        """Shown wide: a page without a PDF page in a landscape document."""
+        return self.landscape and not self.has_pdf_page
+
     def frame(self) -> QRectF:
+        """The PDF page's rect, else the paper; on a landscape page the paper's note
+        bounds QRectF(-h/2, 0, h, w) (Scene 0x1408a8df0), which is what 3.29's thumbnail
+        job (0x14055d170) renders for a document whose orientation is Horizontal (or a
+        PDF page wider than tall, 0x1405633f0) into a transposed (h x w) image: the scene
+        is not turned, its paper simply lies across. In page coordinates (scene x = 0 at
+        page x = w/2) that is (w/2 - h/2, 0, h, w)."""
         if self.has_pdf_page:
             return pdf_target_rect(self.pdf.page_size(self.pdf_page), self.paper)
-        return QRectF(0, 0, *self.paper)
+        width, height = self.paper
+        if self.landscape:
+            return QRectF(width / 2 - height / 2, 0, height, width)
+        return QRectF(0, 0, width, height)
 
     def bounds(self, crop: str) -> tuple[float, float, float, float]:
         """"clip": the page frame; "page": the frame plus any ink/text beyond it."""
@@ -131,7 +148,8 @@ class PageContent:
         if crop == "page" and self.scene is not None:
             # A PDF page is its frame, not the notebook paper: grown only where ink lies
             # beyond it (a slide stays 16:9 once drawn on).
-            paper = (frame.x(), frame.y(), frame.width(), frame.height()) if self.has_pdf_page else None
+            paper = (frame.x(), frame.y(), frame.width(), frame.height()) \
+                if self.has_pdf_page or self.is_landscape else None
             frame = QRectF(*render_bounds(self.scene, "page", measure=qt_measure, paper=paper))
         elif crop != "clip" and crop != "page":
             raise ValueError(f"unknown crop mode {crop!r}")
@@ -198,7 +216,7 @@ class DocumentPages:
     def content(self, index: int) -> PageContent:
         page = self.pages[index]
         return PageContent(self.source.page_scene(self.doc, page), self.pdf, page.pdf_page,
-                           self.templates.get(page.template))
+                           self.templates.get(page.template), landscape=is_landscape_document(self.doc))
 
     def render(self, index: int, scale: float, crop: str = "page") -> QImage:
         return render_content(self.content(index), scale, crop)
@@ -206,6 +224,11 @@ class DocumentPages:
     def close(self) -> None:
         if self.pdf is not None:
             self.pdf.close()
+
+
+def is_landscape_document(doc: Document) -> bool:
+    """.content "orientation" "landscape" (read as 0x1406cf330: Qt::Horizontal)."""
+    return getattr(doc.content, "orientation", "portrait") == "landscape"
 
 
 def cover_index(doc: Document, page_count: int) -> int:

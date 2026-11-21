@@ -79,6 +79,7 @@ from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from viewer import rm_anchor
 from viewer import rm_layer
 from viewer import rm_select
 from viewer import rm_stroke
@@ -512,6 +513,39 @@ class StrokePaste:
                        raw.get("layer"))
 
 
+@dataclass(frozen=True)
+class AnchoredGroupAdd:
+    """A group of a layer anchored to a character of the page's typed text
+    (viewer.rm_anchor.add_group), as the anchor manager makes one for items pasted at
+    the text cursor; named ("edit", uid), so that a StrokePaste can put strokes in it
+    (its `layer` = ("edit", uid)). `anchor`: the character (a TextEdit's ("edit", uid, n),
+    a page item ("page", a, c), or a sentinel); `origin_x`: anchorOriginX; `layer`: the
+    layer (None: the current one). When the character is not on the page (any more),
+    no group is made and what was to go in it goes on the layer."""
+
+    doc_id: str
+    page_id: str
+    anchor: tuple
+    origin_x: float
+    created_ms: int
+    anchor_type: int = 2      # 2 Vertical, 1 Bidirectional (not "kind": the edits file's type key)
+    uid: str = ""
+    layer: ItemRef | None = None
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, anchor, origin_x: float, created_ms: int, anchor_type: int = 2,
+            uid: str | None = None, layer=None) -> "AnchoredGroupAdd":
+        if int(anchor_type) not in (1, 2):
+            raise EditError(f"not an anchor type: {anchor_type!r}")
+        return cls(str(doc_id), str(page_id), _char_ref(anchor), _number(origin_x, "anchor origin"),
+                   int(created_ms), int(anchor_type), uuid.uuid4().hex if uid is None else str(uid), _opt_ref(layer))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "AnchoredGroupAdd":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["anchor"], raw["origin_x"], raw["created_ms"],
+                       raw.get("anchor_type") or 2, raw.get("uid") or "", raw.get("layer"))
+
+
 # ------------------------------------------------------------------ layers & SceneInfo
 
 @dataclass(frozen=True)
@@ -737,7 +771,7 @@ LAYER_EDITS = (LayerAdd, LayerDelete, LayerReattach, LayerRename, LayerVisibilit
                LayerMove, LayerMergeDown, LayerUnmerge, SceneFlags)
 
 
-STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore, StrokePaste, ItemsTransform)
+STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore, StrokePaste, ItemsTransform, AnchoredGroupAdd)
 
 
 # ------------------------------------------------------------------ the pen settings of a document
@@ -1076,7 +1110,7 @@ DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
         | PageTemplate | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | StrokePaste | ItemsTransform
         | ToolSettings | LayerAdd | LayerDelete | LayerReattach | LayerRename | LayerVisibility | LayerMove
-        | LayerMergeDown | LayerUnmerge | SceneFlags)
+        | LayerMergeDown | LayerUnmerge | SceneFlags | AnchoredGroupAdd)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy, "page-import": PageImport,
                           "page-move": PageMove, "page-delete": PageDelete, "page-template": PageTemplate,
@@ -1086,7 +1120,8 @@ KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransfor
                           "items-transform": ItemsTransform, "tool-settings": ToolSettings,
                           "layer-add": LayerAdd, "layer-delete": LayerDelete, "layer-reattach": LayerReattach,
                           "layer-rename": LayerRename, "layer-visible": LayerVisibility, "layer-move": LayerMove,
-                          "layer-merge": LayerMergeDown, "layer-unmerge": LayerUnmerge, "scene-flags": SceneFlags}
+                          "layer-merge": LayerMergeDown, "layer-unmerge": LayerUnmerge, "scene-flags": SceneFlags,
+                          "anchored-group": AnchoredGroupAdd}
 
 
 class PendingEdits:
@@ -1527,6 +1562,21 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 continue
             if edit.uid:
                 made[edit.uid] = new_id
+            continue
+        if isinstance(edit, AnchoredGroupAdd):
+            done = Replay(page, made, removed, typed)
+            char = done.char(edit.anchor)
+            if char is None or page is None:
+                log.warning("not anchoring a group on page %s: its character is not on the page", edit.page_id)
+                continue
+            target_layer = done.resolve(edit.layer) if edit.layer is not None else None
+            try:
+                page, node = rm_anchor.add_group(page, author=author, layer=target_layer, char_id=char,
+                                                 origin_x=edit.origin_x, kind=edit.anchor_type)
+            except rm_anchor.AnchorError as err:
+                raise EditError(f"the anchored group does not fit the page: {err}") from err
+            if edit.uid:
+                made[edit.uid] = node
             continue
         if isinstance(edit, StrokePaste):
             done = Replay(page, made, removed, typed)

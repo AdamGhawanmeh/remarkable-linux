@@ -452,9 +452,15 @@ def transform_items(page: bytes, *, author: bytes, items: Iterable[tuple[int, in
     return w.join(header, blocks), made, old
 
 
+def _is_group_node(blocks: list[w.Block], node: tuple[int, int]) -> bool:
+    from . import rm_layer
+    return rm_layer._node_block_index(blocks, node) is not None
+
+
 def append_items(page: bytes | None, *, author: bytes, values: Sequence[rs.LineValue],
                  layer: tuple[int, int] | None = None) -> tuple[bytes, list[tuple[int, int]]]:
-    """(`page` with line values pasted on top of `layer`, the ids they took): each the
+    """(`page` with line values pasted on top of `layer` (a layer, or a group node such
+    as an anchored group), the ids they took): each the
     next id, appended, moveId 0:0, as the paste adds them (0x1408c2ae0; a shader
     piece's sourceId is renamed first, _fresh_sources). The legacy
     Eraser's white strokes may be pasted too; the tools a layer refuses may not."""
@@ -466,7 +472,10 @@ def append_items(page: bytes | None, *, author: bytes, values: Sequence[rs.LineV
             raise SelectError("an empty line")
         lines.append(replace(value, move_id=None))
     header, blocks = w.split(w.blank_page(author) if page is None else page)
-    layer = rs._layer(blocks, layer)
+    if layer is None or tuple(layer) in w.layers(blocks) or not _is_group_node(blocks, tuple(layer)):
+        layer = rs._layer(blocks, layer)
+    else:
+        layer = tuple(layer)                # a group node (an anchored group, rm_anchor)
     if not lines:
         return w.join(header, blocks), []
     me = w._author_index(blocks, author)

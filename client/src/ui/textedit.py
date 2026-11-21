@@ -47,6 +47,7 @@ moves the cursor to its end rather than adding empty lines down to the click.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -77,6 +78,8 @@ KEY_BACKSPACE, KEY_DELETE = 0x01000003, 0x01000007
 KEY_HOME, KEY_END, KEY_LEFT, KEY_UP, KEY_RIGHT, KEY_DOWN = 0x01000010, 0x01000011, 0x01000012, 0x01000013, \
     0x01000014, 0x01000015
 KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_UNDO, KEY_REDO, KEY_TOOL = 0x01000016, 0x01000017, 0x01000123, 0x01000124, 0x01000054
+
+log = logging.getLogger("rm.ui.textedit")
 
 _CTRL_KEYS = {0x31: TITLE_STYLE, 0x32: SUBHEADING_STYLE, 0x33: SUBHEADING2_STYLE, 0x34: PARAGRAPH_STYLE,
               0x35: BULLETPOINT_STYLE, 0x36: NUMBERED_LIST, 0x37: CHECKBOX_STYLE, 0x41: SELECT_ALL,
@@ -870,3 +873,115 @@ class TextSession:
         else:
             return False
         return True
+
+
+# -- room in the text for items pasted at the cursor -----------------------------------
+#
+# SceneController::insertItemsAtCursorPosition (0x1404425c0, lambda 0x140434630) hands
+# the items to 0x140951040, which asks the text (0x140a4ed10) for room for them: their
+# height plus ROOM_ABOVE and ROOM_BELOW (0x140c8bf80), all in one undo macro.
+
+ROOM_ABOVE, ROOM_BELOW = 50.0, 38.0
+# The default (body) paragraph's height in the app's layout (0x140930fd0: line spacing,
+# LineHeight, top and bottom margins; ARCHITECTURE.md 5.1: 69.546875 with the app's Qt
+# and fonts). It decides how many new lines are made, so the page holds as many as the
+# app would have put there; positions then come from this client's layout.
+APP_BODY_PITCH = 69.546875
+
+
+@dataclass
+class Room:
+    y: float                # scene y where the room's content starts (its centre less half)
+    first: int              # text index of the first new line
+    count: int              # newlines inserted
+
+
+def _block_rect(session: "TextSession", index: int) -> tuple[float, float] | None:
+    """(top, bottom) of the paragraph holding text index `index`, in this layout."""
+    lines = session.lines()
+    if not lines:
+        return None
+    para = lines[line_of(lines, index)].paragraph
+    mine = [line for line in lines if line.paragraph == para]
+    return (mine[0].baseline - mine[0].height * BASELINE_AT,
+            mine[-1].baseline + mine[-1].height * (1 - BASELINE_AT))
+
+
+def make_room(session: "TextSession", needed: float, pitch: float = APP_BODY_PITCH) -> Room:
+    """Make room for `needed` scene units of items at the cursor, as 0x140a4ed10 does,
+    recorded as one undo step of the session (its edits are then taken with take()):
+
+    - at the cursor p (a selection is dropped first): whether it is at its paragraph's
+      start / end and the paragraph is empty;
+    - n = ceil((needed - that empty paragraph's height) / pitch) for an empty paragraph
+      the cursor starts, else ceil(needed / pitch), one more in the middle of a
+      paragraph; never below 0;
+    - n newlines inserted at p, one more when p is the end of the text;
+    - the paragraphs made get the default (body) style, from p + u on (u = 1 unless the
+      cursor started a paragraph with text), n + (at end) - u of them; a paragraph split
+      in two gets its own style back for the part after the room;
+    - y = the gap between the paragraph before the room (its top when the cursor started
+      it, else its bottom) and the one after it, less `needed`, halved, from the first.
+    """
+    import math
+    session._stop_typing()
+    p = session.cursor
+    session.anchor = p
+    start, end = session.paragraph_range(p)
+    at_start, at_end, empty = p == start, p == end, start == end
+    empty_start = at_start and empty
+    saved = session.stored_style(p) if not at_end else None
+    if empty_start:
+        rect = _block_rect(session, p)
+        height = (rect[1] - rect[0]) if rect is not None else pitch
+        n = math.ceil((needed - height) / pitch)
+    else:
+        n = math.ceil(needed / pitch) + (1 if not at_start and not at_end else 0)
+    n = max(0, n)
+    last = session.text.length
+    after = p + n + (1 if at_end else 0)
+    count = n + (1 if p == last else 0)
+    changes: list = []
+    if count:
+        session._insert("\n" * count, changes)
+    u = 1 if empty_start or not at_start else 0
+    for k in range(n + (1 if at_end else 0) - u):
+        session._set_style(p + u + k, BODY_TEXT, changes)
+    if not at_end and saved is not None and after < session.text.length:
+        session._set_style(after, saved, changes)
+    session._step(changes)
+    session._stop_typing()
+    first = _block_rect(session, p)
+    then = _block_rect(session, after)
+    top0 = (first[0] if at_start else first[1]) if first is not None else session.text.root.y
+    top1 = then[0] if then is not None else top0 + needed
+    gap = top1 - top0 - needed
+    if gap < 0:
+        log.warning("Incorrect spacing. This is a bug")
+        gap = 0.0
+    return Room(top0 + gap * 0.5, p + (1 if u else 0), count)
+
+
+def anchor_under(session: "TextSession", x: float, y: float) -> tuple[CharRef, float, float]:
+    """(the character to anchor to, anchorOriginX, the anchor's y) for items whose box is
+    centred on scene (x, y), as a new type 2 group is anchored (0x140974950: the
+    character under the centre; above the text box the before-text sentinel, below it
+    the after-text one, 0x140972ed0 / 0x140972cf0). x is that character's x on its line
+    (stored as anchorOriginX); y the baseline the page draws the group's strokes from
+    (renderer.stroke_offsets: the first line of the paragraph holding the character)."""
+    from viewer.rm_anchor import AFTER_TEXT, BEFORE_TEXT
+    lines = session.lines()
+    root = session.text.root
+    if not lines or session.text.length == 0:
+        return ("page", *BEFORE_TEXT), float(root.x), float(root.y)
+    top = lines[0].baseline - lines[0].height * BASELINE_AT
+    bottom = lines[-1].baseline + lines[-1].height * (1 - BASELINE_AT)
+    if y < top:
+        return ("page", *BEFORE_TEXT), session.caret(0).x, float(root.y)
+    if y > bottom:
+        return ("page", *AFTER_TEXT), session.caret(session.text.length).x, float(root.y)
+    index = min(session.index_at(x, y), session.text.length - 1)
+    char = session.text.id_at(index)
+    para = lines[line_of(lines, index)].paragraph
+    first = next(line for line in lines if line.paragraph == para)
+    return session.ref(char), session.caret(index).x, first.baseline

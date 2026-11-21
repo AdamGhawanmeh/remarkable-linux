@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import platform as _platform
+import re
 import ssl
 import sys
 from enum import IntEnum
@@ -28,6 +29,7 @@ from PySide6.QtNetwork import QNetworkInformation
 from .images import AsyncImageProvider
 from PySide6.QtSvg import QSvgRenderer
 
+from core import config as _config
 from core.auth import PAIRING_URL, AuthNetworkError, PairingError, user_agent
 
 log = logging.getLogger("rm.ui.quick.platform")
@@ -445,6 +447,45 @@ class LinkProvider(QObject):
     connectionIsMetered = Property(bool, lambda self: False, constant=True)
 
 
+class ScreenSaverInhibitor:
+    """org.freedesktop.ScreenSaver on the session bus (GNOME, KDE and others provide it):
+    Inhibit(application, reason) returns a cookie that UnInhibit takes back. One inhibition
+    at a time, as SetThreadExecutionState has one state per thread."""
+
+    SERVICE, PATH, INTERFACE = "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver"
+
+    def __init__(self, bus=None) -> None:
+        self._bus = bus
+        self._cookie: int | None = None
+
+    def _interface(self):
+        from PySide6.QtDBus import QDBusConnection, QDBusInterface
+        bus = self._bus if self._bus is not None else QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            return None
+        interface = QDBusInterface(self.SERVICE, self.PATH, self.INTERFACE, bus)
+        return interface if interface.isValid() else None
+
+    def set(self, inhibit: bool, why: str) -> bool:
+        interface = self._interface()
+        if interface is None:
+            return False
+        if inhibit:
+            if self._cookie is not None:
+                return True
+            reply = interface.call("Inhibit", "reMarkable", why or "reMarkable")
+            values = reply.arguments() if reply is not None else []
+            if not values or reply.errorName():
+                return False
+            self._cookie = int(values[0])
+            return True
+        if self._cookie is None:
+            return True
+        reply = interface.call("UnInhibit", self._cookie)
+        self._cookie = None
+        return not (reply is not None and reply.errorName())
+
+
 class PlatformHelpers(QObject):
     """PlatformHelpers: desktop integration. documentAccepted is how FileImportDialog
     hands over picked files; the app imports them (QuickApp connects it)."""
@@ -470,6 +511,13 @@ class PlatformHelpers(QObject):
         super().__init__(parent)
         self._store = store or SettingsStore()
         self._export = export
+        # openFileChooser: shows a file dialog and calls back with the chosen file URLs
+        # (tests replace it); the folder the files go to (the app may set it).
+        self.choose_files: Callable[[Callable[[list], None]], None] = self._file_dialog
+        self.import_folder: Callable[[], str] = lambda: ""
+        # setInhibitSleep: (inhibit, why) -> whether it worked (tests replace it).
+        self.inhibit_sleep: Callable[[bool, str], bool] = ScreenSaverInhibitor().set
+        self._dialog = None
 
     doubleClickInterval = Property(int, lambda self: QGuiApplication.styleHints().mouseDoubleClickInterval(),
                                    constant=True)
@@ -500,7 +548,32 @@ class PlatformHelpers(QObject):
 
     @Slot()
     def openFileChooser(self) -> None:
-        log.info("openFileChooser: the desktop QML uses FileImportDialog")
+        """PlatformHelpers::openFileChooser. reMarkable.exe 3.29 (Windows) does nothing:
+        its metacall (0x140094b10) has no case for slot 12, and the desktop QML imports
+        through FileImportDialog, which emits documentAccepted for each file. Here, the
+        Linux way: a file dialog for PDFs and EPUBs (Qt uses the XDG desktop portal's
+        chooser where there is one), whose files go out through documentAccepted just as
+        FileImportDialog sends them (no visual name, the import folder, not scanned, not
+        deleted after), so the app imports them."""
+        def chosen(urls: list) -> None:
+            for url in urls:
+                url = QUrl(url)
+                if url.isLocalFile() and url.toLocalFile():
+                    self.documentAccepted.emit(url, "", self.import_folder(), False, False)
+        self.choose_files(chosen)
+
+    def _file_dialog(self, done: Callable[[list], None]) -> None:
+        from PySide6.QtWidgets import QApplication, QFileDialog
+        if not isinstance(QApplication.instance(), QApplication):
+            log.warning("openFileChooser: no widgets application to show a file dialog")
+            return
+        dialog = QFileDialog(None, QCoreApplication.translate("FileImportDialog", "Import"))
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dialog.setNameFilters(["Documents (*.pdf *.epub)", "PDF (*.pdf)", "EPUB (*.epub)"])
+        dialog.urlsSelected.connect(lambda urls: done(list(urls)))
+        dialog.finished.connect(lambda _: dialog.deleteLater())
+        self._dialog = dialog           # kept until it closes
+        dialog.open()
 
     @Slot(int, "QVariant")
     def setValue(self, key: int, value) -> None:
@@ -522,7 +595,13 @@ class PlatformHelpers(QObject):
 
     @Slot(bool, str)
     def setInhibitSleep(self, inhibit: bool, why: str) -> None:
-        pass
+        """PlatformHelpers::setInhibitSleep (platformhelpers.cpp 0x1400f79b0): Windows'
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        to inhibit, ES_CONTINUOUS alone to restore, then "{} to {} display sleep"
+        (Succeeded/Failed, inhibit/restore). Here the freedesktop way: the session's
+        org.freedesktop.ScreenSaver Inhibit(app, why) / UnInhibit(cookie)."""
+        ok = bool(self.inhibit_sleep(bool(inhibit), str(why or "")))
+        log.info("%s to %s display sleep", "Succeeded" if ok else "Failed", "inhibit" if inhibit else "restore")
 
     @Slot()
     def scanDocument(self) -> None:
@@ -577,6 +656,11 @@ def _os_version(part: int) -> int:
     return numbers[part] if part < len(numbers) else 0
 
 
+def _utf16(text: str) -> list[int]:
+    data = text.encode("utf-16-le")
+    return [int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)]
+
+
 class PlatformApp(QObject):
     """PlatformApp (XoApp): updates are the distribution's job, so no Sparkle. logout()
     (LogoutConfirmDialog) runs `on_logout`; the dialog waits for Authentication.loggedInChanged."""
@@ -584,6 +668,8 @@ class PlatformApp(QObject):
     def __init__(self, on_logout: Callable[[], None] | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.on_logout = on_logout
+        # PlatformHelpers' stored WhatsNewVersionRead (the app sets it; core.config's default).
+        self.whats_new_read: Callable[[], object] = lambda: _config.WHATS_NEW_READ_DEFAULT
 
     @Slot()
     def logout(self) -> None:
@@ -592,7 +678,17 @@ class PlatformApp(QObject):
 
     @Slot(str, result=bool)
     def shouldShowWhatsNew(self, version: str) -> bool:
-        return False
+        """PlatformApp::shouldShowWhatsNew (0x14003d3d0): the version last marked read
+        (PlatformHelpers WhatsNewVersionRead, "0" when never set; logged as "Read
+        version:"); true when it is not two parts split at "." (KeepEmptyParts), else
+        when it sorts before `version` UTF-16 unit by unit (a prefix sorts first).
+        WhatsNewDialog shows the release notes then, and marks the version read."""
+        value = self.whats_new_read()
+        read = "" if value is None else str(value)
+        log.info("Read version: %s", read)
+        if len(read.split(".")) != 2:
+            return True
+        return _utf16(read) < _utf16(str(version or ""))
 
     @Slot(result="QVariantMap")
     def whatsNewJson(self) -> dict:
@@ -767,15 +863,33 @@ class UserInfo(QObject):
     def __init__(self, email: str = "", parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._values = {"id": "", "name": "", "username": "", "email": email, "tectonic": "",
-                        "subscriptionLevel": ""}
+                        "subscriptionLevel": self._tr(self.NOT_SUBSCRIBED)}
+        self._subscribed = False
         self._account_type = 2
         self._created_at = 0
         self._scopes: list[str] = []
         self._client_edit = False
 
-    # Subscription levels that are not a subscription (an assumption: the getter of
-    # isSubscribed was not traced; the cache's token says "connect" for Connect).
-    UNSUBSCRIBED = ("", "free", "none")
+    # UserInfo::setSubscriptionLevel (userinfo.cpp, 0x140370820): the level's words, split
+    # at this pattern (QString::split, KeepEmptyParts), each made "Upper" + "lower" and
+    # followed by a space ("%1%2 "), then trimmed and translated; an empty level shows
+    # tr("Not subscribed"), which the constructor (0x14036cf0e) also starts with.
+    # isSubscribed (getter 0x1403710b0 = the bool at +0xe8) is true exactly when the level
+    # set last was not empty, whatever it says.
+    LEVEL_SEPARATORS = re.compile(r"(?: |-|_|:|\t)")
+    NOT_SUBSCRIBED = "Not subscribed"
+
+    @staticmethod
+    def _tr(text: str) -> str:
+        return QCoreApplication.translate("xofm::libs::user::UserInfo", text)
+
+    @classmethod
+    def subscription_text(cls, level: str) -> str:
+        """The subscriptionLevel string the app shows for a token's "level"."""
+        if not level:
+            return cls._tr(cls.NOT_SUBSCRIBED)
+        words = "".join(w[:1].upper() + w[1:].lower() + " " for w in cls.LEVEL_SEPARATORS.split(level))
+        return cls._tr(words.strip())
 
     def set_from_token(self, token: str) -> bool:
         """Fill in the user from the user token's claims, as the app's
@@ -827,11 +941,19 @@ class UserInfo(QObject):
 
     @Slot(str)
     def setSubscriptionLevel(self, value: str) -> None:
-        was = self.isSubscribed
-        self._values["subscriptionLevel"] = value
-        self.subscriptionLevelStringSet.emit()
-        if was != self.isSubscribed:
+        """As 0x140370820: nothing when `value` equals the string shown now (the app
+        compares the formatted string with the raw level), else the formatted level,
+        isSubscribed = level not empty, isSubscribedChanged if that changed, then
+        subscriptionLevelStringSet."""
+        value = value or ""
+        if value == self._values["subscriptionLevel"]:
+            return
+        was = self._subscribed
+        self._values["subscriptionLevel"] = self.subscription_text(value)
+        self._subscribed = bool(value)
+        if was != self._subscribed:
             self.isSubscribedChanged.emit()
+        self.subscriptionLevelStringSet.emit()
 
     def _value(key: str):
         return lambda self: self._values[key]
@@ -887,8 +1009,7 @@ class UserInfo(QObject):
     accountType = Property(int, lambda self: self._account_type, setAccountType, notify=accountTypeChanged)
     subscriptionLevel = Property(str, _value("subscriptionLevel"), notify=subscriptionLevelStringSet)
     tectonic = Property(str, _value("tectonic"), notify=tectonicChanged)
-    isSubscribed = Property(bool, lambda self: self._values["subscriptionLevel"].lower() not in UserInfo.UNSUBSCRIBED,
-                            notify=isSubscribedChanged)
+    isSubscribed = Property(bool, lambda self: self._subscribed, notify=isSubscribedChanged)
     scopes = Property("QStringList", lambda self: list(self._scopes), notify=scopesChanged)
     createdAt = Property("qlonglong", lambda self: self._created_at, notify=createdAtChanged)
 
@@ -936,6 +1057,8 @@ class DocumentController(QObject):
         self.source: Callable[[], object] = lambda: None
         self.refresh: Callable[[], None] = lambda: None
         self.notify: Callable[[str], None] = lambda message: log.warning("%s", message)
+        # The LibraryController's .content setter (the app sets it): (id, what, change) -> bool.
+        self.set_setting: Callable[[str, str, Callable[[dict], bool]], bool] | None = None
 
     def _set_library(self, library: QObject) -> None:
         self._library = library
@@ -1143,9 +1266,24 @@ class DocumentController(QObject):
                           lambda source, node: source.delete_pages(node, list(pages), self._now_ms()),
                           callback, lambda entry, _: entry.pagesRemoved.emit())
 
-    @Slot(str, str)
-    def setViewBackgroundFilter(self, document_id: str, value: str) -> None:
-        self._unsupported("setViewBackgroundFilter")
+    @Slot(str, str, result=bool)
+    def setViewBackgroundFilter(self, document_id: str, value: str) -> bool:
+        """DocumentController::setViewBackgroundFilter (0x140493250 -> 0x1404932d0 ->
+        Document 0x140668a10): the document's .content "viewBackgroundFilter" string,
+        when it differs (an empty one removes the key, as the writer leaves it out);
+        "invalid document..." and False without a document. The desktop QML never
+        calls it; the value is stored as given (nothing here draws a filter)."""
+        from core.create import set_view_background_filter
+        if self.set_setting is None:
+            log.warning("setViewBackgroundFilter: invalid document... (%r)", document_id)
+            return False
+        ok = self.set_setting(str(document_id), "Setting view background filter",
+                              lambda content: set_view_background_filter(content, str(value or "")))
+        library = self._library
+        entry = library.entryForId(str(document_id)) if ok and library is not None else None
+        if entry is not None and hasattr(entry, "viewBackgroundFilterChanged"):
+            entry.viewBackgroundFilterChanged.emit()
+        return ok
 
     @Slot(str, QSizeF, result=bool)
     @Slot(str, QSizeF, "QJSValue", result=bool)

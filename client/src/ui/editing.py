@@ -273,3 +273,51 @@ def pasted_corners(item: dict, scale: float, center: tuple[float, float]) -> lis
         corners = [(x * scale, y * scale, u, v) for x, y, u, v in corners]
     x, y, w, h = corner_bounds(corners)
     return moved(corners, center[0] - x - w * 0.5, center[1] - y - h * 0.5)
+
+
+def _fuzzy_zero(value: float) -> bool:
+    return abs(value) <= 1e-12
+
+
+def centred_for_cursor(lines, images, text_width: float) -> tuple[list, list]:
+    """Clipboard strokes and images as insertItemsAtCursorPosition's lambda (0x140434630)
+    prepares them, before the text makes room: cloned (rm_select.clone), the box around
+    all of them moved sideways onto the text box's centre line (scene x 0) unless it is
+    there already, then the first image scaled about 0, 0 to fit the text width
+    (0x140440ce0: min(1, text width / its width); the width is the text's, 740 without
+    one, 0x140443d50). (line values, image corners)."""
+    from viewer import rm_select, rm_writer
+    lines = [rm_select.clone(v) for v in lines]
+    shapes = [rm_writer.ImageValue(b"", (0, 0), (0, 0), [tuple(c) for c in item["vertices"]]) for item in images]
+    box = rm_select.union([rm_select.line_box(v) for v in lines] + [rm_select.corners_box(s.vertices) for s in shapes])
+    if box is not None:
+        cx = (box[0] + box[2]) / 2
+        if not _fuzzy_zero(cx):
+            shift = rm_select.translation(-cx, 0.0)
+            lines = [rm_select.clone(v, shift) for v in lines]
+            shapes = [rm_select.clone(s, shift) for s in shapes]
+    if shapes:
+        first = rm_select.corners_box(shapes[0].vertices)
+        width = first[2] - first[0] if first is not None else 0.0
+        scale = min(1.0, text_width / width) if width > 0 and text_width > 0 else 1.0
+        if abs(scale - 1.0) * 1e12 > min(abs(scale), 1.0):
+            shapes[0] = rm_select.clone(shapes[0], rm_select.scaling(0.0, 0.0, scale, scale))
+    return lines, [[tuple(v) for v in s.vertices] for s in shapes]
+
+
+def moved_down(lines, corners, top: float) -> tuple[list, list]:
+    """The items moved straight down (or up) so that the top of the box around them is
+    at `top` (0x140951040: by ROOM_ABOVE + the room's y - their top)."""
+    from viewer import rm_select
+    box = rm_select.union([rm_select.line_box(v) for v in lines] + [rm_select.corners_box(c) for c in corners])
+    if box is None:
+        return lines, corners
+    shift = rm_select.translation(0.0, top - box[1])
+    return ([rm_select.clone(v, shift) for v in lines],
+            [rm_select.transform_vertices(c, shift) for c in corners])
+
+
+def items_box(lines, corners):
+    """(x0, y0, x1, y1) around strokes and image corners, or None."""
+    from viewer import rm_select
+    return rm_select.union([rm_select.line_box(v) for v in lines] + [rm_select.corners_box(c) for c in corners])

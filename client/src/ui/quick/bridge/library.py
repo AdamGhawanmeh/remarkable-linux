@@ -22,6 +22,7 @@ import math
 import uuid
 from datetime import datetime, timezone
 from enum import IntEnum
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QObject, QPointF, QSizeF, Qt, QThreadPool, QTimer, Signal, Slot,
@@ -767,7 +768,10 @@ class DocumentWrapper(EntryWrapper):
                                notify=documentMetadataChanged)
     language = Property(str, lambda self: str(self._metadata().get("language", "")), notify=documentMetadataChanged)
     loadError = Property(bool, lambda self: False, notify=loadErrorChanged)
-    archived = Property(bool, lambda self: False, notify=archiveChanged)
+    # Document::archived (+0x2cc, set by 0x140669d10): QFile::exists of the document's
+    # "<id>.cloudarchive" next to its files (FileSystem vtable +8; 3.29's sync only ever
+    # deletes such files). Here: that file among the document's files.
+    archived = Property(bool, lambda self: is_cloud_archived(self._node), notify=archiveChanged)
     loadErrorType = Property(int, lambda self: 0, notify=loadErrorChanged)
     loadErrorDescription = Property(str, lambda self: "", notify=loadErrorChanged)
     sizeInBytes = Property("qlonglong", lambda self: self._node.content.size_in_bytes, notify=sizeInBytesChanged)
@@ -877,9 +881,14 @@ class DocumentWrapper(EntryWrapper):
         ids = self._page_ids()
         return self._page_tag_map().get(ids[page], []) if 0 <= page < len(ids) else []
 
-    @Slot(int, result=float)
-    def scrollPosition(self, page: int) -> float:
-        return 0.0
+    @Slot(int, result="QVariant")
+    def scrollPosition(self, page: int):
+        """Document::scrollPosition (0x140666760): the page's verticalScroll when it was
+        set less than 8 days ago (core.pagemap.page_scroll), else undefined."""
+        from core.pagemap import page_scroll
+        library = _current_library()
+        now = library._now() if library is not None and library._now is not None else datetime.now(timezone.utc)
+        return page_scroll(self._node.content.raw, int(page), now.astimezone(timezone.utc))
 
     @Slot(result=bool)
     def hasContentsOnAnyPage(self) -> bool:
@@ -1195,15 +1204,51 @@ class Library(QObject):
 
     @Slot(result=int)
     def countArchivedDocuments(self) -> int:
-        return 0
+        """LibraryFacade::countArchivedDocuments (0x1404aca80): the entries that are
+        documents (type 1) and archived (Document +0x2cc)."""
+        return sum(1 for node in self.tree.nodes.values()
+                   if isinstance(node, DocumentNode) and is_cloud_archived(node))
 
     @Slot(QObject, result=str)
     def entityIdForEntry(self, entry: QObject) -> str:
         return entry.property("id") if entry is not None else ""
 
+    # The client's on-disk thumbnail folder (the app sets it): purgeThumbnails empties it.
+    thumbnail_dir: Path | None = None
+
     @Slot()
     def purgeThumbnails(self) -> None:
-        pass
+        """Library::purgeThumbnails (library-metadata.cpp 0x1404d4df0): for every
+        document, its thumbnails go (the app removes "<id>.thumbnails" recursively;
+        "Failed to purge thumbnails for {:?}" when one cannot be), then "Purged
+        thumbnails for {} documents" with the number of documents. They are made again
+        when next shown. Here the thumbnails are the client's cached images, named after
+        the document's hash."""
+        import time
+        start = time.monotonic()
+        folder = self.thumbnail_dir
+        files = list(folder.iterdir()) if folder is not None and folder.is_dir() else []
+        count = 0
+        for node in list(self.tree.nodes.values()):
+            if not isinstance(node, DocumentNode):
+                continue
+            count += 1
+            for path in files:
+                if node.hash and path.name.startswith(f"{node.hash}-"):
+                    try:
+                        path.unlink()
+                    except OSError as err:
+                        log.warning("Failed to purge thumbnails for %r: %s", node.id, err)
+        log.info("Purged thumbnails for %d documents", count)
+        log.debug("Thumbnail purge took %.3fs", time.monotonic() - start)
+
+
+CLOUD_ARCHIVE = ".cloudarchive"         # 0x141012988
+
+
+def is_cloud_archived(node) -> bool:
+    """Whether a document is archived as 3.29 reads it: a "<id>.cloudarchive" file."""
+    return isinstance(node, DocumentNode) and f"{node.id}{CLOUD_ARCHIVE}" in (node.files or {})
 
 
 # -- selection and changes ------------------------------------------------------------
@@ -1587,25 +1632,43 @@ class LibraryController(QObject):
         forget_history(document_id)
 
     def _set_setting(self, document_id: str, what: str, field: str, value, change, unchanged: bool,
-                     drop_thumbnails: bool = False) -> None:
+                     drop_thumbnails: bool = False, shown: dict | None = None) -> bool:
         """A .content setting of a document, as the library's setters make it: nothing
         when it already has that value; on a document made here and not uploaded yet,
-        in its files; otherwise shown at once and committed to the cloud (lastModified
-        stays: these setters do not call Entry::setLastModified)."""
+        in its files; otherwise shown at once (`field` = `value`, or the fields `shown`)
+        and committed to the cloud (lastModified stays: these setters do not call
+        Entry::setLastModified). False when there is no such document."""
         node = self.library.tree.get(str(document_id))
         if not isinstance(node, DocumentNode):
             log.warning("%s: no document specified (%r)", what, document_id)
-            return
+            return False
         source = self.source()
         if source is not None and source.change_created(node.id, lambda content, metadata: change(content)):
             self.refresh()
-            return
+            return True
         if unchanged:
-            return
+            return True
         if source is not None:
-            source.show_fields(node.id, content={field: value})
+            source.show_fields(node.id, content=shown if shown is not None else {field: value})
             self.refresh()
         self.submit(what, lambda sync, _: sync.set_document_settings(node.id, change, drop_thumbnails), "")
+        return True
+
+    def _current_content(self, document_id: str) -> dict | None:
+        """A copy of the document's .content as shown now (with changes on their way)."""
+        import copy
+        node = self.library.tree.get(str(document_id))
+        return copy.deepcopy(node.content.raw) if isinstance(node, DocumentNode) else None
+
+    def set_document_setting(self, document_id: str, what: str, change: Callable[[dict], bool]) -> bool:
+        """A .content change made elsewhere (DocumentController.setViewBackgroundFilter) the
+        way this controller's setters make theirs: `change(content)` False = unchanged."""
+        content = self._current_content(document_id)
+        if content is None:
+            log.warning("%s: invalid document... (%r)", what, document_id)
+            return False
+        unchanged = not change(content)
+        return self._set_setting(document_id, what, "", None, change, unchanged, shown=content)
 
     @Slot(str, int)
     def setOrientation(self, document_id: str, orientation: int) -> None:
@@ -1658,17 +1721,81 @@ class LibraryController(QObject):
         if isinstance(entry, DocumentWrapper):
             entry.unlocked(bool(ok))
 
-    @Slot(str, int, float)
-    def setScrollPosition(self, document_id: str, page: int, position: float) -> None:
-        pass
+    @Slot(str, int, float, result=bool)
+    def setScrollPosition(self, document_id: str, page: int, position: float) -> bool:
+        """LibraryController::setScrollPosition (0x1404e3120 -> 0x1404e2e60): the page's
+        cPages verticalScroll and scrollTime (core.create.set_scroll_position), a
+        formatVersion 1 page list upgraded first. False for no document, a page out of
+        range or a document whose page list cannot be made ("Cannot set scroll position,
+        unable to ensure correct format version"). The desktop QML never calls it."""
+        from core.create import set_scroll_position
+        from core.edits import EditError
+        content = self._current_content(document_id)
+        if content is None:
+            log.warning("setScrollPosition: no document specified (%r)", document_id)
+            return False
+        source = self.source()
+        try:
+            author = source.sync.author() if source is not None else None
+        except EditError as err:
+            log.warning("setScrollPosition of %s: %s", document_id, err)
+            return False
+        if author is None:
+            return False
+        now = datetime.now(timezone.utc) if self.library._now is None else self.library._now().astimezone(timezone.utc)
+        log.debug("Setting scroll position of %s to %s on %d", document_id, position, page)
+        if not set_scroll_position(content, int(page), float(position), author, now):
+            log.warning("Cannot set scroll position of %s on page %d", document_id, page)
+            return False
+        return self._set_setting(document_id, "Setting scroll position", "", None,
+                                 lambda c: set_scroll_position(c, int(page), float(position), author, now), False,
+                                 shown={k: content[k] for k in ("cPages", "formatVersion", "pageCount") if k in content})
 
-    @Slot(str, int)
-    def setZoomMode(self, document_id: str, mode: int) -> None:
-        pass
+    @Slot(str, int, result=bool)
+    def setZoomMode(self, document_id: str, mode: int) -> bool:
+        """LibraryController::setZoomMode (0x1404e3700): Document::ZoomMode 0..3 (bestFit,
+        fitToWidth, fitToHeight, customFit) to .content "zoomMode"; a larger mode is
+        refused ("Incorrect zoom mode set: {}")."""
+        from core.create import ZOOM_MODES, set_zoom_mode, zoom_mode_value
+        mode = int(mode)
+        if not 0 <= mode <= 3:
+            log.warning("Incorrect zoom mode set: %d", mode)
+            return False
+        content = self._current_content(document_id)
+        if content is None:
+            log.warning("setZoomMode: no document specified... (%r)", document_id)
+            return False
+        unchanged = zoom_mode_value(content.get("zoomMode")) == mode
+        ok = self._set_setting(document_id, "Setting zoom mode", "zoomMode", ZOOM_MODES[mode],
+                               lambda c: set_zoom_mode(c, mode), unchanged)
+        if ok and not unchanged:
+            self._emit_document(document_id, "zoomModeChanged")
+        return ok
 
-    @Slot(str, float, QPointF, QSizeF)
-    def setCustomZoomFit(self, document_id: str, scale: float, center: QPointF, page_size: QSizeF) -> None:
-        pass
+    @Slot(str, float, QPointF, QSizeF, result=bool)
+    def setCustomZoomFit(self, document_id: str, scale: float, center: QPointF, page_size: QSizeF) -> bool:
+        """LibraryController::setCustomZoomFit (0x1404e1e70 -> Document 0x1406676c0): the
+        customZoom* fields (customZoomOrientation = the document's orientation) and
+        zoomMode customFit, when any of them differs."""
+        from core.create import set_custom_zoom
+        content = self._current_content(document_id)
+        if content is None:
+            log.warning("setCustomZoomFit: no document specified... (%r)", document_id)
+            return False
+        args = (float(scale), (center.x(), center.y()), (page_size.width(), page_size.height()))
+        unchanged = not set_custom_zoom(content, *args)
+        ok = self._set_setting(document_id, "Setting custom fit", "", None, lambda c: set_custom_zoom(c, *args),
+                               unchanged, shown={k: v for k, v in content.items()
+                                                 if k.startswith("customZoom") or k == "zoomMode"})
+        if ok and not unchanged:
+            self._emit_document(document_id, "customZoomChanged")
+            self._emit_document(document_id, "zoomModeChanged")
+        return ok
+
+    def _emit_document(self, document_id: str, signal: str) -> None:
+        entry = self.library._entries.get(str(document_id))
+        if isinstance(entry, DocumentWrapper):
+            getattr(entry, signal).emit()
 
     @Slot(str, str)
     def setVisibleName(self, entry_id: str, name: str) -> None:

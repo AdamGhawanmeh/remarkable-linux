@@ -77,8 +77,9 @@ class ThumbnailService(QObject):
         self._pending: set[str] = set()
         self._lock = threading.Lock()
 
-    # Bump when rendering changes so cached thumbnails are redrawn (v2: page templates).
-    VERSION = 2
+    # Bump when rendering changes so cached thumbnails are redrawn (v2: page templates;
+    # v3: landscape documents and landscape templates).
+    VERSION = 3
 
     def _file(self, doc: Document) -> Path:
         return self.dir / f"{doc.hash}-{self.width}-v{self.VERSION}.png"

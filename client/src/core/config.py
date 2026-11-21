@@ -21,6 +21,11 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+# What PlatformHelpers' WhatsNewVersionRead setting reads as before WhatsNewDialog first
+# marks a version read (PlatformApp::shouldShowWhatsNew, getValue(WhatsNewVersionRead,
+# "0"), reMarkable.exe 0x14003d408): with it, the release notes show on a first start.
+WHATS_NEW_READ_DEFAULT = "0"
+
 log = logging.getLogger("rm.config")
 
 APP_DIR_NAME = "remarkable-linux"

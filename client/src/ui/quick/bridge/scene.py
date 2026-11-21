@@ -824,21 +824,49 @@ class _SelectionImage:
         self._scene = None                  # (a page holding the selected items, its x origin)
         self._preview = QTransform()        # the pending transform
         self._rect = QRectF()               # the scene area the box stands for
+        self._image: QImage | None = None   # image(), made on request
 
     @Slot(QObject, int, int, QRectF, QTransform)
     def updateImage(self, worker, page: int, layer: int, scene_rect: QRectF, preview: QTransform) -> None:
         self._scene = worker.selection_preview() if hasattr(worker, "selection_preview") else None
         self._preview, self._rect = QTransform(preview), QRectF(scene_rect)
+        self._image = None                  # made again when asked for
         self.update()
 
     @Slot()
     def reset(self) -> None:
         self._scene = None
+        self._image = None
         self.update()
 
     @Slot(result=QImage)
     def image(self) -> QImage:
-        return QImage()
+        """SelectionImage::image (metacall 0x1403cc330 case 3): a copy of the image the last
+        updateImage made (0x1403eed70), an empty one after reset() or before any: the
+        selected items of the layer drawn through the preview transform, then moved by
+        -sceneRect.toAlignedRect().topLeft(), on a transparent (Qt::transparent)
+        ARGB32_Premultiplied image of sceneRect.toAlignedRect().size(), one pixel per
+        scene unit. Made here on first request after an update (the app makes it on
+        every update; this item paints the same thing as vectors)."""
+        if self._scene is None or self._rect.isEmpty():
+            return QImage()
+        if getattr(self, "_image", None) is None:
+            from viewer.renderer import paint
+            aligned = self._rect.toAlignedRect()
+            image = QImage(aligned.size(), QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            scene, x_origin = self._scene
+            painter = QPainter(image)
+            try:
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.translate(-aligned.x(), -aligned.y())
+                painter.setTransform(self._preview, True)
+                painter.translate(-x_origin, 0)     # the renderer draws in page coordinates
+                paint(painter, scene)
+            finally:
+                painter.end()
+            self._image = image
+        return QImage(self._image)
 
     def paint(self, painter: QPainter) -> None:
         if self._scene is None or self._rect.width() <= 0 or self._rect.height() <= 0:
@@ -2677,10 +2705,25 @@ class _SceneView:
         self._run_insertion(page_id, insert)
 
     def insert_items_at_cursor(self, items) -> None:
-        """SceneController.insertItemsAtCursorPosition: what was typed is kept first (so
-        undo takes the items, then the text), then the items are pasted at the caret."""
+        """SceneController.insertItemsAtCursorPosition (0x1404425c0, lambda 0x140434630,
+        ARCHITECTURE.md 5.13): what was typed is kept first; then the items are centred on
+        the text's centre line (the first image fitted to the text width), the text makes
+        room for them at the cursor (new body lines, ui.textedit.make_room), they are
+        moved into that room, and the strokes go into a new group anchored (type 2,
+        "Vertical") to the line under the middle of their box, so that they move with the
+        text when it reflows. Text, group and items are one action for undo. Images are
+        put on the layer where they land (the client draws no anchored images).
+        Without a text session (not typing): pasted unanchored at the caret."""
         bounds = editing.items_bounds(items) if items else None
         if not bounds:
+            return
+        if self.text_session is not None:
+            lines, images = editing.clip_lines(items), editing.clip_images(items)
+            target = self._insertion_target("Pasted items") if (lines or images) else None
+            if target is None:
+                return
+            layer = self._active_layer()
+            self._keep_text(then=lambda: self._paste_anchored(target, layer, lines, images))
             return
         c = self._controller
         caret = c._get("textCursorPosition")
@@ -2699,6 +2742,61 @@ class _SceneView:
             self._keep_text(then=paste)
         else:
             paste()
+
+    def _paste_anchored(self, target, layer: int, lines, images) -> None:
+        """The second half of insert_items_at_cursor, once what was typed is kept."""
+        from viewer import rm_select
+        session = self.text_session
+        if session is None:
+            return
+        source, node, page_id = target
+        lines, corners = editing.centred_for_cursor(lines, images, float(session.text.root.text_width or 740.0))
+        box = editing.items_box(lines, corners)
+        if box is None:
+            return
+        try:
+            room = textedit.make_room(session, (box[3] - box[1]) + textedit.ROOM_ABOVE + textedit.ROOM_BELOW)
+        except rm_text.TextError as err:
+            _notify(f"The items could not be pasted: {err}")
+            self._reopen_text()
+            return
+        lines, corners = editing.moved_down(lines, corners, textedit.ROOM_ABOVE + room.y)
+        box = editing.items_box(lines, corners)
+        anchor, origin_x, baseline = textedit.anchor_under(session, (box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        stored = [rm_select.clone(v, rm_select.translation(-origin_x, -baseline)) for v in lines]
+        edits, steps = session.take()
+        now_ms = _now_ms()
+
+        def job():
+            error = None
+            try:
+                pictures = []
+                for item, vertices in zip(images, corners):
+                    try:
+                        picture = QImage.fromData(source.image_file(item["documentId"], item["pageId"], item["fileName"]))
+                    except EditError as err:
+                        log.warning("dropping pasted image item, failed to load source image ref: %s", err)
+                        continue
+                    if picture.isNull():
+                        log.warning("dropping pasted image item, failed to load source image ref")
+                        continue
+                    data, extension, _ = editing.encode_image(picture)
+                    pictures.append((data, extension, vertices, item["timestamps"]))
+                source.paste_anchored(node, page_id, edits, steps, anchor, origin_x, stored, now_ms,
+                                      layer_index=layer, images=pictures)
+            except (EditError, *EXPECTED_ERRORS) as err:
+                error = str(err)
+            except Exception as err:      # an edit never takes the page view down with it
+                log.exception("pasting items at the text cursor on page %s", page_id)
+                error = f"The items could not be pasted: {type(err).__name__}"
+            emit_from_worker(self, lambda: self._text_kept.emit((error, self._after_anchored_paste)))
+        self._pool.start(_Job(job))
+
+    def _after_anchored_paste(self) -> None:
+        """The page shown again, and its text read again: the new group and strokes took
+        ids the text session did not know of."""
+        self._reopen_text()
+        self._load(quiet=True)
 
     def delete_selection(self, layer: int) -> None:
         target = self._selection_target(layer)

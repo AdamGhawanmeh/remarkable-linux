@@ -23,7 +23,7 @@ from typing import Callable
 
 from core.models import (ROOT_ID, TRASH_ID, Content, Document, DocumentTree, FileType, Folder, Node,
                          Page)
-from core.edits import (IMPORT_FILES, PAGE_EDITS, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
+from core.edits import (IMPORT_FILES, PAGE_EDITS, AnchoredGroupAdd, Change, Edit, EditError, ImageDelete, ImageInsert, ImageTransform, ItemsTransform,
                         LayerAdd, LayerAttachChange, LayerDelete, LayerMergeChange, LayerMergeDown, LayerMove,
                         LayerMoveChange, LayerRename, LayerRenameChange, LayerVisibility, LayerVisibilityChange,
                         PageAdd, PageCopy, PageDelete, PageHistory, PageImport, PageMove, PageTemplate, SceneFlagChange,
@@ -1401,6 +1401,43 @@ class LibrarySource:
             changes.append(StrokeChange(remove=tuple(StrokePart(("edit", f"{edit.uid}/{n}"), now[i].line.encode().hex())
                                                      for n, i in enumerate(ids) if i in now)))
         return edit, [i for i in ids if i is not None]
+
+    def paste_anchored(self, doc: Document, page_id: str, text_edits: list, text_steps: list, anchor,
+                       origin_x: float, lines, now_ms: int, layer_index: int | None = None,
+                       images=()) -> tuple[AnchoredGroupAdd, StrokePaste | None, list]:
+        """Items pasted at the text cursor (SceneController::insertItemsAtCursorPosition,
+        ARCHITECTURE.md 5.13), all one action for undo, as the app's undo macro makes
+        it: the text's new lines (`text_edits`, with their undo `text_steps`, from
+        ui.textedit.TextSession.take), a group of the layer anchored to the character
+        `anchor` (a text reference) with anchorOriginX `origin_x`, the strokes `lines`
+        (placed already, less the anchor position) in it, and `images` ((ImageInsert
+        arguments: data, extension, vertices, timestamps), on the layer). (the group
+        edit, the paste edit or None, the ids the strokes took)."""
+        with self._history_lock:
+            doc = self._editable(doc, page_id)
+            history = self._history(doc.id, page_id)
+            layer_ref, _ = self._layer_ref(doc, page_id, layer_index)
+            changes: list = []
+            self._add_edits(doc, [(e, None) for e in text_edits])
+            for step in text_steps:
+                changes += list(step)
+            group = AnchoredGroupAdd.new(doc.id, page_id, anchor, origin_x, now_ms, layer=layer_ref)
+            self._add_edit(doc, group)
+            paste, ids = None, []
+            if lines:
+                paste = StrokePaste.new(doc.id, page_id, lines, now_ms, layer=("edit", group.uid))
+                self._add_edit(doc, paste)
+                after, now = self._items(doc, page_id)
+                ids = [after.made.get(f"{paste.uid}/{n}") for n in range(len(paste.values))]
+                changes.append(StrokeChange(remove=tuple(
+                    StrokePart(("edit", f"{paste.uid}/{n}"), now[i].line.encode().hex())
+                    for n, i in enumerate(ids) if i in now)))
+            for data, extension, vertices, timestamps in images:
+                self.insert_image(doc, page_id, data, extension, vertices, now_ms, timestamps, changes, layer_index)
+            if changes:
+                history.push(changes)
+            history.seen = self._seen(doc.id, page_id)
+        return group, paste, [i for i in ids if i is not None]
 
     # -- layers & SceneInfo --
 

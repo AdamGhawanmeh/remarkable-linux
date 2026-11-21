@@ -66,7 +66,7 @@ from viewer.rm_parser import Color, Tool
 
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, ItemsTransform, PageAdd,
                     PageCopy, PageDelete, PageImport, PageMove, PageTemplate, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
-                    TextEdit, ToolSettings, LAYER_EDITS, SceneFlags,
+                    TextEdit, ToolSettings, LAYER_EDITS, SceneFlags, AnchoredGroupAdd,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
@@ -434,6 +434,9 @@ def _name(enum, value: int) -> str:
     return member.name.title().replace("_V2", "v2").replace("_", "")
 
 
+_ANCHORED_UIDS: set[str] = set()      # anchored groups described so far (their pastes say so)
+
+
 def describe_edit(e) -> str:
     """One pending edit, as push plans list them."""
     if isinstance(e, TextEdit):
@@ -472,7 +475,13 @@ def describe_edit(e) -> str:
         return (f"  put back a stroke on page {e.page_id} (undo/redo): {_name(Tool, line.tool)}, "
                 f"{line.count} points")
     if isinstance(e, StrokePaste):
-        return f"  paste {len(e.values)} stroke{'s' if len(e.values) != 1 else ''} on page {e.page_id}"
+        into = " into an anchored group" if e.layer is not None and e.layer[0] == "edit" and \
+            str(e.layer[1]) in _ANCHORED_UIDS else ""
+        return f"  paste {len(e.values)} stroke{'s' if len(e.values) != 1 else ''}{into} on page {e.page_id}"
+    if isinstance(e, AnchoredGroupAdd):
+        _ANCHORED_UIDS.add(e.uid)
+        what = {1: "bidirectional", 2: "vertical"}.get(e.anchor_type, str(e.anchor_type))
+        return f"  group anchored to the typed text ({what}, origin x {e.origin_x:g}) on page {e.page_id}"
     if isinstance(e, ItemsTransform):
         m = e.matrix
         what = "move" if rm_select.is_translation(m) else "move/scale/turn"

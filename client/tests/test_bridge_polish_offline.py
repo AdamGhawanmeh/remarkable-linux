@@ -2,7 +2,9 @@
 synthetic JWTs only; nothing reaches the real cloud):
 
 - B1 SceneController.insertItemsAtCursorPosition: strokes copied, then Ctrl+V in text
-  mode, put at the caret as one undo step after the text typed, as pending edits.
+  mode: the text makes room after the cursor and the strokes go into a group anchored
+  to it (they reflow with the text), one undo step after the text typed, as pending
+  edits.
 - B2 UserInfo from the user token's claims (id, name, username, email, account type,
   subscription level, isSubscribed, scopes, createdAt), set at start and cleared on
   log-out.
@@ -64,7 +66,7 @@ class UserInfoTests(unittest.TestCase):
                          ("google-oauth2|000000000000000000001", "Test User", "test.user", "test.user@example.invalid"))
         self.assertEqual(info.property("accountType"), 0)
         self.assertEqual(info.getAccountTypeString(), "Google")
-        self.assertEqual(info.property("subscriptionLevel"), "connect")
+        self.assertEqual(info.property("subscriptionLevel"), "Connect")      # as setSubscriptionLevel formats it
         self.assertTrue(info.property("isSubscribed"))
         self.assertEqual(info.property("tectonic"), "eu")
         self.assertEqual(info.property("scopes"), ["sync:tortoise", "intgr", "screenshare", "hwcmail:-1", "mail:-1"])
@@ -77,10 +79,31 @@ class UserInfoTests(unittest.TestCase):
             info = UserInfo()
             info.set_from_token(make_jwt({"auth0-profile": {"UserID": user_id}}))
             self.assertEqual(info.property("accountType"), kind, user_id)
-        for level, subscribed in (("connect", True), ("free", False), ("", False), ("none", False)):
+        # setSubscriptionLevel 0x140370820: subscribed exactly when the level is not empty
+        # (the app has no list of "free" levels); words split at " -_:\t", capitalised.
+        for level, subscribed, shown in (("connect", True, "Connect"), ("free", True, "Free"), ("", False, "Not subscribed"),
+                                         ("none", True, "None"), ("CONNECT_plus-trial", True, "Connect Plus Trial"),
+                                         ("a::b", True, "A  B")):
             info = UserInfo()
             info.set_from_token(make_jwt({"level": level}))
             self.assertEqual(info.property("isSubscribed"), subscribed, level)
+            self.assertEqual(info.property("subscriptionLevel"), shown, level)
+        info = UserInfo()                       # the constructor's state
+        self.assertEqual((info.property("subscriptionLevel"), info.property("isSubscribed")), ("Not subscribed", False))
+
+    def test_subscription_signals_follow_the_app(self):
+        info, seen = UserInfo(), []
+        info.isSubscribedChanged.connect(lambda: seen.append("subscribed"))
+        info.subscriptionLevelStringSet.connect(lambda: seen.append("level"))
+        info.setSubscriptionLevel("connect")
+        self.assertEqual(seen, ["subscribed", "level"])                  # changed flag first, then the string
+        info.setSubscriptionLevel("free")
+        self.assertEqual(seen, ["subscribed", "level", "level"])         # still subscribed: no isSubscribedChanged
+        info.setSubscriptionLevel("Free")                                # equals the string shown: nothing
+        self.assertEqual(len(seen), 3)
+        info.setSubscriptionLevel("")
+        self.assertEqual(seen[3:], ["subscribed", "level"])
+        self.assertFalse(info.property("isSubscribed"))
 
     def test_a_token_without_a_profile_uses_sub_and_junk_changes_nothing(self):
         info = UserInfo()
@@ -222,6 +245,12 @@ class BridgePolishQmlTests(unittest.TestCase):
 
     # -- B1 --
     def test_strokes_pasted_in_text_mode_go_to_the_caret_after_the_text(self):
+        """insertItemsAtCursorPosition (lambda 0x140434630 -> 0x140951040 -> 0x140a4ed10 and
+        the anchor manager 0x14096ca70 with type 2): the text makes room after the cursor
+        (new lines), the strokes go into a group anchored to a line of that room, centred
+        on the text's centre line, and move with the text; one undo step for all of it."""
+        from viewer import rm_anchor, rm_parser
+        from viewer.renderer import layout_text, qt_measure, stroke_offsets
         view = self.open_doc(THROWAWAY)
         self.assertTrue(self.wait_for(lambda: len(self.strokes(view)) == 3))
         ctrl = view._controller
@@ -235,20 +264,38 @@ class BridgePolishQmlTests(unittest.TestCase):
         self.qml("DocumentView_").setProperty("textMode", True)
         self.assertTrue(self.wait_for(lambda: view.text_session is not None), self.notices)
         view.text_do(lambda t: t.type_text("Header"))
-        caret = ctrl.property("textCursorPosition")
         # The app's paste action in text mode (Clipboard holds items): Ctrl+V.
         QMetaObject.invokeMethod(self.qml("DocumentViewport"), "forceActiveFocus")
         self.assertTrue(self.manager_js("pasteAction.enabled"))
         self.manager_js("pasteAction.trigger()")
         self.assertTrue(self.wait_for(lambda: len(self.strokes(view)) == 4), self.notices)
-        self.assertEqual(self.kinds()[-1], "StrokePaste")
-        self.assertIn("TextEdit", self.kinds())
-        self.assertEqual(self.text(), "Header")
-        from viewer import rm_select
-        box = rm_select.line_box(rm_stroke_items(self.source, self.node())[-1].line)   # with the pen's width
-        self.assertAlmostEqual(box[0], caret.x(), delta=1.5)
-        self.assertAlmostEqual(box[1], caret.y(), delta=1.5)
-        # Undo takes the strokes, then the text; redo brings both back.
+        kinds = self.kinds()
+        self.assertEqual(kinds[-2:], ["AnchoredGroupAdd", "StrokePaste"])
+        self.assertIn("TextEdit", kinds)
+        text = self.text()
+        self.assertTrue(text.startswith("Header\n"), repr(text))
+        self.assertEqual(set(text[len("Header"):]), {"\n"})
+        self.assertGreaterEqual(text.count("\n"), 3)          # ceil((h + 50 + 38) / 69.55) + 1 at the end
+        # On the page: a group anchored (type 2, 4 mm) to one of the new lines.
+        node = self.node()
+        page = self.source.staged(node).replay(PAGE1).page
+        scene = rm_parser.parse(page)
+        (pasted,) = [st for st in scene.strokes if st.anchor is not None]
+        anchor = pasted.anchor
+        self.assertEqual(anchor.type, rm_anchor.VERTICAL)
+        self.assertAlmostEqual(anchor.threshold, 35.748032, places=5)
+        self.assertIn(scene.text.char_paragraph.get(anchor.char_id), range(1, text.count("\n") + 1))
+        # Drawn where the room is: centred on x 0, between "Header" and the last line.
+        lines = layout_text(scene, qt_measure)
+        dx, dy = stroke_offsets(scene, lines)[id(pasted)]
+        xs = [pt.x + dx for pt in pasted.points]
+        ys = [pt.y + dy for pt in pasted.points]
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2, 0.0, delta=3.0)
+        header = next(line for line in lines if line.paragraph == 0)
+        last = lines[-1]
+        self.assertGreater(min(ys), header.baseline)
+        self.assertLess(max(ys), last.baseline)
+        # Undo takes the strokes and the room in one step, then the text; redo both back.
         self.qml("DocumentView_").setProperty("textMode", False)
         self.assertTrue(self.wait_for(lambda: view.text_session is None))
         node = self.node()
@@ -260,6 +307,16 @@ class BridgePolishQmlTests(unittest.TestCase):
         self.assertTrue(self.source.redo(node, PAGE1, te.NOW + 3))
         self.assertTrue(self.source.redo(node, PAGE1, te.NOW + 4))
         self.assertEqual(len(rm_stroke_items(self.source, node)), 4)
+        self.assertEqual(self.text(), text)
+        # Reflow: a line typed above moves the anchored strokes down with the text.
+        before = min(ys)
+        from core.edits import TextEdit
+        self.source.add_text_edits(node, PAGE1, [TextEdit.new(THROWAWAY, PAGE1, "insert", te.NOW + 5, text="Top\n")],
+                                   [])
+        scene = rm_parser.parse(self.source.staged(self.node()).replay(PAGE1).page)
+        (moved,) = [st for st in scene.strokes if st.anchor is not None]
+        dx2, dy2 = stroke_offsets(scene, layout_text(scene, qt_measure))[id(moved)]
+        self.assertGreater(min(pt.y + dy2 for pt in moved.points), before + 30)
         self.assertEqual(self.notices, [])
 
     def test_nothing_copied_inserts_nothing(self):

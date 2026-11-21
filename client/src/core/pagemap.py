@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 FIRST, LAST, MIDDLE = "a", "z", "n"     # the key alphabet a..z (0x140d54270) and its middle
@@ -166,6 +167,45 @@ def _bump(entry: dict, name: str) -> None:
         stamp = parse_stamp(old.get("timestamp"))
         if stamp[1]:
             old["timestamp"] = format_stamp((stamp[0], stamp[1] + 1))
+
+
+def iso_utc(moment: datetime) -> str:
+    """QDateTime::toString(Qt::ISODate) of a UTC time: seconds, "Z"."""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def scroll_of(entry: dict, now_utc: datetime) -> float | None:
+    """A page entry's verticalScroll as 0x1408766d0 gives it (see PageMap.scroll)."""
+    field = entry.get("verticalScroll")
+    if not isinstance(field, dict) or not parse_stamp(field.get("timestamp"))[1]:
+        return None
+    try:
+        when = datetime.fromisoformat(str(_value(entry, "scrollTime", "")).replace("Z", "+00:00"))
+    except ValueError:
+        when = None                 # an invalid QDateTime: daysTo gives 0, so the value counts
+    if when is not None and when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    if when is not None and days_to(when, now_utc) >= 8:
+        return None
+    value = field.get("value")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def page_scroll(content: dict, index: int, now_utc: datetime) -> float | None:
+    """Document::scrollPosition(pageNumber) read from a .content without changing it:
+    the live page at `index` in the page map's order (see PageMap.scroll)."""
+    cpages = content.get("cPages") if isinstance(content, dict) else None
+    pages = cpages.get("pages") if isinstance(cpages, dict) else None
+    if not isinstance(pages, list):
+        return None
+    live = sorted((e for e in pages if isinstance(e, dict) and isinstance(e.get("id"), str)
+                   and not _value(e, "deleted")), key=PageMap._order)
+    return scroll_of(live[index], now_utc) if 0 <= index < len(live) else None
+
+
+def days_to(start: datetime, end: datetime) -> int:
+    """QDateTime::daysTo: the number of calendar days (by date, in UTC here) from start to end."""
+    return (end.astimezone(timezone.utc).date() - start.astimezone(timezone.utc).date()).days
 
 
 def _value(entry: dict, name: str, default: Any = None) -> Any:
@@ -342,6 +382,28 @@ class PageMap:
             return False
         _set(self.live[at], "template", str(template), self.author)
         return True
+
+    def set_scroll(self, index: int, position: float, now_utc: datetime) -> bool:
+        """LibraryController::setScrollPosition (0x1404e3120 -> Document 0x1406688b0 ->
+        page entry 0x140877620): the live page at `index` gets `verticalScroll` =
+        `position` and `scrollTime` = `now_utc` as Qt::ISODate ("2026-11-21T12:00:00Z"),
+        each a register write by this device (its own counter + 1). False (nothing
+        written) for an index out of range."""
+        if not 0 <= index < len(self.live):
+            return False
+        entry = self.live[index]
+        _set(entry, "verticalScroll", position, self.author)
+        _set(entry, "scrollTime", iso_utc(now_utc), self.author)
+        return True
+
+    def scroll(self, index: int, now_utc: datetime) -> float | None:
+        """Document::scrollPosition (0x140666760 -> 0x1408767b0 -> 0x1408766d0): the
+        page's verticalScroll, when it was ever written (counter not 0) and its
+        scrollTime is less than 8 days (QDateTime::daysTo) before `now_utc`; else None
+        (QML gets undefined)."""
+        if not 0 <= index < len(self.live):
+            return None
+        return scroll_of(self.live[index], now_utc)
 
     def delete(self, index: int) -> str:
         """Delete the live page at `index` (deletePage, 0x1408704d0): it stays listed,

@@ -152,6 +152,86 @@ def set_cover_page(content: dict, page: int) -> bool:
     return True
 
 
+# Document::ZoomMode (moc) and the .content names the reader 0x1406d06c0 maps to it
+# ("fitToWidth" 1, "fitToHeight" 2, "customFit" 3, anything else bestFit 0).
+ZOOM_MODES = ("bestFit", "fitToWidth", "fitToHeight", "customFit")
+CUSTOM_FIT = 3
+
+
+def zoom_mode_value(name: Any) -> int:
+    return ZOOM_MODES.index(name) if name in ZOOM_MODES[1:] else 0
+
+
+def set_zoom_mode(content: dict, mode: int) -> bool:
+    """LibraryController::setZoomMode (0x1404e3700 -> 0x1404e34a0 -> Document 0x140668a70):
+    "zoomMode" for a Document::ZoomMode; False when it is already that mode. The caller
+    refuses a mode above 3 ("Incorrect zoom mode set: {}")."""
+    if zoom_mode_value(content.get("zoomMode")) == int(mode):
+        return False
+    content["zoomMode"] = ZOOM_MODES[int(mode)]
+    return True
+
+
+def set_custom_zoom(content: dict, scale: float, center: tuple[float, float], page_size: tuple[float, float]) -> bool:
+    """LibraryController::setCustomZoomFit (0x1404e1e70 -> 0x1404e1ba0 -> Document
+    0x1406676c0): when the mode is not customFit, or the scale, centre, page size or
+    customZoomOrientation (which follows the document's own orientation) differ, all of
+    them are set and the mode becomes customFit. False when nothing differs."""
+    orientation = content.get("orientation") if content.get("orientation") == "landscape" else "portrait"
+    wanted = {"customZoomCenterX": float(center[0]), "customZoomCenterY": float(center[1]),
+              "customZoomPageWidth": float(page_size[0]), "customZoomPageHeight": float(page_size[1]),
+              "customZoomScale": float(scale)}
+    same = (zoom_mode_value(content.get("zoomMode")) == CUSTOM_FIT
+            and all(_number(content.get(k)) == v for k, v in wanted.items())
+            and (content.get("customZoomOrientation") == "landscape") == (orientation == "landscape"))
+    if same:
+        return False
+    content.update(wanted)
+    content["customZoomOrientation"] = orientation
+    content["zoomMode"] = ZOOM_MODES[CUSTOM_FIT]
+    return True
+
+
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def set_view_background_filter(content: dict, value: str) -> bool:
+    """DocumentController::setViewBackgroundFilter (0x140493250 -> 0x1404932d0 ->
+    Document 0x140668a10): the string, when it differs. The .content writer (0x1406ce210)
+    writes "viewBackgroundFilter" only when it is not empty, so "" removes the key."""
+    if str(content.get("viewBackgroundFilter") or "") == str(value or ""):
+        return False
+    if value:
+        content["viewBackgroundFilter"] = str(value)
+    else:
+        content.pop("viewBackgroundFilter", None)
+    return True
+
+
+def set_scroll_position(content: dict, index: int, position: float, author: bytes | str, now_utc) -> bool:
+    """LibraryController::setScrollPosition (0x1404e3120 -> 0x1404e2e60): the page map in
+    the current format first (a formatVersion 1 .content is upgraded as on load; one with
+    no page list cannot be: "Cannot set scroll position, unable to ensure correct format
+    version"), then the page's verticalScroll / scrollTime (PageMap.set_scroll). False
+    when nothing could be written."""
+    from .pagemap import PageMap, is_legacy, upgrade
+    if is_legacy(content):
+        if not isinstance(content.get("pages"), list):
+            return False
+        upgraded = upgrade(content, author)
+        content.clear()
+        content.update(upgraded)
+    try:
+        pagemap = PageMap(content, author)
+    except PageMapError:
+        return False
+    if not pagemap.set_scroll(int(index), float(position), now_utc):
+        return False
+    pagemap.save()
+    return True
+
+
 def thumbnail_files(doc_id: str, names: Iterable[str]) -> list[str]:
     """The document's page thumbnails: setOrientation deletes the "<id>.thumbnails"
     directory when the orientation changes (0x140667f10 -> 0x14065cc40 with flag 1), so

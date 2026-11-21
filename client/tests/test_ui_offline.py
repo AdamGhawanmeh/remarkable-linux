@@ -998,7 +998,7 @@ class PageTemplateIntegrationTests(DemoCase):
         faint = lambda y: min(thumb.pixelColor(260, yy).lightness() for yy in (y - 1, y, y + 1))
         self.assertLess(faint(rule), faint(between))                 # rules survive downscaling (faintly)
         self.assertEqual(faint(between), 255)
-        self.assertTrue(any(p.name.endswith("-v2.png") for p in (self.dir / "thumbnails").iterdir()))
+        self.assertTrue(any(p.name.endswith(f"-v{ThumbnailService.VERSION}.png") for p in (self.dir / "thumbnails").iterdir()))
 
 
 # ------------------------------------------------------------------------- export

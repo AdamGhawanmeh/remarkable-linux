@@ -250,9 +250,37 @@ def base_environment(width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT) -> 
             "parentX": 0.0, "parentY": 0.0, "parentWidth": width, "parentHeight": height}
 
 
+def is_landscape(template: Template) -> bool:
+    """The template's "orientation" read as 3.29 reads it (0x1406cf330): "landscape" is
+    Qt::Horizontal (1), anything else Qt::Vertical."""
+    return template.orientation == "landscape"
+
+
+def template_size(template: Template, width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT) -> tuple[float, float]:
+    """templateWidth x templateHeight: the paper, transposed for a landscape template
+    (SceneTemplateRenderer 0x140a0de10: QSizeF::transpose when its orientation is 1)."""
+    return (float(height), float(width)) if is_landscape(template) else (float(width), float(height))
+
+
+def template_left(template: Template, width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT) -> float:
+    """Page x of the template's x = 0. The renderer's paint (0x140a0c740, JSON templates)
+    translates by -templateWidth / 2 from the scene's x = 0, the paper's centre line at
+    page x width / 2: 0 on a portrait template, width/2 - height/2 (-234 on 1404 x 1872)
+    on a landscape one, which then covers the paper's note bounds (-h/2, 0, h, w)."""
+    return width / 2 - template_size(template, width, height)[0] / 2
+
+
 def template_environment(template: Template, width: float = PAGE_WIDTH,
                          height: float = PAGE_HEIGHT) -> dict:
+    """The variables for `template` on a page of paper `width` x `height`: those of
+    base_environment, with templateWidth/Height transposed for a landscape template.
+    paperOriginX is templateWidth / 2 + bounds.x with the note bounds of the paper
+    (-h/2, 0, h, w), so 0 for a landscape template; paperWidth/Height stay h and w."""
     env = base_environment(width, height)
+    if is_landscape(template):
+        tw, th = template_size(template, width, height)
+        env.update(templateWidth=tw, templateHeight=th, paperOriginX=tw / 2 - height / 2,
+                   parentWidth=tw, parentHeight=th)
     for name, value in template.constants:
         env[name] = evaluate(value, env)
     return env
@@ -331,6 +359,7 @@ def template_shapes(template: Template, area: tuple[float, float, float, float],
     both draw these, so the two cannot differ."""
     ax, ay, aw, ah = area
     budget = [MAX_INSTANCES]
+    left = template_left(template, width, height)       # page x of the template's x = 0
 
     def path(item: dict, env: dict, ox: float, oy: float) -> TemplatePath:
         data = item.get("data") or []
@@ -392,7 +421,8 @@ def template_shapes(template: Template, area: tuple[float, float, float, float],
                         if budget[0] < 0:
                             raise TemplateError(f"template {template.name!r} repeats too many times")
                         ix, iy = bx + c * bw, by + r * bh
-                        child_env = dict(env, parentX=ix, parentY=iy, parentWidth=bw, parentHeight=bh)
+                        # parent* in template coordinates, as the app's painter is translated
+                        child_env = dict(env, parentX=ix - left, parentY=iy, parentWidth=bw, parentHeight=bh)
                         yield from items(children, child_env, ix, iy)
             elif kind == "path":
                 yield path(item, env, ox, oy)
@@ -401,7 +431,7 @@ def template_shapes(template: Template, area: tuple[float, float, float, float],
             else:
                 raise TemplateError(f"unknown item type {kind!r}")
 
-    yield from items(template.items, template_environment(template, width, height), 0.0, 0.0)
+    yield from items(template.items, template_environment(template, width, height), left, 0.0)
 
 
 def paint_template(painter, template: Template, area: tuple[float, float, float, float],
