@@ -177,6 +177,108 @@ class Template:
     items: tuple[dict, ...]
 
 
+@dataclass(frozen=True)
+class ProceduralTemplate(Template):
+    """A template 3.29 draws in C++ (SceneTemplateRenderer) rather than from a .template
+    file: Hexagon small/medium/large and Calligraphy medium/large, portrait and landscape
+    (template_shapes draws them, procedural_shapes)."""
+    kind: int = 0                       # SceneTemplateRenderer::Type (0x140a0e5b0)
+    params: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+
+
+# SceneTemplateRenderer::Type by template file name (0x140a0e5b0), and the doubles its
+# setup (0x140a0bf80) stores at +0x20, +0x28, +0x30, +0x38 for each: the hexagon side's
+# horizontal pitch s, the row pitch P, and the x and y origin offsets (hexagons); the
+# column pitch, the row pitch and the x and y offsets (calligraphy).
+PROCEDURAL_TEMPLATES = {
+    "P Hexagon large": (1, (112.1, 194.4, -102.1, -147.4)),
+    "P Hexagon medium": (2, (87.8, 151.8, -30.0, -138.0)),
+    "P Hexagon small": (3, (43.9, 75.9, -8.0, -55.2)),
+    "P Calligraphy large": (4, (72.0, 195.0, -50.5, 65.0)),
+    "P Calligraphy medium": (5, (45.0, 157.5, -35.0, 99.0)),
+    "LS Calligraphy large": (6, (72.0, 195.0, -105.0, 61.0)),
+    "LS Calligraphy medium": (7, (45.0, 159.0, 0.0, 64.0)),
+}
+PROCEDURAL_PEN_WIDTH = 0.5              # QPen(Qt::black, 0.5, SolidLine, SquareCap, BevelJoin) (0x140a0c740)
+CALLIGRAPHY_DASH = (13.0, 17.0)         # its guide lines: that pen, cosmetic, dashed (0x140a0cd40)
+
+
+def procedural_template(name: str) -> ProceduralTemplate | None:
+    entry = PROCEDURAL_TEMPLATES.get(name)
+    if entry is None:
+        return None
+    kind, params = entry
+    return ProceduralTemplate(name, name, "landscape" if name.startswith("LS ") else "portrait", (), (),
+                              kind=kind, params=params)
+
+
+def procedural_shapes(template: ProceduralTemplate, area: tuple[float, float, float, float],
+                      width: float = PAGE_WIDTH, height: float = PAGE_HEIGHT):
+    """The lines 3.29 draws for a procedural template over `area` (page coordinates),
+    as TemplatePaths in page coordinates. Its painters work in scene coordinates (x = 0
+    on the paper's centre line) over the paper's note bounds (0x1408a8df0: (-h/2, 0, h,
+    w)) and the exposed rectangle; rows and columns are counted with C++ truncation."""
+    ax, ay, aw, ah = area
+    half = width / 2                                    # page x of scene x = 0
+    rl, rt, rr, rb = ax - half, ay, ax + aw - half, ay + ah   # the exposed rect, scene coordinates
+    paper_left, paper_width = -height / 2, height       # note bounds
+    paper_right = paper_left + paper_width
+    black = ("#000000", 255)
+
+    def line(x1, y1, x2, y2, dash=(), cosmetic=False) -> TemplatePath:
+        return TemplatePath((("M", ((x1 + half, y1),)), ("L", ((x2 + half, y2),))), black, None,
+                            PROCEDURAL_PEN_WIDTH, True, dash, cosmetic)
+
+    a, pitch, ox, oy = template.params
+    first = max(0, int((rt - oy) / pitch))
+    last = int(int(rb - oy) / pitch + 1.0)
+    columns = int(int(paper_width - ox) / a)
+    if template.kind in (1, 2, 3):
+        # Hexagons (0x140a0d340): per cell, six edges of P/3 (s = P / sqrt 3).
+        for row in range(first, last + 1):
+            y0 = row * pitch + oy
+            for c in range(columns + 1):
+                x = c * a + paper_left + ox
+                if not (rl - a < x <= rr):
+                    continue
+                mx, xr = x + a / 2, x + a
+                y1, y2, y3, y4 = y0 + pitch / 6, y0 + pitch / 2, y0 + 2 * pitch / 3, y0 + pitch
+                yield line(x, y0, mx, y1)
+                yield line(mx, y1, mx, y2)
+                yield line(mx, y1, xr, y0)
+                yield line(x, y3, mx, y2)
+                yield line(mx, y2, xr, y3)
+                yield line(xr, y3, xr, y4)
+        return
+    # Calligraphy (0x140a0cd40): per row three dashed guides and a solid baseline, then
+    # slanted lines across the row (the medium ones a pixel back every second column).
+    kind = template.kind
+    medium = kind in (5, 7)
+    if kind == 5:
+        shift, slant, gap = 0.0, 12.0, 40.2
+    elif kind == 7:
+        shift, slant, gap = 12.0, 12.0, 40.6
+    else:
+        shift, slant, gap = 5.0, 0.0, 48.0
+    start = (paper_left if medium else rl) + shift
+    for row in range(first, last + 1):
+        y0 = row * pitch + oy
+        for y in (y0, y0 + gap, y0 + 3 * gap):
+            yield line(start, y, paper_right, y, CALLIGRAPHY_DASH, True)
+        yield line(rl, y0 + 2 * gap, paper_right, y0 + 2 * gap)
+        back = 0.0
+        for c in range(columns + 1):
+            if medium:
+                if c and c % 2 == 0:
+                    back += 1.0
+                x = c * a + paper_left + ox - back
+            else:
+                x = c * a + paper_left + ox
+                if not (rl - 30.0 <= x <= rr):
+                    continue
+            yield line(x, y0 + 3 * gap, x + a + slant, y0)
+
+
 def parse_template(data: str | bytes, filename: str = "") -> Template:
     try:
         raw = json.loads(data)
@@ -207,7 +309,8 @@ class TemplateLibrary:
         return sorted(p.stem for p in self.directory.glob("*.template"))
 
     def get(self, name: str | None) -> Template | None:
-        """The template, or None for Blank / unknown names (drawn as blank paper)."""
+        """The template file, or None for Blank / unknown names (drawn as blank paper).
+        The seven templates 3.29 draws itself have no file: see resolve()."""
         if not name or name == BLANK:
             return None
         if name not in self._cache:
@@ -218,6 +321,12 @@ class TemplateLibrary:
                 log.warning("no template file for %r; drawing blank paper", name)
                 self._cache[name] = None
         return self._cache[name]
+
+
+    def resolve(self, name: str | None) -> Template | None:
+        """What a page with template `name` is drawn with: one of the procedural
+        templates (Hexagon, Calligraphy: procedural_template), else get(name)."""
+        return procedural_template(name or "") or self.get(name)
 
 
 _default_library: TemplateLibrary | None = None
@@ -313,6 +422,8 @@ class TemplatePath:
     fill: tuple[str, int] | None
     stroke_width: float
     antialiasing: bool
+    dash: tuple[float, ...] = ()        # QPen dash pattern (in pen widths); () solid
+    cosmetic: bool = False              # QPen::setCosmetic: the width is in device pixels
 
 
 @dataclass(frozen=True)
@@ -357,6 +468,9 @@ def template_shapes(template: Template, area: tuple[float, float, float, float],
     """The template's paths and texts, in drawing order and page coordinates, covering
     `area` (x, y, w, h): repeats extend to fill it. paint_template and template_svg
     both draw these, so the two cannot differ."""
+    if isinstance(template, ProceduralTemplate):
+        yield from procedural_shapes(template, area, width, height)
+        return
     ax, ay, aw, ah = area
     budget = [MAX_INSTANCES]
     left = template_left(template, width, height)       # page x of the template's x = 0
@@ -470,7 +584,14 @@ def paint_template(painter, template: Template, area: tuple[float, float, float,
             # only at >= 1 device pixel per page pixel.
             native = abs(painter.worldTransform().determinant()) >= 1.0
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, shape.antialiasing or not native)
-            painter.setPen(QPen(qcolor(shape.stroke), shape.stroke_width) if shape.stroke else Qt.PenStyle.NoPen)
+            if shape.stroke:
+                pen = QPen(qcolor(shape.stroke), shape.stroke_width)
+                if shape.dash:
+                    pen.setDashPattern(list(shape.dash))
+                pen.setCosmetic(shape.cosmetic)
+                painter.setPen(pen)
+            else:
+                painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(qcolor(shape.fill)) if shape.fill else Qt.BrushStyle.NoBrush)
             painter.drawPath(path)
     finally:
@@ -519,13 +640,16 @@ def template_svg(template: Template, area: tuple[float, float, float, float],
     pending: tuple[tuple, list[str]] | None = None
 
     def attributes(style: tuple) -> str:
-        stroke, fill, stroke_width = style
+        stroke, fill, stroke_width, dash, is_cosmetic = style
         if stroke is None:
             text = ' stroke="none"'
         else:
-            cosmetic = ' vector-effect="non-scaling-stroke"' if stroke_width == 0 else ""
+            cosmetic = ' vector-effect="non-scaling-stroke"' if stroke_width == 0 or is_cosmetic else ""
+            # A QPen dash pattern counts in pen widths.
+            dashes = (' stroke-dasharray="' + " ".join(_num(d * (stroke_width or 1)) for d in dash) + '"'
+                      if dash else "")
             text = (_svg_paint("stroke", stroke) + f' stroke-width="{_num(stroke_width or 1)}"'
-                    f' stroke-linecap="square" stroke-linejoin="bevel"{cosmetic}')
+                    f' stroke-linecap="square" stroke-linejoin="bevel"{cosmetic}{dashes}')
         return text + _svg_paint("fill", fill) + (' fill-rule="evenodd"' if fill is not None else "")
 
     def flush() -> None:
@@ -533,7 +657,7 @@ def template_svg(template: Template, area: tuple[float, float, float, float],
         if pending is None:
             return
         style, data = pending
-        stroke, fill, _ = style
+        stroke, fill = style[0], style[1]
         if len(data) == 1 or (fill is None and stroke is not None and stroke[1] == 255):
             out.append(f'<path d="{" ".join(data)}"{attributes(style)}/>')
         else:
@@ -552,7 +676,7 @@ def template_svg(template: Template, area: tuple[float, float, float, float],
         if _outside(shape, area):
             continue
         data = " ".join(cmd + "".join(f" {_num(x)} {_num(y)}" for x, y in pts) for cmd, pts in shape.commands)
-        style = (shape.stroke, shape.fill, shape.stroke_width)
+        style = (shape.stroke, shape.fill, shape.stroke_width, shape.dash, shape.cosmetic)
         if pending is not None and pending[0] == style:
             pending[1].append(data)
         else:

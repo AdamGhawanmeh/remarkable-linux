@@ -349,7 +349,7 @@ def extract_assets(exe: Path) -> None:
     info(f"{len(manifest)} files from {len({e['tree'] for e in manifest})} resource trees -> {RESOURCES}")
 
     files = assets.carved_files(RESOURCES)         # qrc path -> bytes; the first registered tree wins
-    for sub in ("fonts", "icons", "templates"):
+    for sub in ("fonts", "icons", "templates", "brushes"):
         if (ASSETS / sub).exists():
             shutil.rmtree(ASSETS / sub)
     assets.copy_fonts(RESOURCES, ASSETS / "fonts")
@@ -358,6 +358,8 @@ def extract_assets(exe: Path) -> None:
             target = ASSETS / "icons" / path[len("/ark/"):]
         elif path.startswith("/templates/"):               # page templates (viewer/templates.py)
             target = ASSETS / "templates" / path[len("/templates/"):]
+        elif re.fullmatch(r"/images/(pencil\d(-light|-hard)?|brush\d)\.png", path):   # brush textures (viewer/brushes.py)
+            target = ASSETS / "brushes" / path[len("/images/"):]
         else:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -592,7 +594,8 @@ def build_artifacts() -> list[Path]:
     environment and build trees (build/), the extracted exe and icon, the carved
     resources, the client's assets, qml_api.json, the native module, and Python caches."""
     paths = [BUILD, RESOURCES, EXTRACTED / "reMarkable.exe", EXTRACTED / "remarkable.ico", QML_API, NATIVE_LIB]
-    paths += [ASSETS / name for name in ("fonts", "icons", "templates", "remarkable.rcc", "remarkable.rcc.stamp")]
+    paths += [ASSETS / name for name in ("fonts", "icons", "templates", "brushes", "remarkable.rcc",
+                                         "remarkable.rcc.stamp")]
     for top in (CLIENT, PACKAGING):
         paths += [p for p in top.rglob("__pycache__") if not any(part in (".venv", "venv") for part in p.parts)]
     return [p for p in paths if p.exists()]

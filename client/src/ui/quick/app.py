@@ -112,6 +112,7 @@ class QuickApp:
         self.library = Library(now=now)
         self.mutator = Mutator(source)
         self.syncer = Syncer(source)
+        self.syncer.protect, self.syncer.collect = self._open_blobs, self._collect_cache
         self.auth = source.sync.auth
         self.internet = InternetCheck(self.auth)
         self.account = Account(self.auth)
@@ -339,6 +340,28 @@ class QuickApp:
         self.set_tree(tree)
         self.singletons.document_sync.set_status(SyncStatus.Completed)
         self._run_waiting_check()
+
+    def _open_blobs(self) -> set[str]:
+        """The blobs of the documents shown now (their pages may still be read from the
+        version they were opened at while a sync replaces it)."""
+        from .bridge.scene import SceneView
+        keep: set[str] = set()
+        window = getattr(self, "window", None)
+        for view in (window.findChildren(SceneView) if window is not None else []):
+            node = getattr(view._get("document"), "node", None)
+            if node is not None:
+                keep.add(node.hash)
+                keep.update(node.files.values())
+        return keep
+
+    def _collect_cache(self, protected: set[str]) -> None:
+        """After a sync (on the sync's thread): SyncClient.collect_garbage."""
+        from ..workers import ThumbnailService
+        sync = getattr(self.source, "sync", None)
+        if sync is None or getattr(self.source, "cached_only", False):
+            return
+        sync.collect_garbage(self.cache_dir / "thumbnails", protect=protected,
+                             thumbnail_version=ThumbnailService.VERSION)
 
     def _sync_failed(self, message: str, status: SyncStatus | None = None) -> None:
         self.singletons.document_sync.set_status(

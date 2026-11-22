@@ -1692,9 +1692,27 @@ Page mapping: `cPages.pages[].redir.value` is the PDF page; pages without `redir
 inserted on the tablet (no background). EPUBs carry a `.pdf` rendition used the same way.
 The full page-map spec, and how PDF/EPUB pages differ from notebook pages, is in §5.4.
 
-**Not 1:1** (needs decompilation; no engine was configured for REA): pencil and brush
-textures (the app rasterises these itself: `renderPencil`, `renderPaintBrush_v2`, ...),
-shader opacity, and typed-text font sizes (`crdt::TextProperties::FontSize`). The typed-text
+**Pencil and paintbrush textures** (`viewer/brushes.py`). They are not rasterised from
+nothing: the resources hold four sets of four 64 x 64 dithered black-and-white tiles,
+`/images/pencil<n>-light.png`, `pencil<n>.png`, `pencil<n>-hard.png` and `brush<n>.png`
+(`marker<n>.png` is named but not shipped); install.py copies them to
+`client/src/assets/brushes/`. 0x140b2d940 loads the pencil sets as Grayscale8. Per point a
+tile is picked by a hash of `(uint)(x + y + 0.0f)` (multiply by 0xD6E8FEB86659FD93, fold the
+halves, again, low two bits) and, for pencils, by pressure: below 0.75 the light set,
+below 0.9 the plain one, else the hard one (0x140b0f540; 0x14102b6f0, 0x140d2a18c). The
+Paintbrush (0x140b2cdf0) draws each segment with a QPen whose brush is the QBitmap of
+`brush<hash>.png`, rotated by the point's direction (2 pi x byte / 255), when its speed is
+above 20 (0x140e8ee70); slower points are solid. Client: pencil runs are filled through
+their tile at 0.5 + 0.5 x coverage (coverage = 1 - grey / 255) over the existing pressure
+opacity (how 3.29's legacy pencil rasteriser 0x140b08d60 mixes tile and pressure was not
+traced, and a light stroke must not vanish where its tile is blank); paintbrush runs use
+the bitmap exactly; SVG export carries the tiles as `<pattern>`s of vector runs (the tiles
+are pure black and white, so this is exact and the SVG stays vector).
+
+**Not 1:1**: version 2 pencils (13, 14) go through strokev2's FillPencil (0x140b13610),
+which shades with value noise (a permutation table at 0x140e8e1d0) rather than these
+tiles; the Shader (23, strokev2 FillShaderAA) uses no tile, so its opacity stays an
+approximation; typed-text font sizes (`crdt::TextProperties::FontSize`). The typed-text
 fonts are the proprietary reMarkable Sans and reMarkable Serif Small, embedded in the exe;
 they are not extracted or redistributed.
 
@@ -1706,7 +1724,28 @@ client/src/assets/templates) are **JSON `.template` files, not images**: `consta
 `down|up|right|left|infinite|<count>`), `path` (`M/L/C/Z` data, optional
 stroke/fill colour, strokeWidth, antialiasing) or `text` (text, fontSize, position).
 `templates.json` maps 79 names to files; 8 entries (Blank, Calligraphy, Hexagon) have no
-`.template` file. [O] Parser strings in the binary: the variables `templateWidth/Height`,
+`.template` file: Blank is plain paper, and the other seven 3.29 draws in C++
+(SceneTemplateRenderer). Its type by file name (0x140a0e5b0): P Hexagon large/medium/small
+1/2/3, P Calligraphy large/medium 4/5, LS Calligraphy large/medium 6/7; its setup
+(0x140a0bf80) stores four doubles each (hexagons: horizontal pitch s 112.1/87.8/43.9, row
+pitch P 194.4/151.8/75.9, x offset -102.1/-30/-8, y offset -147.4/-138/-55.2;
+calligraphy: column pitch 72/45/72/45, row pitch 195/157.5/195/159, x offset
+-50.5/-35/-105/0, y offset 65/99/61/64), and paint (0x140a0c740) sets QPen(Qt::black, 0.5,
+SolidLine, SquareCap, BevelJoin). Both painters work in scene coordinates over the paper's
+note bounds (0x1408a8df0) and the exposed rectangle, rows from max(0, int((top - oy) / P))
+to int(int(bottom - oy) / P + 1), columns 0..int(int(boundsWidth - ox) / pitch).
+Hexagons (0x140a0d340): per cell at x = c s + left + ox, y0 = r P + oy, the six edges
+(x, y0)-(x + s/2, y0 + P/6), that point-(x + s/2, y0 + P/2), it-(x + s, y0),
+(x, y0 + 2P/3)-(x + s/2, y0 + P/2), that-(x + s, y0 + 2P/3), it-(x + s, y0 + P): edges of
+P/3, regular hexagons. Calligraphy (0x140a0cd40): gap 40.2 (P medium), 40.6 (LS medium),
+else 48; per row three guides with the pen made cosmetic and dashed 13/17 at y0, y0 + gap,
+y0 + 3 gap (from the left plus 0, 12 or 5), a solid baseline at y0 + 2 gap, then lines
+from (x, y0 + 3 gap) to (x + pitch + slant, y0) per column (slant 12 for the medium ones,
+which also step a pixel back every second column; 0 for the large). Client:
+`viewer.templates.ProceduralTemplate` / `procedural_shapes` (`TemplateLibrary.resolve`; `get` stays
+the `.template` files), drawn by `paint_template` and
+`template_svg` (dashes as `stroke-dasharray` in pen widths, cosmetic as non-scaling
+strokes). [O] Parser strings in the binary: the variables `templateWidth/Height`,
 `parentX/Y/Width/Height`, `physicalDpi`, `pixelRatio`, `paperOriginX/Y`, `paperWidth/Height`,
 `textWidth`; colours `#RRGGBB`; a path whose stroke and fill are both invisible is
 illegal. The expression language is JS-like (`+ - * / ( ) < > ? : ||`).
@@ -3166,6 +3205,34 @@ of the platform's bindings: Ctrl+Y on Windows, Ctrl+Shift+Z on GNOME (Wayland an
 so Ctrl+Y did nothing here. `ui.quick.shortcuts.install_redo_shortcut` adds a Shortcut
 for Ctrl+Y on the same `redoAction` (enabled with it) where the platform's first Redo
 binding is not Ctrl+Y already (else both would be ambiguous).
+
+### 5.16 EPUB renditions made here; the cache collected after a sync
+
+**EPUB to PDF** (`core/epub.py`). 3.29 makes an ebook's `<id>.pdf` itself
+(doGeneratePdfFromEpub, EPubRenderer: a cached rendition says "Qt 6.10.3", the desktop
+app's Qt; the tablet's say 5.15.2): a QTextDocument of the spine with default font the
+document's `fontName` or "EB Garamond" at weight 400 and pixel size int(textScale x 38)
+(0x14070de10, 0x140d27790); style sheet `p { line-height: %1 } h1, h2, h3 { margin-top:
+2em; margin-bottom: 1em } code {font-family: 'Noto Sans Mono'}` (%1 lineHeight / 100 when
+above 0, else 1: 0x1407117e0); root frame margins left/right the document's `margins`,
+top/bottom an ebook setting (EpubSettings+0x168, not a constant; 50 px here, measured on
+the cached renditions), document margin 0; a QPdfWriter at 227 dpi with pages (1404, 1872)
+x 72 / 227 points (0x1406ec2d0: 445.3 x 593.8, the cached renditions' 445 x 594) and no page
+margins. `SyncClient.import_file` makes it for an EPUB and uploads it with the book (and
+its page count), so an imported ebook opens at once; one that cannot be laid out goes up
+without, as before. Only what Qt's rich text reads of the XHTML is kept (no EPUB style
+sheets); images, an `<svg>` cover's `<image>` too, are drawn; each spine document starts
+a page.
+
+**Cache collection** (`SyncClient.collect_garbage`, run by the app after every sync that
+succeeded: `Syncer.collect`). Deleted: cached blobs nothing references (old index and file
+versions) and thumbnails of document versions that are gone or of an older thumbnail
+format. Kept: whatever the current tree references, every file pending edits use (by
+sha256), local document copies' files, and the blobs of the documents open when the sync
+started. It holds the sync lock and runs only when the tree was just refreshed with every
+entry loaded (never after a cache-only load or a partial refresh). On a copy of the real
+cache: 696 of 6,188 blobs and 3,146 thumbnails collected, nothing referenced lost, every
+item still loads from the cache.
 
 ## 6. Implications for the Linux client
 

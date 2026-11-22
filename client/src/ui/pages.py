@@ -216,7 +216,7 @@ class DocumentPages:
     def content(self, index: int) -> PageContent:
         page = self.pages[index]
         return PageContent(self.source.page_scene(self.doc, page), self.pdf, page.pdf_page,
-                           self.templates.get(page.template), landscape=is_landscape_document(self.doc))
+                           self.templates.resolve(page.template), landscape=is_landscape_document(self.doc))
 
     def render(self, index: int, scale: float, crop: str = "page") -> QImage:
         return render_content(self.content(index), scale, crop)

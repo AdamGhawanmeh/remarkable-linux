@@ -23,6 +23,7 @@ hidden layers are skipped unless requested. Typed text draws above the strokes.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable
 from xml.sax.saxutils import escape, quoteattr
@@ -84,6 +85,10 @@ class Run:
     points: tuple[tuple[float, float], ...]   # page coordinates
     width: float
     opacity: float
+    # The texture tile it is drawn through (viewer.brushes: "pencil2-hard.png",
+    # "brush1.png") and the tile's rotation in radians; None: solid ink.
+    texture: str | None = None
+    angle: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,23 @@ def _quantise(value: float, step: float) -> float:
     return round(round(value / step) * step, 4)
 
 
+TEXTURED = {"pencil", "mechanical_pencil", "paintbrush"}
+
+
+def _texture(family: str, point) -> tuple[str | None, float]:
+    """(tile, rotation) for a point of a stroke drawn through 3.29's textures
+    (viewer.brushes); (None, 0.0) for solid ink or when the tiles are not installed."""
+    from . import brushes
+
+    if family in ("pencil", "mechanical_pencil"):
+        name = brushes.pencil_texture(point.x, point.y, point.pressure)
+        return (name, 0.0) if brushes.available(name) else (None, 0.0)
+    if family == "paintbrush":
+        name = brushes.brush_texture(point.x, point.y, point.speed)
+        return (name, point.direction) if name and brushes.available(name) else (None, 0.0)
+    return None, 0.0
+
+
 def stroke_runs(scene: PageScene, stroke: Stroke,
                 offset: tuple[float, float] = (0.0, 0.0)) -> list[Run]:
     """Split a stroke into runs of constant (quantised) width and opacity.
@@ -141,10 +163,11 @@ def stroke_runs(scene: PageScene, stroke: Stroke,
     keyed = []
     for p in pts:
         width = _quantise(p.width if p.width > 0 else fallback, 0.25) or 0.25
-        keyed.append((scene.to_page(p.x + dx, p.y + dy), (width, _quantise(_opacity(family, p.pressure), 0.05))))
+        keyed.append((scene.to_page(p.x + dx, p.y + dy),
+                      (width, _quantise(_opacity(family, p.pressure), 0.05), *_texture(family, p))))
     if len(keyed) == 1:
-        (xy, (w, o)), = keyed
-        return [Run((xy, xy), w, o)]
+        (xy, key), = keyed
+        return [Run((xy, xy), *key)]
     runs: list[Run] = []
     current = [keyed[0][0]]
     key = keyed[1][1]
@@ -594,6 +617,26 @@ def erased_after(scene: PageScene, items: list, offsets: dict) -> dict:
     return out
 
 
+_BRUSH_TILE = 64
+
+
+def _svg_pattern(ident: str, texture: str, color: str, alpha: float, origin: float, angle: float) -> str | None:
+    """A texture tile as an SVG <pattern> of vector runs (the tiles are black and white:
+    exact, no raster image), in `color` with the alphas texture_tile gives them."""
+    from .brushes import tile_alphas, tile_runs
+
+    runs = tile_runs(texture)
+    if runs is None:
+        return None
+    paths = []
+    for cells, opacity in zip(runs, tile_alphas(texture, alpha)):
+        if cells and opacity > 0:
+            d = "".join(f"M{x} {y}h{n}v1h-{n}z" for x, y, n in cells)
+            paths.append(f'<path d="{d}" fill="{color}" fill-opacity="{opacity:.4g}"/>')
+    return (f'<pattern id="{ident}" patternUnits="userSpaceOnUse" width="{_BRUSH_TILE}" height="{_BRUSH_TILE}" '
+            f'patternTransform="translate({origin:g} 0) rotate({math.degrees(angle):.4g})">{"".join(paths)}</pattern>')
+
+
 def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: bool = False,
               measure: Measure = estimate_width, decimals: int = 2) -> list[str]:
     """The scene's SVG elements in page coordinates: one group per visible layer, bottom
@@ -605,6 +648,17 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
     offsets = stroke_offsets(scene, lines)
     done: list[str] = []            # finished layers
     masks: list[str] = []           # one <mask> per eraser stroke (legacy pages)
+    patterns: dict[tuple, tuple] = {}  # (tile, colour, alpha, angle) -> (id, <pattern>) (textured strokes)
+
+    def pattern(run: Run, style: StrokeStyle) -> str | None:
+        key = (run.texture, style.color, round(style.alpha * run.opacity, 3), round(run.angle, 4))
+        if key not in patterns:
+            ident = f"tex-{len(patterns)}"
+            element = _svg_pattern(ident, run.texture, style.color, key[2], scene.x_origin, run.angle)
+            if element is None:
+                return None
+            patterns[key] = (ident, element)
+        return patterns[key][0]
 
     def wrap(elements: list[str], mask: str) -> list[str]:
         return [f'<g mask="url(#{mask})">', *elements, "</g>"] if elements else elements
@@ -640,12 +694,17 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
                        f'fill="none" stroke-linecap="{cap}" stroke-linejoin="round"{blend}>')
             for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0))):
                 coords = " ".join(f"{px:.{decimals}f},{py:.{decimals}f}" for px, py in run.points)
+                tile = pattern(run, style) if run.texture else None
+                if tile is not None:            # the tile carries colour and coverage
+                    cur.append(f'<polyline points="{coords}" stroke-width="{run.width:g}" stroke="url(#{tile})"/>')
+                    continue
                 opacity = run.opacity * style.alpha
                 attr = f' stroke-opacity="{opacity:.4g}"' if opacity < 1 else ""
                 cur.append(f'<polyline points="{coords}" stroke-width="{run.width:g}"{attr}/>')
             cur.append("</g>")
         done += [f'<g id="layer-{index}" data-name={quoteattr(layer.name)}>', *cur, "</g>"]
-    out = ([f'<defs>{"".join(masks)}</defs>'] if masks else []) + done
+    defs = list(masks) + [element for _, element in patterns.values()]
+    out = done + ([f'<defs>{"".join(defs)}</defs>'] if defs else [])     # after: ids stay in order
     if lines and (include_hidden or scene.root_document_visible):
         out.append(f'<g id="text" fill="{TEXT_COLOR}">')
         for line in lines:
@@ -763,7 +822,8 @@ def _paint_item(painter, scene: PageScene, stroke, background: str, layers: str,
     for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0))):
         color = QColor(style.color)
         color.setAlphaF(run.opacity * style.alpha)
-        painter.setPen(QPen(color, run.width, Qt.PenStyle.SolidLine, cap,
+        brush = _texture_brush(scene, run, style) if run.texture else None
+        painter.setPen(QPen(brush if brush is not None else color, run.width, Qt.PenStyle.SolidLine, cap,
                             Qt.PenJoinStyle.RoundJoin))
         if all(pt == run.points[0] for pt in run.points):
             # A zero-length path draws nothing; dots (i, full stops) need this.
@@ -774,6 +834,22 @@ def _paint_item(painter, scene: PageScene, stroke, background: str, layers: str,
             path.lineTo(px, py)
         painter.drawPath(path)
     return drawn
+
+
+def _texture_brush(scene: PageScene, run: Run, style: StrokeStyle):
+    """A QBrush of the run's tile in the stroke's colour at the run's opacity, laid out
+    from the scene's origin (x = 0 on the paper's centre line) and turned by the run's
+    angle (viewer.brushes)."""
+    from PySide6.QtGui import QBrush, QTransform
+
+    from .brushes import texture_tile
+
+    tile = texture_tile(run.texture, style.color, round(style.alpha * run.opacity, 3))
+    if tile is None:
+        return None
+    brush = QBrush(tile)
+    brush.setTransform(QTransform().translate(scene.x_origin, 0).rotateRadians(run.angle))
+    return brush
 
 
 def _paint_text(painter, scene: PageScene, lines: list, include_hidden: bool) -> int:

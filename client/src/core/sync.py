@@ -746,6 +746,7 @@ class SyncClient:
         self.root_index: Index | None = None
         self.throttled = False                # the cloud answered 429 during this refresh
         self.edits = PendingEdits(self.root_dir / "pending")    # made here, not uploaded yet
+        self.tree_complete = False            # the tree was refreshed with every entry loaded
 
     # -- transport ------------------------------------------------------------
 
@@ -884,6 +885,7 @@ class SyncClient:
         self.root_index = self.get_index(self.root.hash, ROOT_INDEX_NAME, cached_only=True)
         nodes, failures = self._load_entries(self.root_index.entries, cached_only=True)
         self.tree = DocumentTree(nodes)
+        self.tree_complete = False                 # cached only: never a base for collecting
         log.info("loaded %d items from cache (%d missing)", len(nodes), len(failures))
         return self.tree
 
@@ -938,6 +940,7 @@ class SyncClient:
                         progress(len(transferred), len(scheduled), self.throttled)
         nodes, failures = self._load_entries(entries, cached_only=False, done=done)
         self.tree = DocumentTree(nodes)
+        self.tree_complete = not failures         # collect_garbage only trusts a whole tree
 
         with self._lock:
             docs = self.state["docs"]
@@ -1168,7 +1171,9 @@ class SyncClient:
         """Upload a PDF or EPUB as a new document; returns its id.
 
         Files: <id>.pdf|.epub, <id>.content, <id>.metadata, as the official apps
-        upload them; the tablet adds .pagedata and (for EPUBs) the PDF rendition.
+        upload them; the tablet adds .pagedata. An EPUB also gets its PDF rendition,
+        laid out here as 3.29 lays it out (core.epub), so it can be read at once; an
+        EPUB that cannot be laid out goes up without one, as before.
         """
         path = Path(path)
         data = path.read_bytes()
@@ -1176,11 +1181,24 @@ class SyncClient:
         doc_id = str(uuid.uuid4())                      # fixed across commit retries
         now = ms_timestamp(self._clock())
         pages = pdf_page_count(data) if file_type is FileType.PDF else 0
+        content = new_document_content(file_type, pages, len(data))
+        rendition = None
+        if file_type is FileType.EPUB:
+            from .epub import EpubError, generate_rendition
+            try:
+                rendition, pages = generate_rendition(
+                    data, margins=float(content["margins"]), text_scale=float(content["textScale"]),
+                    line_height_value=float(content["lineHeight"]), font_name=str(content["fontName"]))
+                content["pageCount"] = pages
+            except (EpubError, ValueError, OSError) as err:
+                log.warning("no PDF rendition for %s: %s", path.name, err)
         contents = {
             f"{doc_id}.{file_type.value}": data,
-            f"{doc_id}.content": json_bytes(new_document_content(file_type, pages, len(data))),
+            f"{doc_id}.content": json_bytes(content),
             f"{doc_id}.metadata": json_bytes(new_metadata(name or path.stem, parent, DOCUMENT_TYPE, now)),
         }
+        if rendition is not None:
+            contents[f"{doc_id}.pdf"] = rendition
         files = {n: file_entry(n, d) for n, d in contents.items()}
         change = ItemChange(doc_id, files, {files[n].hash: d for n, d in contents.items()})
 
@@ -1548,6 +1566,42 @@ class SyncClient:
             self._save_state()
         removed_blobs = self.blobs.prune(self.referenced_hashes())
         return {"blobs": removed_blobs, "documents": removed_docs}
+
+    def collect_garbage(self, thumbnails: Path | None = None, protect: Iterable[str] = (),
+                        thumbnail_version: int | None = None) -> dict[str, int]:
+        """After a sync: delete the cached blobs nothing needs any more (old versions of
+        indexes and files) and the thumbnails of document versions that are gone.
+
+        Kept: every blob the current tree references (root, document indexes, files),
+        every file the pending edits use (images, imported pages, by sha256), the files
+        of local document copies (state "files"), and `protect` (what the app has open).
+        Nothing is deleted unless the tree was just refreshed with every entry loaded
+        (a partial tree would lose the blobs of what failed to load), and the whole
+        collection holds the sync lock, so no upload or sync runs meanwhile.
+        Thumbnails are `<document index hash>-<width>-p<page>-v<version>.png`: kept for
+        the current documents' hashes (and, given `thumbnail_version`, that version)."""
+        from .edits import _hashes
+
+        with self._busy:
+            if not self.tree_complete or self.root is None or self.root.is_empty or not self.tree.nodes:
+                return {"skipped": 1, "blobs": 0, "thumbnails": 0}
+            keep = self.referenced_hashes() | set(protect) | _hashes(self.edits.all())
+            with self._lock:
+                for rec in self.state["docs"].values():
+                    keep.update((rec.get("files") or {}).values())
+            removed = self.blobs.prune(keep)
+            thumbs = 0
+            if thumbnails is not None and thumbnails.is_dir():
+                current = {n.hash for n in self.tree.nodes.values()}
+                for path in thumbnails.glob("*.png"):
+                    parts = path.stem.split("-")
+                    stale = parts[0] not in current or (
+                        thumbnail_version is not None and parts[-1] != f"v{thumbnail_version}")
+                    if stale:
+                        path.unlink(missing_ok=True)
+                        thumbs += 1
+        log.info("cache collected: %d blobs, %d thumbnails", removed, thumbs)
+        return {"skipped": 0, "blobs": removed, "thumbnails": thumbs}
 
     def clear_cache(self) -> None:
         with self._lock:

@@ -367,12 +367,17 @@ class Syncer(QObject):
         self.pool.setMaxThreadCount(1)
         self.running = False
         self.last_error: Exception | None = None     # why the last sync failed
+        # Post-sync cleanup: `protect()` runs on this thread when a sync starts (what is
+        # open then), `collect(protected)` on the worker after a sync that succeeded.
+        self.protect: Callable[[], set] | None = None
+        self.collect: Callable[[set], object] | None = None
 
     def refresh(self) -> bool:
         if self.running:
             return False
         self.running = True
         self.started.emit()
+        protected = set(self.protect()) if self.protect is not None else set()
 
         def progress(transferred: int, scheduled: int, throttled: bool) -> None:
             emit_from_worker(self, lambda: self.progress.emit(transferred, scheduled, throttled))
@@ -388,6 +393,11 @@ class Syncer(QObject):
                 self.running, self.last_error = False, err
                 emit_from_worker(self, lambda: self.failed.emit(f"{type(err).__name__}: {err}"))
                 return
+            if self.collect is not None:
+                try:
+                    self.collect(protected)
+                except Exception:          # cleanup never fails a sync  # noqa: BLE001
+                    log.exception("post-sync cache cleanup")
             self.running = False
             emit_from_worker(self, lambda: self.finished.emit(tree))
         self.pool.start(_Job(job))
