@@ -3234,6 +3234,41 @@ entry loaded (never after a cache-only load or a partial refresh). On a copy of 
 cache: 696 of 6,188 blobs and 3,146 thumbnails collected, nothing referenced lost, every
 item still loads from the cache.
 
+### 5.17 The white page card of a note page
+
+What the viewer shows of a page is three rectangles, all in scene coordinates (x = 0 on
+the paper's centre line):
+
+- **The paper** (`SceneView` bounds): the frame (1404 x 1872, the PDF page, or a landscape
+  notebook's note bounds) grown to the ink and typed text.
+- **The scroll range** (`SceneTileManager.sceneBoundingRect`): on a note page (a notebook
+  page, or a page inserted into a PDF) DocumentViewport.updateSceneBoundingRect makes it
+  the paper's note bounds across, x from -h/2 to h/2 (1872 wide on the default paper,
+  portrait pages included: "We want all notebooks to use 'landscape' bounds"), from y 0 to
+  max(4/3 h, the content's bottom + the bottom margin), plus the window when zoomed out.
+  Other pages keep the SceneView's bounds.
+- **The white card and its shadow** (DocumentView's ShadowOverlay, `pageBounds`): that same
+  rectangle, made twice as tall on note pages so its bottom is never seen; outside it the
+  panel colour covers everything.
+
+3.29 renders its tiles over the whole card, and its template painter (0x140a0c740, JSON
+templates and the procedural ones of 5.3) fills whatever rectangle it is handed, its
+repeats running as far as needed. The built-in portrait templates are made for this:
+"P Lines small" draws its rules `templateHeight` (1872) wide from `templateWidth / 2 -
+templateHeight / 2`, i.e. exactly the note bounds, repeating down. So on 3.29 the rules run
+across the card's full width and on below the paper; there is no paper-sized sheet on the
+card.
+
+The client rendered only the paper (`render_content(crop="page")`), so the card showed bare
+white strips left and right of the rules (234 px each on the default paper) and below the
+last rule. Now `SceneView._render_rect` is the union of the paper and, on a note page,
+the tile manager's sceneBoundingRect; `render_content(area=...)` paints the template (and
+the ink) over it; the view renders again when the card grows (`_card_changed`, from the
+tile manager's sceneBoundingRect). `SceneView._card` is that image, what `paint` shows;
+`SceneView._image` stays the paper's own part of it (self._bounds), as before. PDF pages,
+thumbnails and exports still show the paper
+only (the PDF page, or the 1404 x 1872 frame), as 3.29's do.
+
 ## 6. Implications for the Linux client
 
 1. **Auth**: implement device/new → user/new with discovery-based host resolution and

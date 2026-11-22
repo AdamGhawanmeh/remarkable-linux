@@ -169,15 +169,19 @@ def _draw_pdf_page(painter: QPainter, content: PageContent) -> None:
     painter.restore()
 
 
-def render_content(content: PageContent, scale: float, crop: str = "page", background: bool = True) -> QImage:
+def render_content(content: PageContent, scale: float, crop: str = "page", background: bool = True,
+                   area: tuple[float, float, float, float] | None = None) -> QImage:
     """Render one page to an image at `scale` (page pixels → image pixels).
 
     crop "page" grows with the content (faithful, scrollable); "clip" is exactly the
     page frame (thumbnails). `background` False leaves out the template, or the PDF
     page, as the app's "Hide template" does (SceneController.backgroundVisible): ink,
     images and typed text are drawn all the same, and the page keeps its frame.
+    `area` (page coordinates) renders that rectangle instead: the viewer's whole white
+    page card on a note page, which 3.29 covers with the template (its template
+    painter fills whatever it is handed; ARCHITECTURE.md 5.17).
     """
-    x, y, w, h = content.bounds(crop)
+    x, y, w, h = area if area is not None else content.bounds(crop)
     image = QImage(max(1, round(w * scale)), max(1, round(h * scale)),
                    QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor(PAPER))

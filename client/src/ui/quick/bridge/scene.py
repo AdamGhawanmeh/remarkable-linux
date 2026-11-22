@@ -1210,6 +1210,10 @@ class _TileManager:
     def _property_changed(self, name: str) -> None:
         if name in ("sceneBoundingRect", "viewportSize"):
             self._apply(self._get("center"), self._get("scale"))
+        if name == "sceneBoundingRect":
+            changed = getattr(self.parent(), "_card_changed", None)
+            if changed is not None:
+                changed()
 
     def to_view(self, p: QPointF) -> QPointF:
         c, s, half = self._get("center"), self._get("scale"), self._view_half()
@@ -1824,8 +1828,10 @@ class _SceneView:
         self._content: PageContent | None = None
         self._page_id = ""                  # of the page shown (its id in the document)
         self._bounds = QRectF()             # content bounds, scene coordinates
-        self._image: QImage | None = None   # the page rendered at self._image_scale
+        self._image: QImage | None = None   # the page (self._bounds) rendered at self._image_scale
         self._image_scale = 0.0
+        self._card: QImage | None = None    # what is shown: the page card (self._image_rect)
+        self._image_rect = QRectF()         # what self._card shows, scene coordinates
         self._rendering = False
         self._render_again = False
         self._pool = _view_pool()
@@ -3256,6 +3262,30 @@ class _SceneView:
         return self._device_ratio
 
     # -- rendering --
+    def _render_rect(self) -> QRectF:
+        """What to render, scene coordinates: the page's bounds and, on a note page (no
+        PDF page under it), the whole white page card DocumentView draws, which is the
+        tile manager's sceneBoundingRect (DocumentViewport.updateSceneBoundingRect gives
+        note pages the paper's note bounds, -h/2..h/2, and at least 4/3 of h down).
+        3.29 renders its tiles over that card and paints the template into each tile's
+        rectangle, so a portrait page's rules run across the card's full width and on
+        below the paper (P Lines small spans templateHeight on purpose); rendering only
+        the paper left white strips beside and below it (ARCHITECTURE.md 5.17)."""
+        rect = QRectF(self._bounds)
+        if self._content is not None and not self._content.has_pdf_page:
+            card = self._tiles._get("sceneBoundingRect")
+            if isinstance(card, QRectF) and card.isValid():
+                rect = rect.united(card)
+        return rect
+
+    def _card_changed(self) -> None:
+        """The card changed (a page loaded, the window resized): render it again when the
+        image no longer covers it."""
+        if self._content is None or self._content.has_pdf_page:
+            return
+        if self._image is None or not self._image_rect.contains(self._render_rect()):
+            self._render()
+
     def _render(self) -> None:
         if self._content is None:
             return
@@ -3265,10 +3295,14 @@ class _SceneView:
             self._render_again = True
             return
         scale = self._tiles._get("scale") * self._dpr()
-        area = self._bounds.width() * self._bounds.height() * scale * scale
+        rect = self._render_rect()
+        area = rect.width() * rect.height() * scale * scale
         if area > MAX_PIXELS:
             scale *= (MAX_PIXELS / area) ** 0.5
         content = self._content
+        bounds = QRectF(self._bounds)
+        origin = content.origin                                 # page x of scene x = 0
+        page_area = (rect.x() + origin, rect.y(), rect.width(), rect.height())
         if self.text_session is not None:
             from dataclasses import replace
             content = replace(content, scene=self.text_session.shown_scene())
@@ -3285,18 +3319,24 @@ class _SceneView:
 
         def job():
             try:
-                image = render_content(content, scale, "page", background)
+                image = render_content(content, scale, "page", background, area=page_area)
             except EXPECTED_ERRORS as err:
                 log.warning("cannot render page: %s", err)
                 image = None
-            emit_from_worker(self, lambda: self._rendered.emit((image, scale)))
+            emit_from_worker(self, lambda: self._rendered.emit((image, scale, rect, bounds)))
         self._pool.start(_Job(job))
 
     def _on_rendered(self, result) -> None:
-        image, scale = result
+        image, scale, rect, bounds = result
         self._rendering = False
         if image is not None:
-            self._image, self._image_scale = image, scale
+            # The page's own part of the card, as self._image always was (hit tests,
+            # pixel checks); the card is what paint() shows.
+            k = image.width() / rect.width() if rect.width() else 1.0
+            page = image.copy(QRect(round((bounds.x() - rect.x()) * k), round((bounds.y() - rect.y()) * k),
+                                    max(1, round(bounds.width() * k)), max(1, round(bounds.height() * k)))) \
+                if rect != bounds else image
+            self._card, self._image, self._image_scale, self._image_rect = image, page, scale, rect
             self.update()
         if self._render_again:
             self._render_again = False
@@ -3306,15 +3346,19 @@ class _SceneView:
             self._pen_shown(self._pen_rendering)
             self._pen_rendering = 0
         wanted = self._tiles._get("scale") * self._dpr()
-        capped = self._bounds.width() * self._bounds.height() * wanted * wanted > MAX_PIXELS
+        shown = self._render_rect()
+        capped = shown.width() * shown.height() * wanted * wanted > MAX_PIXELS
+        if image is not None and not self._image_rect.contains(shown):    # the card grew meanwhile
+            self._render()
+            return
         if not capped and abs(self._image_scale - wanted) / wanted > 0.01:
             self._render()
 
     def paint(self, painter: QPainter) -> None:
-        if self._image is None:
+        if self._card is None:
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawImage(self._tiles.sceneToView(self._bounds), self._image)
+        painter.drawImage(self._tiles.sceneToView(self._image_rect), self._card)
         session = self.text_session
         if session is None or not self._get("textModeEnabled"):
             return
