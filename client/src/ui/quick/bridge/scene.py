@@ -1211,9 +1211,17 @@ class _TileManager:
         if name in ("sceneBoundingRect", "viewportSize"):
             self._apply(self._get("center"), self._get("scale"))
         if name == "sceneBoundingRect":
-            changed = getattr(self.parent(), "_card_changed", None)
+            view = self.parent()
+            corrected = getattr(view, "_scroll_range_set", None)
+            if corrected is not None and corrected(self._get("sceneBoundingRect")):
+                return
+            changed = getattr(view, "_card_changed", None)
             if changed is not None:
                 changed()
+        elif name == "viewportSize":
+            refresh = getattr(self.parent(), "_refresh_scroll_range", None)
+            if refresh is not None:
+                refresh()
 
     def to_view(self, p: QPointF) -> QPointF:
         c, s, half = self._get("center"), self._get("scale"), self._view_half()
@@ -1984,7 +1992,17 @@ class _SceneView:
         # bounds already widened are kept meanwhile (united): set alone, the bare bounds,
         # narrower and shorter than those, re-centred a zoomed-out view on them first.
         current = self._tiles._get("sceneBoundingRect")
-        if reload and not content.has_pdf_page and isinstance(current, QRectF) and current.isValid():
+        if not content.has_pdf_page:
+            self._hook_page_card()
+            # A note page: the scroll range 3.29's SceneView gives it (scroll_boundary),
+            # which also replaces the note bounds the QML then asks for. On a reload the
+            # range already there is kept vertically, so the view does not jump.
+            scroll = self.scroll_boundary()
+            if reload and isinstance(current, QRectF) and current.isValid():
+                top, bottom = min(scroll.top(), current.top()), max(scroll.bottom(), current.bottom())
+                scroll = QRectF(scroll.left(), top, scroll.width(), bottom - top)
+            self._set_scroll_range(scroll)
+        elif reload and isinstance(current, QRectF) and current.isValid():
             self._tiles._set("sceneBoundingRect", bounds.united(current))
         else:
             self._tiles._set("sceneBoundingRect", bounds)
@@ -2014,7 +2032,8 @@ class _SceneView:
             self._controller._set("rootDocumentLength", rm_text.units(text.text) if text is not None else 0)
         self._update_viewport()
         self._set("defaultCenter", QPointF(0, frame.height() / 2))
-        self._set("sceneExteriorBoundary", bounds)
+        self._set("sceneExteriorBoundary", self.exterior_boundary() if not content.has_pdf_page else bounds)
+        self._hook_page_card()
         self._update_history()
         self._set("pageStatus", PAGE_READY)
         self._set("awaitingInitialTileSet", False)
@@ -3262,26 +3281,144 @@ class _SceneView:
         return self._device_ratio
 
     # -- rendering --
+    # -- the page card and the scroll range of a note page (ARCHITECTURE.md 5.17) --
+    def _note_page(self) -> bool:
+        return self._content is not None and not self._content.has_pdf_page
+
+    def exterior_boundary(self) -> QRectF:
+        """SceneView::sceneExteriorBoundary as 3.29 computes it for a note page with
+        sceneExteriorMode ExcludeMargin (DocumentViewport's; 0x140452410): the content
+        made symmetric about the paper's centre line, united with the paper's portrait
+        bounds, which are widened to its note bounds (-h/2..h/2) only for a landscape
+        document or when the content reaches past the portrait paper's sides; cut to
+        the scene's rect, whose bottom is the lower of the content's and the paper's.
+        An unexpanded portrait page is therefore its paper, 1404 x 1872."""
+        content = QRectF(self._bounds)
+        width, height = self._content.paper if self._content is not None else (PAGE_WIDTH, PAGE_HEIGHT)
+        portrait = QRectF(-width / 2, 0, width, height)
+        note = QRectF(-height / 2, 0, height, width)
+        landscape = bool(self._content is not None and self._content.landscape)
+        widen = landscape or content.left() < portrait.left() or content.right() > portrait.right()
+        reach = max(-content.left(), content.right())
+        symmetric = QRectF(-reach, content.top(), 2 * reach, content.height())
+        paper = QRectF(note.left(), portrait.top(), note.width(), portrait.height()) if widen else portrait
+        limit = note.united(content)
+        limit.setBottom(max(content.bottom(), portrait.bottom()))
+        return symmetric.united(paper).intersected(limit)
+
+    def scroll_boundary(self) -> QRectF:
+        """The tile manager's scroll range on a note page: the page card (page_card),
+        and below it the room DocumentViewport.updateSceneBoundingRect gives a note
+        page's content, (bottomMargin + bottomPadding / scaleFactor) x devicePixelRatio,
+        so the last lines are not under the page indicator.
+
+        3.29's SceneView (updateTileManagerScrollBoundary, 0x140459330) takes its
+        exterior boundary and lets it run 0.8 of the view's height further down; with
+        its QML card drawn twice as tall, that is room to write below the page. With the
+        card ending at the page (page_card), that room would scroll onto bare panel, so
+        it is left out here (ARCHITECTURE.md 5.17)."""
+        card = self.page_card()
+        extra = 0.0
+        document_view = getattr(self, "_document_view", None)
+        if document_view is not None:
+            try:
+                from PySide6.QtQml import QQmlProperty
+                padding = float(QQmlProperty.read(document_view, "bottomPadding") or 0)
+                margin = float(QQmlProperty.read(document_view, "bottomMargin") or 0)
+                viewport = getattr(self, "_viewport_item", None)
+                factor = float(QQmlProperty.read(viewport, "scaleFactor") or 1.0) if viewport is not None else 1.0
+                extra = (margin + padding / max(factor, 1e-6)) * self._dpr()
+            except (RuntimeError, TypeError, ValueError):
+                extra = 0.0
+        top = min(0.0, card.top())
+        return QRectF(card.left(), top, card.width(), card.bottom() + extra - top)
+
+    def _set_scroll_range(self, rect: QRectF) -> None:
+        self._correcting = True
+        try:
+            self._tiles._set("sceneBoundingRect", rect)
+        finally:
+            self._correcting = False
+        self._card_changed()
+
+    def _scroll_range_set(self, rect) -> bool:
+        """Something (DocumentViewport.updateSceneBoundingRect) set the scroll range of
+        a note page: 3.29's SceneView puts its own back (its
+        updateTileManagerScrollBoundary), so the note bounds the QML asks for do not
+        widen an unexpanded portrait page. Room a selection at the page's ends adds
+        above and below (top < 0, same width) stays. True when corrected."""
+        if getattr(self, "_correcting", False) or not self._note_page() or not isinstance(rect, QRectF):
+            return False
+        ours = self.scroll_boundary()
+        if all(abs(a - b) < 0.5 for a, b in zip(rect.getRect(), ours.getRect())):
+            return False
+        same_width = abs(rect.left() - ours.left()) < 0.5 and abs(rect.right() - ours.right()) < 0.5
+        if same_width and rect.top() < -0.5:          # DocumentViewport.onAreaSelected's extra room
+            return False
+        self._set_scroll_range(ours)
+        return True
+
+    def _refresh_scroll_range(self) -> None:
+        if self._note_page() and not getattr(self, "_correcting", False):
+            self._set_scroll_range(self.scroll_boundary())
+
+    def page_card(self) -> QRectF:
+        """The white card shown for the page, scene coordinates: on a note page the
+        exterior boundary (the paper, grown where ink or text reaches past it), not
+        3.29's QML card, which is the scroll range drawn twice as tall and never ends
+        (DocumentView.updateOverlay): a deliberate difference (ARCHITECTURE.md 5.17).
+        Its height is the page's own (paper, or ink and text past it): 3.29's exterior
+        boundary reaches the portrait paper's bottom even on a 1404-tall landscape page.
+        Other pages: the SceneView's bounds."""
+        if not self._note_page():
+            return QRectF(self._bounds)
+        exterior = self.exterior_boundary()
+        return QRectF(exterior.left(), self._bounds.top(), exterior.width(), self._bounds.height())
+
     def _render_rect(self) -> QRectF:
-        """What to render, scene coordinates: the page's bounds and, on a note page (no
-        PDF page under it), the whole white page card DocumentView draws, which is the
-        tile manager's sceneBoundingRect (DocumentViewport.updateSceneBoundingRect gives
-        note pages the paper's note bounds, -h/2..h/2, and at least 4/3 of h down).
-        3.29 renders its tiles over that card and paints the template into each tile's
-        rectangle, so a portrait page's rules run across the card's full width and on
-        below the paper (P Lines small spans templateHeight on purpose); rendering only
-        the paper left white strips beside and below it (ARCHITECTURE.md 5.17)."""
-        rect = QRectF(self._bounds)
-        if self._content is not None and not self._content.has_pdf_page:
-            card = self._tiles._get("sceneBoundingRect")
-            if isinstance(card, QRectF) and card.isValid():
-                rect = rect.united(card)
-        return rect
+        """What to render, scene coordinates: the page card (template and ink over it)
+        and anything of the page outside it."""
+        return self.page_card().united(self._bounds)
+
+    def _hook_page_card(self) -> None:
+        """Make DocumentView's ShadowOverlay (the white card and its shadow) end at
+        page_card() on note pages: its bounds are re-set after the official QML sets
+        them (updateOverlay), from this view while it is DocumentViewport.sceneView."""
+        item, document_view = self, None
+        while item is not None:
+            if item.metaObject().className().startswith("DocumentView_"):
+                document_view = item
+                break
+            item = item.parentItem()
+        if document_view is None:
+            return
+        overlay = next((o for o in document_view.findChildren(QObject)
+                        if o.metaObject().className().startswith("ShadowOverlay")), None)
+        viewport = next((o for o in document_view.findChildren(QObject)
+                         if o.metaObject().className().startswith("DocumentViewport_")), None)
+        self._document_view, self._viewport_item = document_view, viewport
+        if overlay is None or overlay.property("rmCardClamp"):
+            return
+        overlay.setProperty("rmCardClamp", True)
+
+        def clamp() -> None:
+            from PySide6.QtQml import QQmlProperty
+            view = QQmlProperty.read(viewport, "sceneView") if viewport is not None else None
+            if not isinstance(view, SceneView) or not view._note_page() or view._tiles is None:
+                return
+            shown = view._tiles.sceneToView(view.page_card())
+            current = overlay.property("bounds")
+            if isinstance(current, QRectF) and all(abs(a - b) < 0.5 for a, b in zip(current.getRect(), shown.getRect())):
+                return
+            overlay.setProperty("bounds", shown)
+
+        overlay.boundsChanged.connect(clamp)
+        clamp()
 
     def _card_changed(self) -> None:
         """The card changed (a page loaded, the window resized): render it again when the
         image no longer covers it."""
-        if self._content is None or self._content.has_pdf_page:
+        if not self._note_page():
             return
         if self._image is None or not self._image_rect.contains(self._render_rect()):
             self._render()

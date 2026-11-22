@@ -391,13 +391,15 @@ class QuickPaperTests(unittest.TestCase):
         self.assertEqual(controller.property("paperPortraitBounds"), QRectF(-810, 0, 1620, 2160))
         self.assertEqual(controller.property("paperNoteBounds"), QRectF(-1080, 0, 2160, 1620))
         self.assertEqual(controller.property("primaryContentRect"), QRectF(-810, 0, 1620, 2160))
-        # DocumentViewport.updateSceneBoundingRect: note pages get the "landscape" bounds,
-        # +-paperNoteBounds.width / 2 and at least 4/3 of it down.
-        self.assertTrue(self.wait_for(lambda: view._tiles._get("sceneBoundingRect").width() == 2160),
+        # DocumentViewport.updateSceneBoundingRect asks for the "landscape" note bounds
+        # (+-paperNoteBounds.width / 2); 3.29's SceneView puts its own scroll range back
+        # (updateTileManagerScrollBoundary 0x140459330: the exterior boundary, which for
+        # an unexpanded portrait page is its paper, -w/2..w/2; ARCHITECTURE.md 5.17).
+        self.assertTrue(self.wait_for(lambda: view._tiles._get("sceneBoundingRect").width() == 1620),
                         view._tiles._get("sceneBoundingRect"))
         bounds = view._tiles._get("sceneBoundingRect")
-        self.assertEqual((bounds.left(), bounds.top()), (-1080, 0))
-        self.assertGreaterEqual(bounds.height(), 2160 * 4 / 3)
+        self.assertEqual((bounds.left(), bounds.top()), (-810, 0))
+        self.assertGreaterEqual(bounds.height(), 2160)
         # A stroke drawn at scene x 780, past a 1404-wide page's edge, lands there.
         pens = self.tq.PenTests.pens(self, view)
         pens.tools.chooseTool("fineliner")

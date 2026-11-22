@@ -1,12 +1,14 @@
-"""The white page card of a note page and what is drawn on it (ARCHITECTURE.md 5.17).
+"""The white page card of a note page, its scroll range and what is drawn on it
+(ARCHITECTURE.md 5.17).
 
-DocumentView's ShadowOverlay draws the white card at the tile manager's
-sceneBoundingRect, which DocumentViewport.updateSceneBoundingRect makes the paper's note
-bounds on a note page (x from -h/2 to h/2, and at least 4/3 h down). 3.29 renders its
-tiles over that card and paints the template into each tile, so the rules of a portrait
-page run across the card's whole width and on below the paper. The client used to render
-only the paper, which left blank white strips beside and below the template. Synthetic
-ids only."""
+3.29's QML (DocumentViewport.updateSceneBoundingRect) asks for the paper's note bounds,
+-h/2..h/2, as a note page's scroll range, and DocumentView draws the white card at that
+range, twice as tall. 3.29's C++ SceneView then puts its own range back
+(updateTileManagerScrollBoundary): its exterior boundary, which is the portrait paper
+unless ink or text reaches past its sides. The client did only the QML part, so an
+unexpanded portrait page showed a 1872-wide card. Now the card is the page (the
+paper, grown where ink or text goes past it); the template is drawn over exactly that.
+Synthetic ids only."""
 
 from __future__ import annotations
 
@@ -85,7 +87,7 @@ class RenderAreaTests(unittest.TestCase):
         # Without an area: the paper only, 1404 x 1872.
         plain = render_content(content, 0.25)
         self.assertEqual((plain.width(), plain.height()), (351, 468))
-        # The card of a portrait note page in page coordinates: x -234..1638, y 0..2496.
+        # An area wider and taller than the paper (page coordinates): the template fills it all.
         card = render_content(content, 0.25, area=(-234.0, 0.0, 1872.0, 2496.0))
         self.assertEqual((card.width(), card.height()), (468, 624))
         rows = range(0, 624)
@@ -159,41 +161,62 @@ class PageCardTests(unittest.TestCase):
         QMetaObject.invokeMethod(self.qml("DocumentView_"), "hide")
         wait(200)
 
-    def card(self, view) -> QRectF:
+    def scroll(self, view) -> QRectF:
         return view._tiles._get("sceneBoundingRect")
 
-    def test_a_portrait_page_renders_its_whole_card(self):
+    def shown_card(self) -> QRectF:
+        return self.qml("DocumentView_").property("pageBounds")
+
+    def assert_card(self, view, card: QRectF) -> None:
+        self.assertEqual(view.page_card(), card)
+        self.assertEqual(view._image_rect, card)                              # the template over the card only
+        shown = view._tiles.sceneToView(card)
+        bounds = self.shown_card()
+        for a, b in zip(bounds.getRect(), shown.getRect()):                  # the white card and its shadow
+            self.assertAlmostEqual(a, b, delta=0.5)
+
+    def test_an_unexpanded_portrait_page_is_its_paper(self):
         view = self.open(self.portrait)
         self.assertEqual(view._bounds, QRectF(-702, 0, 1404, 1872))
-        self.assertEqual(self.card(view), QRectF(-936, 0, 1872, 2496))       # note bounds, 4/3 h down
-        self.assertEqual(view._image_rect, self.card(view))                  # no bare white strips
-        self.assertEqual(self.qml("DocumentView_").property("pageBounds").width(),
-                         view._tiles.sceneToView(self.card(view)).width())   # the card drawn is that rect
-        image = view._card                                                   # what is shown
+        self.assertEqual(view.exterior_boundary(), QRectF(-702, 0, 1404, 1872))   # 3.29's, ExcludeMargin
+        self.assert_card(view, QRectF(-702, 0, 1404, 1872))
+        scroll = self.scroll(view)
+        self.assertEqual((scroll.left(), scroll.width(), scroll.top()), (-702, 1404, 0))
+        self.assertGreaterEqual(scroll.bottom(), 1872)
+        self.assertLess(scroll.bottom(), 1872 + 400)                         # room for the page indicator only
+        image = view._card
         scale = image.width() / view._image_rect.width()
-        page = view._image                                                   # the paper's own part, as before
-        self.assertAlmostEqual(page.width() / scale, view._bounds.width(), delta=1)
-        self.assertAlmostEqual(page.height() / scale, view._bounds.height(), delta=1)
-        x_left = round((-900 + 936) * scale)                                 # left of the paper (scene x < -702)
-        x_right = round((900 + 936) * scale)                                 # right of it (scene x > 702)
-        below = range(round(2000 * scale), image.height())                   # below the paper (y > 1872)
-        rows = range(0, image.height())
-        self.assertTrue(inked(image, x_left, rows))
-        self.assertTrue(inked(image, x_right, rows))
-        self.assertTrue(any(image.pixelColor(image.width() // 2, y).lightness() < 235 for y in below))
+        self.assertEqual(image.height(), round(1872 * scale))                # nothing below the paper
+        self.assertTrue(inked(image, image.width() - 2, range(0, image.height())))   # rules reach the right edge
 
-    def test_a_page_with_ink_below_the_paper_renders_its_grown_card(self):
+    def test_the_qml_note_bounds_do_not_widen_a_portrait_page(self):
+        view = self.open(self.portrait)
+        view._tiles.setProperty("sceneBoundingRect", QRectF(-936, 0, 1872, 2496))   # updateSceneBoundingRect's
+        wait(50)
+        self.assertEqual(self.scroll(view).width(), 1404)
+        self.assert_card(view, QRectF(-702, 0, 1404, 1872))
+        grown = QRectF(-702, -40, 1404, self.scroll(view).height() + 80)    # onAreaSelected's extra room stays
+        view._tiles.setProperty("sceneBoundingRect", grown)
+        wait(50)
+        self.assertEqual(self.scroll(view), grown)
+
+    def test_a_page_with_ink_past_its_sides_and_bottom_grows_its_card(self):
         view = self.open(self.expanded)
-        card = self.card(view)
-        self.assertGreater(view._bounds.bottom(), 1872)
-        self.assertGreaterEqual(card.bottom(), view._bounds.bottom())
-        self.assertTrue(view._image_rect.contains(card) and view._image_rect.contains(view._bounds))
+        bounds = view._bounds
+        self.assertGreater(bounds.bottom(), 1872)
+        self.assertGreater(bounds.right(), 936)
+        card = view.page_card()
+        # Past the portrait paper's side: 3.29 widens to the note bounds, and to the ink.
+        self.assertEqual((card.left(), card.right()), (-936, bounds.right()))
+        self.assertEqual((card.top(), card.bottom()), (0, bounds.bottom()))
+        self.assert_card(view, card)
+        self.assertGreaterEqual(self.scroll(view).bottom(), bounds.bottom())
 
-    def test_a_landscape_page_renders_its_card(self):
+    def test_a_landscape_page_is_its_paper(self):
         view = self.open(self.landscape)
         self.assertEqual(view._bounds, QRectF(-936, 0, 1872, 1404))
-        self.assertEqual(self.card(view), QRectF(-936, 0, 1872, 2496))
-        self.assertEqual(view._image_rect, self.card(view))
+        self.assert_card(view, QRectF(-936, 0, 1872, 1404))
+        self.assertEqual(self.scroll(view).width(), 1872)
 
     def test_a_pdf_page_is_not_widened(self):
         pdf = next(d for d in self.app.library.tree.documents()
@@ -201,6 +224,7 @@ class PageCardTests(unittest.TestCase):
         view = self.open(pdf.id)
         self.assertFalse(view._content is None or not view._content.has_pdf_page)
         self.assertEqual(view._image_rect, view._bounds)
+        self.assertEqual(view.page_card(), view._bounds)
 
 
 if __name__ == "__main__":

@@ -3236,38 +3236,56 @@ item still loads from the cache.
 
 ### 5.17 The white page card of a note page
 
-What the viewer shows of a page is three rectangles, all in scene coordinates (x = 0 on
+What the viewer shows of a page is four rectangles, all in scene coordinates (x = 0 on
 the paper's centre line):
 
-- **The paper** (`SceneView` bounds): the frame (1404 x 1872, the PDF page, or a landscape
-  notebook's note bounds) grown to the ink and typed text.
-- **The scroll range** (`SceneTileManager.sceneBoundingRect`): on a note page (a notebook
-  page, or a page inserted into a PDF) DocumentViewport.updateSceneBoundingRect makes it
-  the paper's note bounds across, x from -h/2 to h/2 (1872 wide on the default paper,
-  portrait pages included: "We want all notebooks to use 'landscape' bounds"), from y 0 to
-  max(4/3 h, the content's bottom + the bottom margin), plus the window when zoomed out.
-  Other pages keep the SceneView's bounds.
-- **The white card and its shadow** (DocumentView's ShadowOverlay, `pageBounds`): that same
-  rectangle, made twice as tall on note pages so its bottom is never seen; outside it the
-  panel colour covers everything.
+- **The paper and content** (`SceneView` bounds): the frame (1404 x 1872, the PDF page, or
+  a landscape notebook's note bounds) grown to the ink and typed text.
+- **The exterior boundary** (`SceneView::sceneExteriorBoundary`, 0x140452410; read with
+  DocumentViewport's `sceneExteriorMode: ExcludeMargin` on a note page): the content made
+  symmetric about x = 0, united with the paper's portrait bounds (-w/2, 0, w, h)
+  (0x1408a8eb0), whose sides become the note bounds' (-h/2..h/2, 0x1408a8df0) only for a
+  landscape document (Document orientation 1) or when the content reaches past the
+  portrait paper's sides; all cut to the scene's rect (the scene's own rect united with
+  the note bounds), whose bottom is set to the lower of the content's and the portrait
+  paper's. An unexpanded portrait page's exterior boundary is its paper, 1404 x 1872.
+- **The scroll range** (`SceneTileManager.sceneBoundingRect`, stored as set:
+  0x1403fdf00). DocumentViewport.updateSceneBoundingRect asks for the note bounds across
+  (1872 wide, "We want all notebooks to use 'landscape' bounds") down to max(4/3 h,
+  content bottom + room). 3.29's C++ SceneView sets it too: updateTileManagerScrollBoundary
+  (0x140459330, "updating tile manager scroll boundary for note page to {}") makes it the
+  exterior boundary with its height raised to max(its bottom, the content's bottom) + 0.8
+  x the view's height / scale and its top at -(+0xf0)/scale. That is what keeps an
+  unexpanded portrait page 1404 wide in 3.29.
+- **The white card and its shadow** (DocumentView's ShadowOverlay, `pageBounds`): the
+  scroll range, drawn twice as tall on note pages so its bottom is never seen.
 
-3.29 renders its tiles over the whole card, and its template painter (0x140a0c740, JSON
-templates and the procedural ones of 5.3) fills whatever rectangle it is handed, its
-repeats running as far as needed. The built-in portrait templates are made for this:
-"P Lines small" draws its rules `templateHeight` (1872) wide from `templateWidth / 2 -
-templateHeight / 2`, i.e. exactly the note bounds, repeating down. So on 3.29 the rules run
-across the card's full width and on below the paper; there is no paper-sized sheet on the
-card.
+The client used to implement only the QML half (the C++ slots were plumbing stubs), so
+every note page got the 1872-wide range and card; 8e7cbf4 then painted the template over
+that card, which made an unexpanded portrait page look expanded (rules past its right
+edge and on below its bottom).
 
-The client rendered only the paper (`render_content(crop="page")`), so the card showed bare
-white strips left and right of the rules (234 px each on the default paper) and below the
-last rule. Now `SceneView._render_rect` is the union of the paper and, on a note page,
-the tile manager's sceneBoundingRect; `render_content(area=...)` paints the template (and
-the ink) over it; the view renders again when the card grows (`_card_changed`, from the
-tile manager's sceneBoundingRect). `SceneView._card` is that image, what `paint` shows;
-`SceneView._image` stays the paper's own part of it (self._bounds), as before. PDF pages,
-thumbnails and exports still show the paper
-only (the PDF page, or the 1404 x 1872 frame), as 3.29's do.
+Now (`bridge/scene.py`): `SceneView.exterior_boundary()` is 0x140452410's; a note page's
+scroll range is set from it on load, and whenever the QML sets the note bounds instead
+(`_scroll_range_set`, from the tile manager) it is put back, as 3.29's SceneView does (the
+extra room `onAreaSelected` adds above and below for a selection at the page's ends, top
+< 0 and the same width, is kept). `sceneExteriorBoundary` is the exterior boundary.
+
+**Deliberate differences from 3.29** (asked for): the white card is `page_card()`, the
+exterior boundary's width with the page's own height (paper, or ink and text below it):
+DocumentView's ShadowOverlay `bounds` are re-set to it after the official QML sets them
+(its `boundsChanged`; no QML file is changed), so the card and its shadow end at the page
+instead of running on below it, and a landscape page's card is 1404 tall (3.29's exterior
+boundary reaches the portrait paper's 1872). The scroll range is that card plus the room
+updateSceneBoundingRect gives a note page's content, (bottomMargin + bottomPadding /
+scaleFactor) x devicePixelRatio, instead of 3.29's 0.8 view heights, which would scroll
+onto bare panel. The template and ink are rendered over the card only
+(`render_content(area=...)`): on a page whose ink reaches past the note bounds, the card
+follows the ink and the rules stop where the template's own geometry ends (P Lines small:
+the note bounds), as on 3.29. Initial zoom is unchanged (DocumentView.viewportScale uses
+the paper height); fit-to-width now fits the paper, as the scroll range is its width.
+`SceneView._card` is the rendered card, what `paint` shows; `SceneView._image` stays the
+paper's own part of it. PDF pages, thumbnails and exports still show the paper only.
 
 ## 6. Implications for the Linux client
 
