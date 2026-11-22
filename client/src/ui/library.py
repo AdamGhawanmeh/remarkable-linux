@@ -278,7 +278,7 @@ def document_pages(doc: Document, pdf_page_count: int | None = None,
     Documents without a page list (never opened on a tablet) fall back to one page
     per PDF page (ids from unlisted_page_id), or per .rm file for notebooks. Templates
     come from .content; older (formatVersion 1) documents list them in .pagedata, one
-    line per page.
+    line per page (never read for formatVersion 2, as in 3.29).
     """
     live: list[Page] = [p for p in doc.content.pages if not p.deleted]
     if not live:
@@ -288,6 +288,10 @@ def document_pages(doc: Document, pdf_page_count: int | None = None,
             ids = sorted(name[len(doc.id) + 1:-3] for name in doc.files
                          if name.startswith(f"{doc.id}/") and name.endswith(".rm"))
             live = [Page(id=pid) for pid in ids]
+    if doc.content.format_version == 2:
+        # 3.29 does not read .pagedata for formatVersion 2 ("Skipping template/pagedata
+        # file loading for version 2", 0x140661df0): the page list's templates only.
+        pagedata = None
     refs = []
     for i, page in enumerate(live):
         name = f"{doc.id}/{page.id}.rm"
@@ -704,6 +708,8 @@ class LibrarySource:
                         "of one document only")
         if doc.file_type not in EDITABLE_TYPES:
             return "Only notebooks, PDFs and ebooks can be edited"
+        if doc.content.unsupported:
+            return "There's a mismatch in format versions. Try updating your software."
         if tree.is_trashed(doc.id):
             return "A document in the trash cannot be edited"
         if doc.file_type is not FileType.NOTEBOOK and not has_page_list(tree.get(doc.id)):

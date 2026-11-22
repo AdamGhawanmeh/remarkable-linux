@@ -23,6 +23,7 @@ from PySide6.QtCore import (Q_ARG, QEventLoop, QMetaObject, QObject, QPoint, QPo
                             QUrl, Signal, qVersion)
 from PySide6.QtGui import QColor, QFont, QImage, QPainter
 from PySide6.QtNetwork import QNetworkInformation
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from ui.quick.app import configure, prepare
@@ -1281,6 +1282,41 @@ class EditingTests(unittest.TestCase):
         view = self.open_document(self.THROWAWAY, self.PAGE1)
         self.assertTrue(self.wait_for(lambda: view.property("status") == 2))
         self.assertFalse(view._controller.property("undoAvailable"))
+        self.assertEqual(self.notices, [])
+        self.assertEqual(real_warnings(self.app.warnings), [])
+
+    def test_ctrl_y_redoes_where_the_platforms_redo_does_not_bind_it(self):
+        """GNOME binds StandardKey.Redo to Ctrl+Shift+Z only; 3.29 on Windows redoes with
+        Ctrl+Y. ui.quick.shortcuts adds the key there, as a Shortcut on the app's own
+        redoAction. Offscreen Qt binds Ctrl+Y itself, so this installs a stand-in key
+        through the same code and presses it."""
+        from ui.quick import shortcuts
+        self.assertEqual(shortcuts.missing_redo_sequences(["Ctrl+Shift+Z", "Redo"]), ["Ctrl+Y"])
+        self.assertEqual(shortcuts.missing_redo_sequences(["Ctrl+Y", "Ctrl+Shift+Z"]), [])
+        self.assertIsNone(self.window.findChild(QObject, "linuxRedoShortcut"))      # offscreen: Ctrl+Y is bound
+        shortcut = shortcuts.install_redo_shortcut(self.app.engine, self.window, ["Ctrl+Alt+Y"])
+        try:
+            self.assertIsNotNone(shortcut)
+            view = self.open_document(self.THROWAWAY, self.PAGE1)
+            controller = view._controller
+            undo, redo = self.action("Undo"), self.action("Redo")
+            self.window.requestActivate()
+            QMetaObject.invokeMethod(self.qml("DocumentViewport"), "forceActiveFocus")
+            self.drop_and_select(view)
+            self.assertTrue(self.wait_for(lambda: undo.property("enabled")))
+            self.assertFalse(shortcut.property("enabled"))          # nothing to redo yet
+            QMetaObject.invokeMethod(undo, "trigger")
+            self.assertTrue(self.wait_for(lambda: len(self.pending()) == 2), self.notices)
+            self.assertTrue(self.wait_for(lambda: redo.property("enabled") and shortcut.property("enabled")))
+            QTest.keyClick(self.window, Qt.Key.Key_Y,
+                           Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+            self.assertTrue(self.wait_for(lambda: len(self.pending()) == 3), self.notices)
+            self.assertTrue(self.wait_for(lambda: len(view._content.scene.placed_images) == 1))
+            self.assertTrue(self.wait_for(lambda: not controller.property("redoAvailable")))
+        finally:
+            if shortcut is not None:
+                shortcut.deleteLater()
+                wait(30)
         self.assertEqual(self.notices, [])
         self.assertEqual(real_warnings(self.app.warnings), [])
 

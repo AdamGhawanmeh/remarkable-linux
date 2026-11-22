@@ -55,7 +55,7 @@ from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 
 from core import handwriting as hwc
 from core.edits import EditError
-from core.models import FileType
+from core.models import FileType, LoadErrorType, load_error_text
 from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, Layer, Tool
 from viewer.rm_parser import parse as parse_page
 from viewer import rm_stroke
@@ -1916,6 +1916,8 @@ class _SceneView:
         def job():
             pages = None
             try:
+                if node.content.unsupported:            # main.qml does not open it; nor does any other way in
+                    raise ValueError(load_error_text(LoadErrorType.UNSUPPORTED_FORMAT_VERSION))
                 pages = DocumentPages(source, node)
                 if not pages.pages:
                     raise ValueError(no_pages_reason(node))

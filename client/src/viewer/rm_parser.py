@@ -647,6 +647,39 @@ BLOCK_IMAGE_ITEM = 0x0F
 STRUCTURAL_BLOCKS = frozenset({0x00, 0x01, 0x09, 0x0A, 0x0C, 0x0D})
 
 
+# The newest version of each block type reMarkable.exe 3.29 reads (0x140a079c0: a jump
+# table; 0 for 0x00, 0x0B, 0x0C and types past 0x0F).
+SUPPORTED_BLOCK_VERSIONS = {0x01: 1, 0x02: 2, 0x03: 1, 0x04: 1, 0x05: 2, 0x06: 2, 0x07: 2, 0x08: 1,
+                            0x09: 1, 0x0A: 1, 0x0D: 1, 0x0E: 3, 0x0F: 2}
+
+
+def block_unreadable(block_type: int, min_version: int, version: int) -> bool:
+    """Whether a block is a newer layout of a block type this client (and 3.29) reads,
+    one that says a reader must know that layout: 3.29's block reader (0x140a02fb0)
+    stops at a block newer than it reads (supported < version) whose min_version is
+    above what it reads. Such a page is refused here: drawing it would be a guess, and
+    writing it back would re-encode the block in the old layout.
+
+    Blocks of a type 3.29 does not read at all are not refused: 3.29 keeps them byte for
+    byte when their min_version is 0 (0x1409f6840) and stops reading the page at one
+    with a higher min_version; this client keeps every such block byte for byte (the
+    writer never re-encodes them), which loses nothing. MigrationInfo (0x00, 1/1 on every
+    real page) is read before that check."""
+    supported = SUPPORTED_BLOCK_VERSIONS.get(block_type, 0)
+    if supported == 0 or min_version == 0:
+        return False
+    return supported < version and supported < min_version
+
+
+def check_block(block_type: int, min_version: int, version: int, offset: int) -> None:
+    """RmParseError for a block 3.29 would refuse (block_unreadable): the page is newer
+    than this client, and must be neither drawn from a guess nor written back."""
+    if block_unreadable(block_type, min_version, version):
+        raise RmParseError(f"block type {block_type:#x} at offset {offset} is version {version} (needs a reader of "
+                           f"version {min_version} or later): the page was made by a newer reMarkable; update "
+                           "reMarkable to open it")
+
+
 def block_name(block_type: int) -> str:
     return BLOCK_NAMES[block_type] if 0 <= block_type < len(BLOCK_NAMES) else f"Unknown{block_type}"
 
@@ -1163,7 +1196,8 @@ def _parse_v6(data: bytes) -> PageScene:
 
     while r.pos < len(data):
         start = r.pos
-        length, _zero, _min_version, version, block_type = r.unpack("<IBBBB")
+        length, _zero, min_version, version, block_type = r.unpack("<IBBBB")
+        check_block(block_type, min_version, version, start)
         payload = r.take(length)
         counts[block_type] = counts.get(block_type, 0) + 1
         try:

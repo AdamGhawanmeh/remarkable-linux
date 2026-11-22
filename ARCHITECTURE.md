@@ -382,6 +382,12 @@ Token lifecycle [O]:
   Live account: schema 3, 5-field index lines, v3 hash-of-hashes verified on every entry of a real library.
 - `/sync/v3/` + `{}missing`, `{}check-files` — batch missing-hash checks.
 - `/gentree/v1/` + `GetEntries`, `GetFiles`, `GetFile`, `PutFile`, `DeleteEntry`, `EntrySession` — newer generation-tree API.
+  Not implemented. 3.29 holds its sync state as a variant of `sync1_5` and `gentree`
+  (accessors 0x14020e720 / 0x14020e7a0); what selects gentree for an account was not
+  found (`setProtocolFlag` 0x140137500 is the Limited-sync flag, not the protocol). The
+  client refuses to sync rather than guess: `core.sync.protocol_refusal` stops a sync
+  whose root reply or discovery reply names gentree, or whose root `schemaVersion` is
+  not 3 or 4 (`UnsupportedProtocolError`, said in the app, nothing read or written).
 - `/sync/reports/v1` — sync reports/telemetry.
 - Headers: `rm-filename`, `rm-batch-number`, `rm-sync-id`, `rm-parent-hash`, `rm-path`,
   `rm-expect-version`, `rm-sha256-mismatch`, `rm-recovered-{missing,empty}-hash`;
@@ -937,7 +943,7 @@ Parser: `client/src/viewer/rm_parser.py` (v3, v5, v6).
 | Points | 6 × f32: x, y, speed, direction, width, pressure | Block v2: 14 bytes `f32 x, f32 y, u16 speed×4, u16 width×4, u8 direction×255/2π, u8 pressure×255`; block v1: 6 × f32 |
 | Layers | Implicit, by position | TreeNode (0x02) with last-write-wins label/visibility, attached to root `0:1` via SceneGroupItem (0x04) |
 | Coordinates | x from left edge, 0–1404 | x centred on the page (−702…702); pages can extend beyond 1404 × 1872 |
-| Erasing | Eraser strokes drawn in white | Items deleted in the CRDT: the stroke's own block stays, without its value and with `deletedLength`; what an eraser leaves of a stroke comes back as new strokes (see "Deleting and the eraser" below) |
+| Erasing | Eraser strokes that show the background under the ink again (§5.15) | Items deleted in the CRDT: the stroke's own block stays, without its value and with `deletedLength`; what an eraser leaves of a stroke comes back as new strokes (see "Deleting and the eraser" below) |
 | Typed text | — | RootText (0x07): CRDT character sequence (left/right ids) + paragraph styles (last write wins) + box position/width |
 | Images | — | SceneImagesTable (0x0E) + CrdtImageItem (0x0F) |
 | Groups | — | Layers are children of root `0:1` (Layer 1 is usually `0:11`); groups nest inside layers via CrdtGroupItem. A group TreeNode may carry an **anchor** (LWW fields 7 char id, 8 type, 9 threshold, 10 origin x): its strokes' x is relative to origin x and y to the line holding that typed-text character, so handwriting follows the text |
@@ -1777,7 +1783,11 @@ read it.
   values cover exactly 0…`original`−1. They do not have to be unique or increasing: in two
   PDFs every PDF page is listed 2–3 times, because copied pages keep their `redir`
   (`core/clone.py` and `edits.PageCopy` do the same). `pageCount` is a cached count: one of
-  those two says 10 with 15 live pages. The live `cPages` entries are what counts.
+  those two says 10 with 15 live pages. The live `cPages` entries are what counts: for a
+  formatVersion 2 document 3.29's loader (0x1406669f0) sets `Document::pageCount` (+0x24c)
+  to the size of its page vector and never reads the stored number; for formatVersion 1
+  it takes the stored `pageCount` when it is at least 1 and grows the page list to it
+  (0x14087aea0). `models.Content.page_count` does the same (§5.15).
 - Pages inserted into a PDF (in 15 of 48 PDFs) carry ordinary templates (`Blank` 48,
   `P Lines small` 5, `P Grid bottom` 4, `Perspective2` 1). PDF-backed pages say `Blank`
   (1471) or have no template (18).
@@ -3101,6 +3111,61 @@ answers as the app's does (§2.2 lists what stays a no-op). Tests:
   `markWhatsNewAsRead` stores the version. Client: the same, so a first start shows the
   dialog once; `core.config.WHATS_NEW_READ_DEFAULT` is that "0" (the tests' helper raises
   it, so their windows start clear; `WhatsNewTests` checks the dialog with "0").
+
+### 5.15 Format guards, page counts and legacy erasers (audit fixes)
+
+**Documents newer than 3.29.** The loader (0x1406611a0) reads `formatVersion` as
+0x1406cefc0 does (`QJsonValue::toInt(0)` of the key, at least 1; 1 when missing) and
+sets `loadErrorType` UnsupportedFormatVersion (2) when it is above 2 (0x1406cf2c0), so
+the document does not load; page operations on it are refused ("Cannot add page, unable
+to ensure correct format version", 0x140667af0). `loadError` is `loadErrorType != 0`
+(0x14065fdc0); `loadErrorDescription` (0x140661af0) is per type: 1 "Unable to view
+document. File format is outdated.", 2 "There's a mismatch in format versions. Try
+updating your software.", 3 "Your PDF file seems to be missing. Try importing it
+again.", 4 "Document is archived.", else "Something seems to be wrong. Please try to
+restart.". An archived document (`archived`, 0x140669d10) gets CloudArchive (4).
+main.qml's `requestOpenDocument` then shows `SoftwareUpdateDialog` for type 2 and
+`UnableToViewDialog` (with the description) for the others instead of opening.
+
+Client: `models.format_version_of`, `MAX_FORMAT_VERSION`, `Content.unsupported`,
+`check_format`; `DocumentWrapper.loadError/loadErrorType/loadErrorDescription`
+(UnsupportedFormatVersion, else CloudArchive); a newer document is also refused by
+`edit_refusal`, `core.edits.document_files` / `current_content` (so a pending edit is
+never applied to it on upload), `SyncClient._content_change` (tags) and
+`clone_document`; SceneView will not load its pages if asked another way.
+
+**Pages newer than 3.29.** The block reader (0x140a02fb0) knows, per block type, the
+newest version it reads (0x140a079c0: 0x01 1, 0x02 2, 0x03 1, 0x04 1, 0x05 2, 0x06 2,
+0x07 2, 0x08 1, 0x09 1, 0x0A 1, 0x0D 1, 0x0E 3, 0x0F 2; 0 for the rest). A block newer
+than that whose `min_version` is above it stops the page; with `min_version` 0 it is
+kept byte for byte (0x1409f6840). `rm_parser.block_unreadable` / `check_block` refuse a
+page with such a block of a known type (parser and `rm_writer.split`, so it is neither
+drawn from a guess nor written back). Blocks of types 3.29 does not read stay kept byte
+for byte here, as before (the writer never re-encodes them); every cached page passes.
+
+**Pages and templates.** `Content.parse` orders `cPages` by (idx, id), as
+`core.pagemap.PageMap` does, and counts live pages for formatVersion 2 (§5.4). `.pagedata`
+is not read for formatVersion 2 ("Skipping template/pagedata file loading for version
+2", 0x140661df0): `document_pages` uses it for formatVersion 1 only.
+
+**Legacy eraser strokes.** 3.29 draws lines through strokev2 pipelines where it has one
+(0x140b2ace0: 22 Eraser, 23 Shader, 13/14 Pencil, 15 Ballpoint, 0x3a0010 solid tools);
+Eraser (6) has none and goes to the QPainter renderer 0x140b38240, which sends it to
+0x140b37da0: a rasteriser that copies the page's background image (the template or PDF
+page under the ink) over the pixels the stroke covers. So an eraser stroke removes the
+ink drawn before it and shows what was under the ink; it never paints white over a PDF
+or an ebook. Client: `renderer.eraser_outline` (runs stroked at their widths, round caps
+and joins) and `erased_after`; `paint` clips every item drawn before an eraser stroke by
+the union of the later erasers, and `svg_scene` masks them (`<mask id="erase-n">`), so
+the viewer, PNG, PDF (vector and raster) and SVG export agree. On the cached EPUB page
+with two such strokes the client used to whiten 1,994 pixels of the book's text; now
+none, and every pixel inside the eraser equals the page under it.
+
+**Ctrl+Y.** ActionManager's Redo is `StandardKey.Redo`; a QML Shortcut takes the first
+of the platform's bindings: Ctrl+Y on Windows, Ctrl+Shift+Z on GNOME (Wayland and X11),
+so Ctrl+Y did nothing here. `ui.quick.shortcuts.install_redo_shortcut` adds a Shortcut
+for Ctrl+Y on the same `redoAction` (enabled with it) where the platform's first Redo
+binding is not Ctrl+Y already (else both would be ambiguous).
 
 ## 6. Implications for the Linux client
 

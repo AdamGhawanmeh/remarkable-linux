@@ -29,8 +29,8 @@ from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QObject, QPoi
                             QEnum)
 
 from core.auth import CERTIFICATE_TIME_ERROR, HANDSHAKE_FAILED, http_error_name
-from core.models import (ROOT_ID, TRASH_ID, Document as DocumentNode, DocumentTree, FileType, Node,
-                         unique_name)
+from core.models import (ROOT_ID, TRASH_ID, Document as DocumentNode, DocumentTree, FileType, LoadErrorType, Node,
+                         load_error_text, unique_name)
 
 from ...library import PageRef, document_pages, document_tags, has_page_list, pdf_name
 from ...workers import _Job, emit_from_worker
@@ -670,6 +670,8 @@ class DocumentWrapper(EntryWrapper):
                 signal.emit()
         self.lastOpenedPageChanged.emit(self._page())
         self.coverPageNumberChanged.emit(node.content.cover_page_number)
+        self.archiveChanged.emit()
+        self.loadErrorChanged.emit()
         self.nodeReplaced.emit()
 
     def _page(self) -> int:
@@ -767,13 +769,28 @@ class DocumentWrapper(EntryWrapper):
     publicationDate = Property(str, lambda self: str(self._metadata().get("publicationDate", "")),
                                notify=documentMetadataChanged)
     language = Property(str, lambda self: str(self._metadata().get("language", "")), notify=documentMetadataChanged)
-    loadError = Property(bool, lambda self: False, notify=loadErrorChanged)
+    def _load_error_type(self) -> int:
+        """Document::loadErrorType (+0x2c8) as 3.29 sets it: UnsupportedFormatVersion when
+        .content's formatVersion is newer than it reads (0x1406611a0), CloudArchive while
+        the document is archived (0x140669d10); None otherwise. main.qml's
+        requestOpenDocument then shows SoftwareUpdateDialog or UnableToViewDialog instead
+        of opening it."""
+        if self._node.content.unsupported:
+            return int(LoadErrorType.UNSUPPORTED_FORMAT_VERSION)
+        if is_cloud_archived(self._node):
+            return int(LoadErrorType.CLOUD_ARCHIVE)
+        return int(LoadErrorType.NONE)
+
+    # Document::loadError (0x14065fdc0): loadErrorType != None.
+    loadError = Property(bool, lambda self: self._load_error_type() != 0, notify=loadErrorChanged)
     # Document::archived (+0x2cc, set by 0x140669d10): QFile::exists of the document's
     # "<id>.cloudarchive" next to its files (FileSystem vtable +8; 3.29's sync only ever
     # deletes such files). Here: that file among the document's files.
     archived = Property(bool, lambda self: is_cloud_archived(self._node), notify=archiveChanged)
-    loadErrorType = Property(int, lambda self: 0, notify=loadErrorChanged)
-    loadErrorDescription = Property(str, lambda self: "", notify=loadErrorChanged)
+    loadErrorType = Property(int, _load_error_type, notify=loadErrorChanged)
+    # Document::loadErrorDescription (0x140661af0).
+    loadErrorDescription = Property(str, lambda self: load_error_text(self._load_error_type()),
+                                    notify=loadErrorChanged)
     sizeInBytes = Property("qlonglong", lambda self: self._node.content.size_in_bytes, notify=sizeInBytesChanged)
     redirectionPageMap = Property("QVariantList", lambda self: [p.pdf_page if p.pdf_page is not None else -1
                                                                 for p in self._pages()],

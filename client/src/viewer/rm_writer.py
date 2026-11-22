@@ -19,7 +19,8 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from .rm_parser import (HEADER_LENGTH, TAG_BYTE1, TAG_BYTE4, TAG_BYTE8, TAG_ID, TAG_LENGTH4, RmParseError)
+from .rm_parser import (HEADER_LENGTH, TAG_BYTE1, TAG_BYTE4, TAG_BYTE8, TAG_ID, TAG_LENGTH4, RmParseError,
+                        check_block)
 
 V6_HEADER = b"reMarkable .lines file, version=6".ljust(HEADER_LENGTH)
 BLOCK_HEADER = struct.Struct("<IBBBB")
@@ -54,6 +55,7 @@ def split(data: bytes) -> tuple[bytes, list[Block]]:
         end = pos + BLOCK_HEADER.size + length
         if end > len(data):
             raise RmParseError(f"block at offset {pos} runs past the end of the page")
+        check_block(block_type, min_version, version, pos)       # never rewrite a newer page
         blocks.append(Block(block_type, min_version, version, data[pos + BLOCK_HEADER.size:end], pos))
         pos = end
     return data[:HEADER_LENGTH], blocks

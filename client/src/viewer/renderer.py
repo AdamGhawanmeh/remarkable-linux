@@ -15,7 +15,8 @@ Fidelity (ARCHITECTURE.md §5.2):
     used if installed, otherwise Noto Sans / sans-serif.
 
 Stroke widths come from each point's recorded width, so pressure-sensitive tools
-taper naturally. Eraser strokes (legacy files) paint the background colour;
+taper naturally. Eraser strokes (legacy files) take away the ink drawn before them and
+show the template or PDF page under it again, as 3.29 does (eraser_outline);
 erase-section, selection and zoom tools leave no ink. Layers draw bottom to top;
 hidden layers are skipped unless requested. Typed text draws above the strokes.
 """
@@ -541,40 +542,110 @@ def _svg_font(font: TextFont) -> str:
     return f'font-family="{families}" font-size="{font.size:g}"{weight}{style}'
 
 
+def is_eraser(stroke) -> bool:
+    """A stored eraser stroke (Eraser 6, the masked eraser 22: legacy pages)."""
+    return isinstance(stroke, Stroke) and stroke.tool.family == "eraser"
+
+
+# Legacy eraser strokes (ARCHITECTURE.md 5.2). reMarkable.exe 3.29 draws a line whose
+# tool has no strokev2 pipeline (0x140b2ace0 leaves Eraser 6 out) with its QPainter
+# renderer (0x140b38240), which sends tool 6 to 0x140b37da0: that rasteriser copies the
+# page's background image (the template or PDF page under the ink) over what the
+# stroke covers. An eraser stroke therefore removes the ink drawn before it and shows
+# what is under the page's ink again; it never paints white over a PDF or an ebook.
+# Here: every item drawn before an eraser stroke is clipped by that stroke's outline
+# (QPainter clip, SVG mask), the same in the viewer, PNG, PDF and SVG.
+
+def eraser_outline(scene: PageScene, stroke: Stroke, offset: tuple[float, float] = (0.0, 0.0)):
+    """The area an eraser stroke covers (a QPainterPath): its runs stroked at their
+    widths with round caps and joins."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QPainterPath, QPainterPathStroker
+
+    area = QPainterPath()
+    for run in stroke_runs(scene, stroke, offset):
+        if all(pt == run.points[0] for pt in run.points):
+            dot = QPainterPath()
+            dot.addEllipse(QPointF(*run.points[0]), run.width / 2, run.width / 2)
+            area = area.united(dot)
+            continue
+        path = QPainterPath(QPointF(*run.points[0]))
+        for px, py in run.points[1:]:
+            path.lineTo(px, py)
+        stroker = QPainterPathStroker()
+        stroker.setWidth(run.width)
+        stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+        stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        area = area.united(stroker.createStroke(path))
+    return area
+
+
+def erased_after(scene: PageScene, items: list, offsets: dict) -> dict:
+    """id(item) -> the union of the outlines of the eraser strokes drawn after it (a
+    QPainterPath), for the items (in drawing order) that have any."""
+    later = None
+    out: dict[int, object] = {}
+    for item in reversed(items):
+        if is_eraser(item):
+            area = eraser_outline(scene, item, offsets.get(id(item), (0.0, 0.0)))
+            later = area if later is None else later.united(area)
+        elif later is not None:
+            out[id(item)] = later
+    return out
+
+
 def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: bool = False,
               measure: Measure = estimate_width, decimals: int = 2) -> list[str]:
     """The scene's SVG elements in page coordinates: one group per visible layer, bottom
     to top, holding a group per stroke (tool, colour, caps, highlighter blending) with a
-    polyline per run of constant width and opacity; then the typed text. `background` is
-    what eraser strokes paint with; `measure` lays out the text (qt_measure: as the
+    polyline per run of constant width and opacity; then the typed text. Eraser strokes
+    mask what was drawn before them (eraser_outline); `measure` lays out the text (qt_measure: as the
     viewer wraps it); `decimals` is the precision of stroke coordinates."""
     lines = layout_text(scene, measure)
     offsets = stroke_offsets(scene, lines)
-    out = []
+    done: list[str] = []            # finished layers
+    masks: list[str] = []           # one <mask> per eraser stroke (legacy pages)
+
+    def wrap(elements: list[str], mask: str) -> list[str]:
+        return [f'<g mask="url(#{mask})">', *elements, "</g>"] if elements else elements
+
     for index, layer in enumerate(_visible_layers(scene, include_hidden)):
-        out.append(f'<g id="layer-{index}" data-name={quoteattr(layer.name)}>')
+        cur: list[str] = []
         for stroke in layer.items():
             if isinstance(stroke, ImageItem):
                 if element := _svg_image(scene, stroke):
-                    out.append(element)
+                    cur.append(element)
                 continue
             if isinstance(stroke, GlyphRange):
-                out += _svg_glyphs(scene, stroke)
+                cur += _svg_glyphs(scene, stroke)
+                continue
+            if is_eraser(stroke):
+                # What was drawn before it is masked where it passes (see eraser_outline).
+                mask = f"erase-{len(masks)}"
+                runs = [f'<polyline points="{" ".join(f"{px:.{decimals}f},{py:.{decimals}f}" for px, py in run.points)}" '
+                        f'stroke-width="{run.width:g}"/>'
+                        for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0)))]
+                masks.append(f'<mask id="{mask}" maskUnits="userSpaceOnUse" x="-100000" y="-100000" '
+                             f'width="200000" height="200000"><rect x="-100000" y="-100000" width="200000" '
+                             f'height="200000" fill="white"/><g stroke="black" fill="none" stroke-linecap="round" '
+                             f'stroke-linejoin="round">{"".join(runs)}</g></mask>')
+                done, cur = wrap(done, mask), wrap(cur, mask)
                 continue
             style = stroke_style(stroke, background)
             if style is None:
                 continue
             cap = "square" if style.square_cap else "round"
             blend = ' style="mix-blend-mode:darken"' if style.blend_darken else ""
-            out.append(f'<g data-tool="{stroke.tool.name.lower()}" stroke="{style.color}" '
+            cur.append(f'<g data-tool="{stroke.tool.name.lower()}" stroke="{style.color}" '
                        f'fill="none" stroke-linecap="{cap}" stroke-linejoin="round"{blend}>')
             for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0))):
                 coords = " ".join(f"{px:.{decimals}f},{py:.{decimals}f}" for px, py in run.points)
                 opacity = run.opacity * style.alpha
                 attr = f' stroke-opacity="{opacity:.4g}"' if opacity < 1 else ""
-                out.append(f'<polyline points="{coords}" stroke-width="{run.width:g}"{attr}/>')
-            out.append("</g>")
-        out.append("</g>")
+                cur.append(f'<polyline points="{coords}" stroke-width="{run.width:g}"{attr}/>')
+            cur.append("</g>")
+        done += [f'<g id="layer-{index}" data-name={quoteattr(layer.name)}>', *cur, "</g>"]
+    out = ([f'<defs>{"".join(masks)}</defs>'] if masks else []) + done
     if lines and (include_hidden or scene.root_document_visible):
         out.append(f'<g id="text" fill="{TEXT_COLOR}">')
         for line in lines:
@@ -634,8 +705,8 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     QPdfWriter itself cannot express.
     blend_modes=False never changes the composition mode (devices without support).
     """
-    from PySide6.QtCore import QPointF, Qt
-    from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QPainter, QPainterPath
 
     if layers not in LAYERS:
         raise ValueError(f"unknown layers {layers!r}")
@@ -645,44 +716,72 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     lines = layout_text(scene, qt_measure)
     offsets = stroke_offsets(scene, lines)
     drawn = 0
-    for layer in _visible_layers(scene, include_hidden):
-        for stroke in layer.items():
-            if isinstance(stroke, ImageItem):
-                if layers != "darken" and _paint_image(painter, scene, stroke, blend_modes):
-                    drawn += 1
-                continue
-            if isinstance(stroke, GlyphRange):
-                if layers != "normal" and _paint_glyphs(painter, scene, stroke, blend_modes):
-                    drawn += 1
-                continue
-            style = stroke_style(stroke, background)
-            if style is None or (layers == "darken" and not style.blend_darken) \
-                    or (layers == "normal" and style.blend_darken):
-                continue
-            if blend_modes:
-                painter.setCompositionMode(
-                    QPainter.CompositionMode.CompositionMode_Darken if style.blend_darken
-                    else QPainter.CompositionMode.CompositionMode_SourceOver)
-            cap = Qt.PenCapStyle.SquareCap if style.square_cap else Qt.PenCapStyle.RoundCap
-            drawn += 1
-            for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0))):
-                color = QColor(style.color)
-                color.setAlphaF(run.opacity * style.alpha)
-                painter.setPen(QPen(color, run.width, Qt.PenStyle.SolidLine, cap,
-                                    Qt.PenJoinStyle.RoundJoin))
-                if all(pt == run.points[0] for pt in run.points):
-                    # A zero-length path draws nothing; dots (i, full stops) need this.
-                    painter.drawPoint(QPointF(*run.points[0]))
-                    continue
-                path = QPainterPath(QPointF(*run.points[0]))
-                for px, py in run.points[1:]:
-                    path.lineTo(px, py)
-                painter.drawPath(path)
+    ordered = [item for layer in _visible_layers(scene, include_hidden) for item in layer.items()]
+    erased = erased_after(scene, ordered, offsets) if any(is_eraser(i) for i in ordered) else {}
+    everywhere = QPainterPath()
+    everywhere.addRect(-1e6, -1e6, 2e6, 2e6)
+    for stroke in ordered:
+        if is_eraser(stroke):
+            continue                    # it clips what came before it (erased_after)
+        clip = erased.get(id(stroke))
+        if clip is not None:
+            painter.save()
+            painter.setClipPath(everywhere.subtracted(clip), Qt.ClipOperation.IntersectClip)
+        try:
+            drawn += _paint_item(painter, scene, stroke, background, layers, blend_modes, offsets)
+        finally:
+            if clip is not None:
+                painter.restore()
     if blend_modes:
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
     if layers == "darken":
         return drawn
+    return drawn + _paint_text(painter, scene, lines, include_hidden)
 
+
+def _paint_item(painter, scene: PageScene, stroke, background: str, layers: str, blend_modes: bool,
+                offsets: dict) -> int:
+    """Draw one item of a layer (image, text highlight or stroke); 1 if drawn."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+
+    drawn = 0
+    if isinstance(stroke, ImageItem):
+        return 1 if layers != "darken" and _paint_image(painter, scene, stroke, blend_modes) else 0
+    if isinstance(stroke, GlyphRange):
+        return 1 if layers != "normal" and _paint_glyphs(painter, scene, stroke, blend_modes) else 0
+    style = stroke_style(stroke, background)
+    if style is None or (layers == "darken" and not style.blend_darken) \
+            or (layers == "normal" and style.blend_darken):
+        return 0
+    if blend_modes:
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_Darken if style.blend_darken
+            else QPainter.CompositionMode.CompositionMode_SourceOver)
+    cap = Qt.PenCapStyle.SquareCap if style.square_cap else Qt.PenCapStyle.RoundCap
+    drawn += 1
+    for run in stroke_runs(scene, stroke, offsets.get(id(stroke), (0.0, 0.0))):
+        color = QColor(style.color)
+        color.setAlphaF(run.opacity * style.alpha)
+        painter.setPen(QPen(color, run.width, Qt.PenStyle.SolidLine, cap,
+                            Qt.PenJoinStyle.RoundJoin))
+        if all(pt == run.points[0] for pt in run.points):
+            # A zero-length path draws nothing; dots (i, full stops) need this.
+            painter.drawPoint(QPointF(*run.points[0]))
+            continue
+        path = QPainterPath(QPointF(*run.points[0]))
+        for px, py in run.points[1:]:
+            path.lineTo(px, py)
+        painter.drawPath(path)
+    return drawn
+
+
+def _paint_text(painter, scene: PageScene, lines: list, include_hidden: bool) -> int:
+    """Draw the typed text above the layers; how many lines."""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QColor
+
+    drawn = 0
     if not (include_hidden or scene.root_document_visible):
         return drawn
     painter.setPen(QColor(TEXT_COLOR))

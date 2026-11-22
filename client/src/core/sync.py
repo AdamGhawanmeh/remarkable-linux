@@ -69,7 +69,7 @@ from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTran
                     TextEdit, ToolSettings, LAYER_EDITS, SceneFlags, AnchoredGroupAdd,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
-                     DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
+                     UnsupportedFormatError, check_format, DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
                      new_document_content, new_folder_content, new_metadata)
 
 log = logging.getLogger("rm.sync")
@@ -94,6 +94,46 @@ STATE_FILE = "state.json"
 
 class SyncError(Exception):
     """A sync request failed or returned unusable data."""
+
+
+class UnsupportedProtocolError(SyncError):
+    """The cloud asks for a sync protocol this client does not speak (the generation-tree
+    API, /gentree/v1/, that reMarkable.exe 3.29 also has, or an index schema other than 3
+    and 4): nothing is read or written rather than syncing blindly."""
+
+
+# Index schemas this client reads and writes (hashOfHashesV3, hashOfSchemaV4).
+SUPPORTED_SCHEMAS = (3, 4)
+PROTOCOL_REFUSAL = ("Your reMarkable account uses a newer sync protocol than this app supports. "
+                    "Nothing was synced: update the app.")
+
+
+def _mentions(value: Any, word: str) -> bool:
+    """Whether `word` appears (any case) in a JSON value's keys or strings."""
+    if isinstance(value, str):
+        return word in value.lower()
+    if isinstance(value, dict):
+        return any(_mentions(k, word) or _mentions(v, word) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_mentions(v, word) for v in value)
+    return False
+
+
+def protocol_refusal(reply: Any) -> str:
+    """Why a root or discovery reply is refused ("" when it is not): it names the
+    generation-tree protocol ("gentree", 3.29's rmsync::gentree), or its root says an
+    index schema this client does not handle. What makes 3.29 choose gentree for an
+    account is not known (ARCHITECTURE.md 3.3), so any mention of it stops the sync."""
+    if _mentions(reply, "gentree"):
+        return f"{PROTOCOL_REFUSAL} (the cloud asked for the generation-tree protocol)"
+    if isinstance(reply, dict) and reply.get("schemaVersion") is not None:
+        try:
+            schema = int(reply["schemaVersion"])
+        except (TypeError, ValueError):
+            return f"{PROTOCOL_REFUSAL} (unreadable schemaVersion {reply['schemaVersion']!r})"
+        if schema not in SUPPORTED_SCHEMAS:
+            return f"{PROTOCOL_REFUSAL} (index schema {schema})"
+    return ""
 
 
 class IntegrityError(SyncError):
@@ -159,6 +199,9 @@ class RootInfo:
             generation = int(raw.get("generation", 0))
         except (TypeError, ValueError) as err:
             raise SyncError(f"invalid generation {raw.get('generation')!r}") from err
+        refusal = protocol_refusal(raw)
+        if refusal:
+            raise UnsupportedProtocolError(refusal)
         jobs = raw.get("maxNetworkJobs")
         return cls(
             hash=root_hash,
@@ -744,6 +787,11 @@ class SyncClient:
         return self._request("GET", path, headers=headers)
 
     def fetch_root(self) -> RootInfo:
+        resolver = getattr(self.auth, "resolver", None)
+        discovered = getattr(resolver, "_discovered", None)
+        refusal = protocol_refusal(discovered) if discovered else ""
+        if refusal:
+            raise UnsupportedProtocolError(refusal)
         for path in (ROOT_V4_PATH, ROOT_V3_PATH):
             resp = self._get(path)
             if resp.status == 200:
@@ -1160,6 +1208,9 @@ class SyncClient:
             node = tree.get(doc_id)
             if not isinstance(node, Document) or tree.is_trashed(doc_id):
                 raise SyncError("the document to copy is no longer in the library")
+            if node.content.unsupported:
+                raise SyncError(f"the document to copy has formatVersion {node.content.format_version}, "
+                                "newer than this client reads")
             entries = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
             try:
                 staged = self.staged_files(node, cached_only=False) if self.edits.of(doc_id) and not clean else {}
@@ -1266,6 +1317,10 @@ class SyncClient:
         files = {e.id: e for e in self.get_index(node.hash, f"{node.id}.docSchema").entries}
         content_name, metadata_name = f"{node.id}.content", f"{node.id}.metadata"
         content = json.loads(self.get_blob(files[content_name].hash, content_name)) if content_name in files else {}
+        try:
+            check_format(content, f"{node.id}")
+        except UnsupportedFormatError as err:
+            raise SyncError(str(err)) from err
         now = int(ms_timestamp(self._clock()))
         if not change(content, now):
             return None

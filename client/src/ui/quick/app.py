@@ -40,6 +40,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
 from core.auth import AuthError, AuthNetworkError
+from core.sync import UnsupportedProtocolError
 from core.models import DocumentTree
 
 from ..library import LibrarySource
@@ -59,6 +60,7 @@ from .bridge.platform import (LOGIN_RESULTS, ArkIconProvider, ArkTokensSettings,
                               login_result)
 from .bridge.scene import Recognizer, set_clipboard, set_edit_notifier, set_page_source
 from .bridge.screenshare import ScreenShareClient
+from .shortcuts import install_redo_shortcut
 
 log = logging.getLogger("rm.ui.quick")
 MAIN_URL = QUrl("qrc:/qml/main.qml")
@@ -342,6 +344,8 @@ class QuickApp:
         self.singletons.document_sync.set_status(
             sync_failure_status(self.syncer.last_error) if status is None else status, message)
         log.warning("sync failed: %s", message)
+        if isinstance(self.syncer.last_error, UnsupportedProtocolError):
+            self.library.errorMessage.emit(str(self.syncer.last_error))     # said, not only logged
         self._run_waiting_check()
 
     def _sync_for_check(self) -> None:
@@ -410,6 +414,7 @@ class QuickApp:
         if not engine.rootObjects():
             raise RuntimeError(f"{self.main.toString()} failed to load:\n" + "\n".join(self.warnings))
         install_settings_cell(engine, self.window, self.outgoing)
+        install_redo_shortcut(engine, self.window)     # Ctrl+Y redoes, as on Windows
         return engine
 
     def _translate(self, code: str) -> None:

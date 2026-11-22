@@ -205,7 +205,7 @@ class DocumentPages:
         self.pdf_path: Path | None = source.pdf_path(doc)
         self.pdf = PdfFile(self.pdf_path) if self.pdf_path else None
         pagedata = None
-        if any(not p.template for p in doc.content.pages if not p.deleted):
+        if doc.content.format_version != 2 and any(not p.template for p in doc.content.pages if not p.deleted):
             try:
                 pagedata = source.pagedata(doc)
             except SyncError as err:          # e.g. offline and not cached: plain paper

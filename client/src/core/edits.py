@@ -88,7 +88,7 @@ from viewer import rm_text
 from viewer.rm_parser import ParagraphStyle, RmParseError
 
 from .config import atomic_write_json, ensure_private_dir, read_json
-from .models import Document, json_bytes
+from .models import Document, check_format, json_bytes
 from .pagemap import PageMap, PageMapError, is_legacy, upgrade
 
 log = logging.getLogger("rm.edits")
@@ -2108,6 +2108,7 @@ def current_content(doc: Document, read: Callable[[str], bytes], author: bytes) 
     content = json.loads(read(f"{doc.id}.content"))
     if not isinstance(content, dict):
         raise ValueError("the .content is not a JSON object")
+    check_format(content, "the document")       # never rewrite a newer format (3.29 refuses too)
     if not is_legacy(content):
         return content
     name, templates = f"{doc.id}.pagedata", None
@@ -2358,7 +2359,11 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
     None); empty when nothing is left to do. `read(name)` gives a file `doc` has,
     `image(edit)` an inserted image's file, `files(sha256)` a kept file of an imported
     page. EditError if an edit no longer fits: its page was removed, or cannot be
-    edited safely."""
+    edited safely, or the document's format is newer than this client reads (as 3.29,
+    which refuses every change to such a document)."""
+    if doc.content.unsupported:
+        raise EditError(f"the document has formatVersion {doc.content.format_version}, newer than this "
+                        "client reads: update reMarkable to edit it")
     staged = Staged(doc, edits, read, author, files)
     missing = staged.missing()
     if missing:

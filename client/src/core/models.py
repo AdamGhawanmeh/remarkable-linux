@@ -24,13 +24,70 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any, Iterator
 
 log = logging.getLogger("rm.models")
 
 ROOT_ID = ""
 TRASH_ID = "trash"
+
+# The newest .content formatVersion reMarkable.exe 3.29 reads (0x1406cf2c0 returns 2). A
+# document with a newer one fails to load (loadErrorType UnsupportedFormatVersion,
+# 0x1406611a0) and none of its pages may be changed ("Cannot add page, unable to ensure
+# correct format version", 0x140667af0): this client refuses it the same way.
+MAX_FORMAT_VERSION = 2
+
+
+class LoadErrorType(IntEnum):
+    """DocumentIO.LoadErrorType (moc metadata): why a document cannot be opened."""
+    NONE = 0
+    LEGACY_LINES_CONVERSION_FAILED = 1
+    UNSUPPORTED_FORMAT_VERSION = 2
+    MISSING_PDF = 3
+    CLOUD_ARCHIVE = 4
+    POTENTIALLY_UNSTABLE = 5
+    UNSPECIFIED = 15
+
+
+# Document::loadErrorDescription (0x140661af0), per type; anything else is the last.
+LOAD_ERROR_TEXT = {
+    LoadErrorType.LEGACY_LINES_CONVERSION_FAILED: "Unable to view document. File format is outdated.",
+    LoadErrorType.UNSUPPORTED_FORMAT_VERSION: "There's a mismatch in format versions. Try updating your software.",
+    LoadErrorType.MISSING_PDF: "Your PDF file seems to be missing. Try importing it again.",
+    LoadErrorType.CLOUD_ARCHIVE: "Document is archived.",
+}
+LOAD_ERROR_OTHER_TEXT = "Something seems to be wrong. Please try to restart."
+
+
+def load_error_text(kind: int) -> str:
+    return LOAD_ERROR_TEXT.get(kind, LOAD_ERROR_OTHER_TEXT) if kind else ""
+
+
+def format_version_of(raw: dict) -> int:
+    """A .content's formatVersion as 3.29 reads it (0x1406cefc0): QJsonValue::toInt(0)
+    of the key when present (an integral number; anything else reads 0), at least 1;
+    1 when the key is missing."""
+    if "formatVersion" not in raw:
+        return 1
+    value = raw.get("formatVersion")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+        return 1
+    return max(int(value), 1)
+
+
+class UnsupportedFormatError(ValueError):
+    """A document whose format is newer than this client (and 3.29) understands."""
+
+
+def check_format(content: dict, what: str = "the document") -> None:
+    """UnsupportedFormatError when `content` (a .content) has a formatVersion newer than
+    MAX_FORMAT_VERSION: nothing of such a document may be written."""
+    version = format_version_of(content)
+    if version > MAX_FORMAT_VERSION:
+        raise UnsupportedFormatError(f"{what} has formatVersion {version}, newer than this client reads "
+                                     f"({MAX_FORMAT_VERSION}): {LOAD_ERROR_TEXT[LoadErrorType.UNSUPPORTED_FORMAT_VERSION]}")
+
 
 DOCUMENT_TYPE = "DocumentType"
 COLLECTION_TYPE = "CollectionType"
@@ -229,13 +286,14 @@ class Content:
     @classmethod
     def parse(cls, data: bytes | str | dict | None) -> "Content":
         raw = _load(data)
-        fmt = int(raw.get("formatVersion") or 1)
+        fmt = format_version_of(raw)
         pages: list[Page] = []
         c_pages = raw.get("cPages")
         if isinstance(c_pages, dict) and isinstance(c_pages.get("pages"), list):
-            # formatVersion 2: CRDT page list ordered by idx.value.
-            entries = sorted(c_pages["pages"],
-                             key=lambda p: str((p.get("idx") or {}).get("value", "")))
+            # formatVersion 2: CRDT page list ordered by idx.value, then page id, as
+            # core.pagemap.PageMap orders it (two devices can give pages one key).
+            entries = sorted((p for p in c_pages["pages"] if isinstance(p, dict)),
+                             key=lambda p: (str((p.get("idx") or {}).get("value", "")), str(p.get("id", ""))))
             for p in entries:
                 redir = (p.get("redir") or {}).get("value")
                 pages.append(Page(
@@ -265,10 +323,19 @@ class Content:
         for tag in raw.get("tags") or []:
             tags.append(tag.get("name", "") if isinstance(tag, dict) else str(tag))
         live = [p for p in pages if not p.deleted]
+        if fmt == 2 and isinstance(c_pages, dict):
+            # reMarkable.exe 3.29's loader (0x1406669f0) counts a formatVersion 2
+            # document's pages from its page list (Document+0x24c = the pages vector's
+            # size); the stored pageCount is a cached number that can be stale.
+            page_count = len(live)
+        else:
+            # formatVersion 1: the stored pageCount when it is at least 1 (the app
+            # grows the page list to it), else the page list.
+            page_count = _int(raw.get("pageCount")) if _int(raw.get("pageCount")) >= 1 else len(live)
         return cls(
             file_type=FileType.parse(raw.get("fileType")),
             format_version=fmt,
-            page_count=int(raw.get("pageCount") or len(live)),
+            page_count=page_count,
             pages=pages,
             orientation=str(raw.get("orientation", "")),
             tags=[t for t in tags if t],
@@ -277,6 +344,11 @@ class Content:
             size_in_bytes=int(raw.get("sizeInBytes") or 0),
             raw=raw,
         )
+
+    @property
+    def unsupported(self) -> bool:
+        """Newer than MAX_FORMAT_VERSION: the document cannot be opened or changed."""
+        return self.format_version > MAX_FORMAT_VERSION
 
     @property
     def page_ids(self) -> list[str]:
