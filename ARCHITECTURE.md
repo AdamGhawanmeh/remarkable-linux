@@ -3271,6 +3271,9 @@ scroll range is set from it on load, and whenever the QML sets the note bounds i
 extra room `onAreaSelected` adds above and below for a selection at the page's ends, top
 < 0 and the same width, is kept). `sceneExteriorBoundary` is the exterior boundary.
 
+A note page's `SceneView` bounds are `PageContent.bounds("exact")`: the paper united with what lies
+past it, no margin, like 3.29's scene rect (5.18).
+
 **Deliberate differences from 3.29** (asked for): the white card is `page_card()`, the
 exterior boundary's width with the page's own height (paper, or ink and text below it):
 DocumentView's ShadowOverlay `bounds` are re-set to it after the official QML sets them
@@ -3286,6 +3289,47 @@ the note bounds), as on 3.29. Initial zoom is unchanged (DocumentView.viewportSc
 the paper height); fit-to-width now fits the paper, as the scroll range is its width.
 `SceneView._card` is the rendered card, what `paint` shows; `SceneView._image` stays the
 paper's own part of it. PDF pages, thumbnails and exports still show the paper only.
+
+### 5.18 Images dropped on a page: where, at what size, and the page width they give
+
+**Where.** DocumentViewport's image DropArea is `enabled: actions.canEditDocuments &&
+notePage && !!sceneController && !!tileManager` (keys `text/uri-list`; .png, .jpg,
+.jpeg; at most 25 files, the first centred on the drop point, the rest cascaded 40 px).
+`notePage` is `Document::isNotepage(currentPage)` (0x1406609e0): every page of a notebook
+(fileType 1), and a page of a PDF or EPUB only when it has no PDF page behind it
+(redir -1: a page inserted into it). So 3.29 takes dropped files on notebook pages and
+on pages inserted into a PDF or EPUB, never on a PDF or EPUB page itself; with a
+document open nothing else accepts a file (DocumentDropOverlay, the import overlay, is
+the library grid's), so a file dragged onto a PDF page is ignored. A picture pasted from
+another program (pasteClipboardData -> pasteClipboardContentAsFloatingSceneImage) is
+gated the same way (`Clipboard.hasText && notePage`). Items copied in the app,
+images included, can be pasted on any page (`... || Clipboard.hasItems`): images on
+PDF and EPUB pages are fine, only files cannot be dropped there. The C++ slot
+(insertImageFileAsSceneItem 0x140442280) checks nothing of this itself. The client runs
+the same QML, so it behaves the same; tests/test_image_drop_offline.py pins it.
+
+**Size.** The slot reads the file with QImageReader and autoTransform (EXIF turns),
+and the document worker runs 0x14042ccd0 -> 0x1404377b0 -> createPersistedSceneImageItem
+(0x14043c3c0): the item is the stored picture's own size, one scene unit a pixel,
+QRectF(-w/2, -h/2, w, h), added and selected centred on the drop point (addAndSelect
+0x1409af310). The stored picture is only shrunk to fit 3200 x 3200 (0x140a4e5e0,
+QSize(0xc80, 0xc80)) and kept under 3 MiB; nothing fits it to the page. So a 1920 px
+screenshot is 1920 units wide on a 1404-wide page, in 3.29 as here (`editing.FIT_TO_PAGE`
+stays False). The page file's paper size (SceneInfo) does not change.
+
+**Page width.** The scene rect (Scene +0x2c0, 0x1408ab350) is the union of the items'
+own rects, with no margin, and the exterior boundary (5.17) is built from it: an image
+inside the paper leaves the page 1404 wide; one past the paper's side widens it to the
+note bounds (±936), or to its own edge when it reaches further (a 1920-wide picture:
+±960); moved back inside, the page is 1404 wide again. The client's view used the
+rendering bounds, which add a margin of 20 wherever something reaches past the paper, so
+an overhanging picture gave ±980 instead of ±960 (strokes, pages with ink and PDF pages
+the same 20 units). A note page's view now uses `PageContent.bounds("exact")`: the frame
+united with what lies past it, no margin (images by their corners, text by its lines,
+strokes by their points; padding strokes by their pen width would widen 554 of 4,242
+real notebook pages where ink touches the edge, and 3.29's line items' rects were not
+traced, so strokes are measured as before). On every cached notebook page the pages
+widened are the same 164 as before. Exports and PDF pages keep the margin.
 
 ## 6. Implications for the Linux client
 

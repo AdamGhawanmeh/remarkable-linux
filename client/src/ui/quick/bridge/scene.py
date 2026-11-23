@@ -1939,7 +1939,10 @@ class _SceneView:
                 index = ids.index(page_id) if page_id in ids else 0
                 content = pages.content(index)
                 frame = content.frame()
-                bounds = QRectF(*content.bounds("page"))
+                # A note page's bounds are exactly what is on it (3.29's scene rect: the
+                # page's items, no margin), so an image or stroke inside the paper never
+                # widens it, and one past its edge widens it by what really overhangs.
+                bounds = QRectF(*content.bounds("page" if content.has_pdf_page else "exact"))
                 links = []
                 if content.has_pdf_page:
                     page_of_pdf = {p.pdf_page: i for i, p in enumerate(pages.pages) if p.pdf_page is not None}

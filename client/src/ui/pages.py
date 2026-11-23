@@ -143,15 +143,22 @@ class PageContent:
         return QRectF(0, 0, width, height)
 
     def bounds(self, crop: str) -> tuple[float, float, float, float]:
-        """"clip": the page frame; "page": the frame plus any ink/text beyond it."""
+        """"clip": the page frame; "page": the frame plus any ink/text beyond it, with a
+        margin of 20 (exports, PDF pages); "exact": the frame united with what lies
+        beyond it with no margin, as 3.29's scene rect is (0x1408ab350, the union of its
+        items' rects): images by their corners, text by its lines, strokes by their
+        points (not padded by pen width: on 554 of 4,242 real notebook pages ink touches
+        the edge that way). The viewer's note pages use it (ARCHITECTURE.md 5.17)."""
         frame = self.frame()
-        if crop == "page" and self.scene is not None:
+        if crop in ("page", "exact") and self.scene is not None:
             # A PDF page is its frame, not the notebook paper: grown only where ink lies
             # beyond it (a slide stays 16:9 once drawn on).
             paper = (frame.x(), frame.y(), frame.width(), frame.height()) \
                 if self.has_pdf_page or self.is_landscape else None
-            frame = QRectF(*render_bounds(self.scene, "page", measure=qt_measure, paper=paper))
-        elif crop != "clip" and crop != "page":
+            exact = crop == "exact"
+            frame = QRectF(*render_bounds(self.scene, "page", margin=0.0 if exact else 20.0, measure=qt_measure,
+                                          paper=paper))
+        elif crop not in ("clip", "page", "exact"):
             raise ValueError(f"unknown crop mode {crop!r}")
         return frame.x(), frame.y(), frame.width(), frame.height()
 
