@@ -245,7 +245,7 @@ BULLETS = ("•", "◦", "-")                 # by level (static QStrings 0x1412
 BULLET_X = 20.0                           # glyph left: block x + level x 48 + 20
 NUMBER_RIGHT = 30.0                       # number + "." ends at block x + level x 48 + 30
 CHECKBOX_SIZE, CHECKBOX_RAISE = 40.0, 2.0  # its SVG drawn in (block x + level x 48, top - 2, 40, 40)
-CHECKBOX_MARKERS = ("☐", "☑")
+CHECKBOX_MARKERS = ("☐", "☑", "▣")       # unchecked, checked, indeterminate (state 2) [I: the glyph]
 
 _LIST_KINDS = {
     ParagraphStyle.BULLETPOINT: ("bullet", 0), ParagraphStyle.BULLETPOINT_INDENTED: ("bullet", 1),
@@ -266,21 +266,62 @@ def paragraph_font(style: ParagraphStyle) -> TextFont:
                     strike=_LIST_KINDS.get(style, ("", 0))[0] == "checked")
 
 
-def _list_level(style: ParagraphStyle) -> int | None:
-    kind = _LIST_KINDS.get(style)
-    return None if kind is None else kind[1]
+def _list_level(para) -> int | None:
+    """A list paragraph's indent level (the style says 0 or "indented"; the paragraph
+    carries the stored level 0..2), None for any other paragraph."""
+    kind = _LIST_KINDS.get(para.style)
+    return None if kind is None else max(kind[1], para.indent)
+
+
+def _roman(number: int) -> str:
+    """Roman numerals, lower case (0x140941a10) [I: the standard subtractive form]."""
+    out = ""
+    for value, digits in ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+                          (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while number >= value:
+            out += digits
+            number -= value
+    return out
 
 
 def _number_label(number: int, level: int) -> str:
-    """The numbered list's label by level (0x14093c49e): decimal, then lower-case
-    letters (A..Z, base 26, lowered); a third level would be roman (not reachable)."""
+    """The numbered list's label by level mod 3 (0x14093c49e): decimal, lower-case
+    letters (A..Z, base 26, lowered), roman (0x140941a10), each followed by a dot."""
     if level % 3 == 1:
         out, n = "", number
         while n > 0:
             n, r = divmod(n - 1, 26)
             out = chr(0x61 + r) + out
         return out + "."
+    if level % 3 == 2:
+        return _roman(number) + "."
     return f"{number}."
+
+
+def list_numbers(paragraphs) -> list[int]:
+    """The QTextBlock::userState of every paragraph (0x140943ca0, in order): -1 for one
+    that is not a numbered list; for a numbered one, walk back over the previous
+    paragraphs: one that is not numbered stops the walk (n = 0), one at the same level
+    gives n = its number, a shallower one stops (n = 0), a deeper one is skipped. Its
+    number is n + 1, or 1 when that reaches 1000."""
+    states: list[int] = []
+    levels: list[int] = []
+    for para in paragraphs:
+        kind = _LIST_KINDS.get(para.style)
+        level = _list_level(para) or 0
+        levels.append(level)
+        if kind is None or kind[0] != "number":
+            states.append(-1)
+            continue
+        n = 0
+        for j in range(len(states) - 1, -1, -1):
+            if states[j] < 0 or levels[j] < level:
+                break
+            if levels[j] == level:
+                n = states[j]
+                break
+        states.append(1 if n + 1 >= 1000 else n + 1)
+    return states
 
 
 @dataclass(frozen=True)
@@ -437,7 +478,7 @@ def _estimated_blocks(block: TextBlock, left: float, measure: Measure) -> list[_
         gap = (_fixed(bs.line_distance * height) if bs.line_distance is not None else bs.fixed_distance)
         if index:
             y += bs.top
-        level = _list_level(para.style)
+        level = _list_level(para)
         indent = INDENT * (level + 1) if level is not None else 0.0
         x0, max_w = left + DOCUMENT_MARGIN + indent, max(width - indent, own.size)
         spans = _spans(para, base)
@@ -528,7 +569,7 @@ def _qt_blocks(block: TextBlock, left: float) -> list[_Block]:
             fmt.setLineHeight(bs.line_distance * qt_metrics(own)[1], 4)       # LineDistanceHeight
         elif bs.fixed_distance:
             fmt.setLineHeight(bs.fixed_distance, 4)
-        level = _list_level(para.style)
+        level = _list_level(para)
         if level is not None:
             fmt.setProperty(QTextFormat.Property.BlockIndent, level + 1)
         chars = QTextCharFormat()
@@ -572,30 +613,24 @@ def _with_markers(block: TextBlock, blocks: list[_Block], metrics, measure: Meas
     paint places it (0x14093bb80): from the block's rectangle (x, y), level x 48 in."""
     from dataclasses import replace
     out: list[TextLine] = []
-    numbers = [0, 0]
+    numbers = list_numbers(block.paragraphs)
     for index, (para, laid) in enumerate(zip(block.paragraphs, blocks)):
         kind = _LIST_KINDS.get(para.style)
-        # userState (the number) is not traced; counted per level over consecutive items.
-        if kind is None or kind[0] != "number":
-            numbers = [0, 0]
-        elif kind[1] == 0:
-            numbers = [numbers[0] + 1, 0]
-        else:
-            numbers[1] += 1
         lines = laid.lines
         if kind is not None and lines:
-            what, level = kind
+            what, level = kind[0], _list_level(para)
             font = paragraph_font(para.style)
             indent = level * INDENT
             _, _, int_ascent = metrics(font)
             if what == "bullet":
-                marker = BULLETS[level]
+                marker = BULLETS[min(level, len(BULLETS) - 1)]
                 at = (laid.x + indent + BULLET_X, laid.y + int_ascent)
             elif what == "number":
-                marker = _number_label(numbers[level], level)
+                marker = _number_label(numbers[index], level)
                 at = (laid.x + indent + NUMBER_RIGHT - _ink_width(marker, font, measure), laid.y + int_ascent)
             else:
-                marker = CHECKBOX_MARKERS[what == "checked"]
+                # state 2 (indeterminate, 0x1408b5ef0) is drawn as its own box, no strike-out
+                marker = CHECKBOX_MARKERS[1 if what == "checked" else 2 if para.state == 2 else 0]
                 at = (laid.x + indent, laid.y - CHECKBOX_RAISE, CHECKBOX_SIZE, CHECKBOX_SIZE)
             lines = [replace(lines[0], marker=marker, marker_font=replace(font, strike=False), marker_at=at)] + lines[1:]
         out.extend(lines)
@@ -731,9 +766,11 @@ def stroke_offsets(scene: PageScene, lines: list[TextLine],
     which 3.29 adds to every stored point (ARCHITECTURE.md 5.1): x = the stored
     anchorOriginX (type 2; type 1 follows its character sideways, x of the character),
     y = the baseline of the visual line holding the anchor character (a sentinel takes
-    the first or the last character). An id the text does not hold keeps the text's
-    top, and a page without text puts the group at y 0 (neither is traced)."""
-    text = scene.text
+    the first or the last character). An id the text does not hold (not even as a
+    deleted character), or a page without text, leaves the group out of 3.29's manager:
+    its strokes are drawn at their stored coordinates, offset (0, 0) (0x14097c4f0; the
+    zero is [I]: the node's +0x1f0 starts at 0). A type 2 anchor whose originX timestamp
+    is 0:0 takes the computed x of the character (Anchor.origin_set)."""
     offsets: dict[int, tuple[float, float]] = {}
     found: dict[tuple, tuple[float, float] | None] = {}
     for stroke in scene.strokes:
@@ -744,11 +781,11 @@ def stroke_offsets(scene: PageScene, lines: list[TextLine],
             found[a.char_id] = anchor_point(scene, lines, a.char_id, measure)
         point = found[a.char_id]
         if point is None:
-            offsets[id(stroke)] = (a.origin_x, text.y if text is not None else 0.0)
+            offsets[id(stroke)] = (0.0, 0.0)
         elif a.type == 1:
             offsets[id(stroke)] = point
         else:
-            offsets[id(stroke)] = (a.origin_x, point[1])
+            offsets[id(stroke)] = (a.origin_x if a.origin_set else point[0], point[1])
     return offsets
 
 
@@ -891,11 +928,19 @@ def _svg_font(font: TextFont) -> str:
 
 # The checkbox when the app's own image (":/images/checkbox_*.svg", 48 x 48 drawn into
 # the 40 x 40 box) is not to hand: its square, 8..40 of 48, and a tick when checked.
-def _checkbox_shapes(box, checked: bool):
+def _checkbox_shapes(box, checked: bool, indeterminate: bool = False):
+    """(square, mark points, stroke width); the mark is a tick when checked and a
+    horizontal bar through the middle when indeterminate [I: the resource's shape is
+    only the fallback here]."""
     x, y, w, h = box
     k = w / 48.0
     square = (x + 8 * k, y + 8 * k, 32 * k, 32 * k)
-    tick = ((x + 15 * k, y + 24.5 * k), (x + 21 * k, y + 30.5 * k), (x + 33 * k, y + 18.5 * k)) if checked else ()
+    if checked:
+        tick = ((x + 15 * k, y + 24.5 * k), (x + 21 * k, y + 30.5 * k), (x + 33 * k, y + 18.5 * k))
+    elif indeterminate:
+        tick = ((x + 15 * k, y + 24 * k), (x + 33 * k, y + 24 * k))
+    else:
+        tick = ()
     return square, tick, 2.5 * k
 
 
@@ -1043,7 +1088,8 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
         out.append(f'<g id="text" fill="{TEXT_COLOR}">')
         for line in lines:
             if line.marker in CHECKBOX_MARKERS and len(line.marker_at) == 4:
-                (sx, sy, sw, sh), tick, width = _checkbox_shapes(line.marker_at, line.marker == CHECKBOX_MARKERS[1])
+                (sx, sy, sw, sh), tick, width = _checkbox_shapes(line.marker_at, line.marker == CHECKBOX_MARKERS[1],
+                                                                 line.marker == CHECKBOX_MARKERS[2])
                 out.append(f'<rect x="{sx:.2f}" y="{sy:.2f}" width="{sw:.2f}" height="{sh:.2f}" fill="none" '
                            f'stroke="{TEXT_COLOR}" stroke-width="{width:g}"/>')
                 if tick:
@@ -1213,7 +1259,8 @@ def _paint_text(painter, scene: PageScene, lines: list, include_hidden: bool) ->
     for line in lines:
         drawn += 1
         if line.marker in CHECKBOX_MARKERS and len(line.marker_at) == 4:
-            _paint_checkbox(painter, line.marker_at, line.marker == CHECKBOX_MARKERS[1])
+            _paint_checkbox(painter, line.marker_at, line.marker == CHECKBOX_MARKERS[1],
+                            line.marker == CHECKBOX_MARKERS[2])
         elif line.marker and line.marker_font and len(line.marker_at) == 2:
             painter.setFont(_qfont(line.marker_font))
             painter.drawText(QPointF(*line.marker_at), line.marker)
@@ -1225,13 +1272,14 @@ def _paint_text(painter, scene: PageScene, lines: list, include_hidden: bool) ->
     return drawn
 
 
-def _paint_checkbox(painter, box, checked: bool) -> None:
-    """The app's checkbox image (":/images/checkbox_checked.svg" / "unchecked", when the
-    app's resources are registered) in its box, else _checkbox_shapes."""
+def _paint_checkbox(painter, box, checked: bool, indeterminate: bool = False) -> None:
+    """The app's checkbox image (":/images/checkbox_checked.svg" / "unchecked" /
+    "indeterminate", when the app's resources are registered) in its box, else
+    _checkbox_shapes."""
     from PySide6.QtCore import QPointF, QRectF, Qt
     from PySide6.QtGui import QColor, QPen, QPolygonF
     from PySide6.QtCore import QFile
-    path = f":/images/checkbox_{'checked' if checked else 'unchecked'}.svg"
+    path = f":/images/checkbox_{'checked' if checked else 'indeterminate' if indeterminate else 'unchecked'}.svg"
     svg = None
     if QFile.exists(path):
         try:
@@ -1242,7 +1290,7 @@ def _paint_checkbox(painter, box, checked: bool) -> None:
     if svg is not None and svg.isValid():
         svg.render(painter, QRectF(*box))
         return
-    (sx, sy, sw, sh), tick, width = _checkbox_shapes(box, checked)
+    (sx, sy, sw, sh), tick, width = _checkbox_shapes(box, checked, indeterminate)
     painter.save()
     painter.setPen(QPen(QColor(TEXT_COLOR), width))
     painter.setBrush(Qt.BrushStyle.NoBrush)

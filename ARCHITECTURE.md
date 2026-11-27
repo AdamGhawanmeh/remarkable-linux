@@ -1004,8 +1004,17 @@ as `sceneKeyActionReceived` and handed back to `SceneController::keyAction`. Ctr
 Subheading, Subheading2, Paragraph, Bullet, Numbered, Checkbox. Enter (`handleKeyEnter`
 0x14094f2d0): empty list item → un-indent (0x1408b5aa0), else new paragraph that copies the style
 when the old one is a list item (checkbox unchecked) or was split mid-way. Backspace
-(0x14094ea70) at a list item's start → body text. `* `/`+ `/`- ` at a paragraph start → bullet
-(0x14094d080). `cycleParagraphStyle` (0x14043ca20): a list button on the same list kind cycles
+(0x14094ea70) at a list item's start → body text. **Autoformat** (`handleKeyStroke`
+0x14094d080, read 2026-11-27): only a typed text of exactly one " "; the word before it is
+read back from the cursor to the previous " " or paragraph separator (0x1409444c0); it
+counts only when it starts the paragraph (0x140936980: start == block position). Then in
+order: matches `^[\*\+\-]$` (static regex 0x141259379) → bullet (style 3); equals "[]"
+(SceneKeyHandler+0x160, ctor 0x140948bf0) → checkbox, unchecked (style 5 = legacy 6,
+0x1408b57f0); equals "1." (+0x178) → numbered list (style 9 = legacy 10, 0x1408b6100). A
+paragraph that is already a list (0x1408b5e30) is left as it is, the word kept. The
+conversion (0x140949960) is one SceneMacroAction: delete the word and the space
+(length + 1 at the word's start), then set the paragraph style. Link autoformat follows
+but is gated by a flag (0x141259258) nothing sets: off in 3.29. `cycleParagraphStyle` (0x14043ca20): a list button on the same list kind cycles
 indent 0..2 (0x1408b5870), anything else sets. Indented lists are written with
 base_style/style_properties (0x140a92b30). The cursor is drawn by the view, not QML
 (`CursorBlinkManager` only toggles `setCursorVisible`). Undo of text: remove by id, put back with
@@ -1394,12 +1403,19 @@ position as a QPointF (never stored).
   text+0x678 / 0x688; 0x698 indeterminate) rendered into (x, y − 2, 40, 40), chosen as:
   checked when 0x1408b5d20 holds (state 1 or 3), else 0x678 + 0x20 × (state == 2,
   0x1408b5ef0), i.e. indeterminate for state 2 and unchecked otherwise. Which renderer
-  loads which SVG is [I: the three resource strings 0x140d6a190 / 1d0 / 210 lie in the
-  order unchecked, checked, indeterminate]; the client draws state 2 as unchecked. A number is
+  loads which SVG [O: the three resource strings 0x140d6a190 / 1d0 / 210 lie in the
+  order unchecked, checked, indeterminate; the text ctor 0x1409247b0 loads 0x678 from
+  QString 0x1412592c0, 0x688 from 0x141259260 and 0x698 from 0x141259278, which the static
+  initializer 0x14002ac70 makes ":/images/checkbox_indeterminate.svg"]. State 2 draws the
+  indeterminate box, without strike-out. A number is
   QTextBlock::userState formatted by level mod 3 (decimal, letters A–Z base 26, roman
   0x140941a10), lower-cased, + ".", right-aligned so it ends at +30 (its integer
-  boundingRect width). How userState is numbered is not traced [I: consecutive items per
-  level].
+  boundingRect width). **Numbering** (userState, 0x140943ca0, every block in order): a block
+  that is not a numbered list gets −1; a numbered one walks back over the previous blocks:
+  a block that is not a numbered list stops the walk (n = 0); one at the same indent level
+  gives n = its number; one at a shallower level stops (n = 0); a deeper one is skipped.
+  Its number is n + 1, or 1 when n + 1 reaches 1000. So bullets, checkboxes or text
+  between numbered items restart the count, and a deeper sub-list does not.
 - **The client** (`viewer.renderer`, H1 of the 2026-11-27 audit, fixed): `layout_text(scene,
   qt_measure)` builds this QTextDocument (`_qt_blocks`: margin 4, indent 48, tab stop 48,
   the formats above, PreferNoHinting fonts via `_qfont`) and reads every QTextLine back
@@ -1416,8 +1432,14 @@ position as a QPointF (never stored).
   groups all take their anchor positions from it. Checked on the cached library: on a
   page holding both kinds the sentinel-anchored ink now ends at 1869.6 and the layer ink
   at 1871.2; on empty Title boxes the sentinel-anchored ink starts at y 5.98 / 6.13.
-  Not traced: what 3.29 does with an anchor id the text does not hold beyond the warning
-  (kept at the text box's top here).
+  **An anchor id the text does not hold** (0x14097c4f0, from the manager's rebuild
+  0x14097ae70): "anchor=… for group=… is not present in text..." and the group is left out
+  of the manager, so its position is never set and its strokes are drawn at their stored
+  coordinates (offset (0, 0) [I: the node's +0x1f0 starts at 0]). An id the text holds but
+  has deleted still resolves (its index, 0x140972cf0). A Vertical anchor whose originX
+  timestamp is 0:0 ("vertial anchor without initial offset") gets originX = the computed x,
+  stamped with the next clock id. The client draws such a group at (0, 0), and also an
+  anchored group on a page with no text [I: no real page has one].
 - **Where a new stroke goes** [O, read 2026-11-27: 0x14096ca70, 0x140971e20, 0x140977bf0,
   0x140974950, 0x1409741d0, 0x140a58a30, 0x140a58e00, 0x140a57d70, 0x140a5a1a0, 0x140a5a550,
   0x140a5a6a0, 0x140a5a370, 0x140a59b90, 0x140b3e5f0]. On a page with typed text every
@@ -2923,6 +2945,22 @@ password protection" encrypts the exported PDF with it (pypdf, AES-256) [I: the 
 encryption scheme is not traced].
 
 ### 5.11 PDF/EPUB text highlights erased; typed text on PDF/EPUB documents
+
+**`{doc}.highlights/{page}.json`** [O, 0x1405a8760, called on every page store; read
+2026-11-27]: rebuilt from the scene each time. For each layer, in the scene's layer order,
+an array of the layer's own glyph-range items (0x1408c7e50 with filter 1: direct children,
+in sequence order), each `{"color": int (+0x60), "length": int (+0x5c), "rects": [{"height",
+"width", "x", "y"} per rectangle, doubles], "start": int (+0x58), "text": string (+0x68)}`;
+the document is `{"highlights": [ layer arrays ]}`, an empty layer an empty array. When at
+least one glyph range exists anywhere it is written with `QJsonDocument::toJson(Indented)`
+(format 0: Qt's 4-space indentation, keys in Qt's sorted order, a trailing newline),
+creating the directory first ("Unable to create highlights directory: %s"); when none
+exists an existing file is removed ("Unable to remove obsolete highlights file: %s") and
+nothing is written. The client (`core.edits`, milestone parity/highlights-and-lists-m1-m2)
+does the same for each PDF/EPUB page it writes (`core.highlights`: `qt_json` follows Qt 6's
+writer [I: integral doubles without a decimal point, others the shortest repr, an empty
+array as "[", newline, "]", control characters as \u00XX]; pages it does not write keep
+their file as it is).
 
 **Text highlights (`CrdtGlyphItem`, block 0x03)** [O: reMarkable.exe 3.29; none of the
 6,110 cached v6 pages (4,281 blobs + 1,829 document files, 2026-11-21) has a 0x03 block,

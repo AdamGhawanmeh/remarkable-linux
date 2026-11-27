@@ -169,6 +169,9 @@ class Anchor:
     origin_x: float
     threshold: float = 0.0
     type: int = 0
+    # False when anchorOriginX's timestamp is 0:0 ("vertial anchor without initial
+    # offset", 0x14097c4f0): the position then takes the computed character x.
+    origin_set: bool = field(default=True, compare=False)
 
     @property
     def is_special(self) -> bool:
@@ -261,6 +264,18 @@ def checkbox_checked(base: int, properties: int) -> bool:
     """Whether a style is drawn (and struck out) as a checked checkbox (0x1408b5d20):
     a list, kind 1 (checkbox), state 1 or 3."""
     return base == STYLE_LIST and properties >> 4 & 0xF == 1 and properties >> 8 & 7 in (1, 3)
+
+
+def checkbox_state(base: int, properties: int) -> int:
+    """The state bits (8..10) of a checkbox style, 0 for any other style. ParagraphStyle
+    has no member for state 2 (indeterminate, 0x1408b5ef0), so the paragraph carries
+    it as Paragraph.state: 2 draws checkbox_indeterminate.svg, without strike-out."""
+    return properties >> 8 & 7 if base == STYLE_LIST and properties >> 4 & 0xF == 1 else 0
+
+
+def list_indent(base: int, properties: int) -> int:
+    """The indent level (0..2, the low nibble) of a list style, 0 for any other."""
+    return properties & 0xF if base == STYLE_LIST else 0
 
 
 def _style_from_legacy(legacy: int) -> tuple[int, int]:
@@ -402,6 +417,10 @@ class TextSpan:
 class Paragraph:
     style: ParagraphStyle
     spans: list[TextSpan] = field(default_factory=list)
+    # What `style` cannot say: a list's indent level (0..2; ParagraphStyle has only
+    # "indented") and a checkbox's state bits (2 is indeterminate). 0 when not stored.
+    indent: int = 0
+    state: int = 0
 
     @property
     def text(self) -> str:
@@ -822,9 +841,11 @@ def _decode_anchor(f: dict[int, _Field]) -> Anchor:
     kind = lww(8, TAG_BYTE1)
     threshold = lww(9, TAG_BYTE4)
     origin = lww(10, TAG_BYTE4)
+    stamp = _read_fields(f[10].raw).get(1) if 10 in f else None
     return Anchor(char_id=char_id, origin_x=origin.as_float32() if origin else 0.0,
                   threshold=threshold.as_float32() if threshold else 0.0,
-                  type=kind.as_int() if kind else 0)
+                  type=kind.as_int() if kind else 0,
+                  origin_set=stamp is not None and stamp.type == TAG_ID and stamp.raw != (0, 0))
 
 
 def _decode_line(value: bytes, block_version: int, item_id, left=None, right=None) -> Stroke:
@@ -1070,10 +1091,13 @@ def text_block(root: RootText, authors: dict[int, bytes] | None = None) -> TextB
         if known is None or _id_key(entry.timestamp) >= _id_key(known.timestamp):
             styles[entry.char_id] = entry
 
-    def style_of(start_id) -> ParagraphStyle:
-        return styles[start_id].style if start_id in styles else ParagraphStyle.PARAGRAPH
+    def style_of(start_id) -> Paragraph:
+        if start_id not in styles:
+            return Paragraph(ParagraphStyle.PARAGRAPH)
+        entry = styles[start_id]
+        return Paragraph(entry.style, indent=list_indent(*entry.base), state=checkbox_state(*entry.base))
 
-    paragraphs = [Paragraph(style_of(_NO_ID))]
+    paragraphs = [style_of(_NO_ID)]
     char_paragraph: dict[tuple[int, int], int] = {}
     depth = {"bold": 0, "italic": 0, "link": 0}
     markers = {FORMAT_BOLD_START: ("bold", 1), FORMAT_BOLD_END: ("bold", -1),
@@ -1094,7 +1118,7 @@ def text_block(root: RootText, authors: dict[int, bytes] | None = None) -> TextB
                 name, step = markers[c.fmt]
                 depth[name] += step
         elif c.char == "\n":
-            paragraphs.append(Paragraph(style_of(c.id)))
+            paragraphs.append(style_of(c.id))
         elif c.char is not None:
             spans, on = paragraphs[-1].spans, {name: n > 0 for name, n in depth.items()}
             if spans and (spans[-1].bold, spans[-1].italic, spans[-1].link) == tuple(on.values()):

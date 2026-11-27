@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from rmfixtures import (  # noqa: E402
-    ROOT, ZERO, block, encode_root_text, f_id, f_sub, f_u8, group_item, header, image_entries, image_item,
+    ROOT, ZERO, block, encode_root_text, f_f32, f_id, f_sub, f_u8, group_item, header, image_entries, image_item,
     image_value, images_table, line_item, paragraph_format, points_v1, points_v2, root_text, sample_text_block,
     scene_tree, text_item, tombstone, tree_node, v5_file, v6_file)
 
@@ -640,6 +640,17 @@ class AnchorTests(unittest.TestCase):
         data = v6_file(node, group_item(LAYER, (1, 2), GROUP),
                        line_item(GROUP, (1, 3), tool=17, color=0, points=points_v2([(0, 0, 0, 0, 1, 1)])))
         self.assertEqual(parse(data).strokes[0].anchor, Anchor((1, 7), origin_x=0.0))
+        self.assertFalse(parse(data).strokes[0].anchor.origin_set)       # no originX timestamp: 0:0
+
+    def test_an_origin_x_stamped_0_0_is_not_set(self):
+        stamped = lambda stamp: block(0x02, f_id(1, GROUP) + f_sub(7, f_id(1, (1, 1)) + f_id(2, (1, 7)))
+                                      + f_sub(10, f_id(1, stamp) + f_f32(2, 5.0)),
+                                      version=2)
+        for stamp, expected in (((0, 0), False), ((1, 1), True)):
+            data = v6_file(stamped(stamp), group_item(LAYER, (1, 2), GROUP),
+                           line_item(GROUP, (1, 3), tool=17, color=0, points=points_v2([(0, 0, 0, 0, 1, 1)])))
+            anchor = parse(data).strokes[0].anchor
+            self.assertEqual((anchor.origin_x, anchor.origin_set), (5.0, expected))
 
     def test_sentinel_anchor(self):
         self.assertTrue(Anchor((0, ANCHOR_SENTINEL_START), 0).is_special)
@@ -672,16 +683,41 @@ class AnchorTests(unittest.TestCase):
             nested = sc.layers[0].strokes[0]
             self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(nested)], (-464.0, y))
 
-    def test_unknown_anchor_sits_at_text_top(self):
+    def test_an_anchor_id_the_text_does_not_hold_draws_at_offset_zero(self):
+        # 0x14097c4f0: the group is left out of the manager, its strokes drawn as stored.
         sc = parse(anchored_page(anchor_char=(9, 9)))
         nested = sc.layers[0].strokes[0]
-        self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(nested)], (-464.0, 234.0))
+        self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(nested)], (0.0, 0.0))
 
-    def test_anchor_without_text_has_no_vertical_offset(self):
+    def test_a_deleted_character_anchor_still_resolves(self):
+        # (1, 7) is a character of the sample text; deleting it keeps its id in the sequence.
+        deleted = (1, 30)              # a run of two deleted characters after "Hello"
+        data = v6_file(
+            tree_node(ROOT), tree_node(LAYER, "Layer 1", True), tree_node(GROUP, "", True, anchor=(deleted, -464.0)),
+            group_item(ROOT, (1, 1), LAYER), group_item(LAYER, (1, 2), GROUP),
+            root_text([text_item((1, 1), ZERO, text="Title\nHello"), text_item(deleted, (1, 11), deleted=2)],
+                      [paragraph_format(ZERO, 1)]),
+            line_item(GROUP, (1, 10), tool=17, color=0, points=points_v2([(10, -5, 0, 0, 3, 255)])))
+        sc = parse(data)
+        lines = layout_text(sc)
+        self.assertEqual(stroke_offsets(sc, lines)[id(sc.strokes[0])],
+                         (-464.0, next(l.baseline for l in lines if l.paragraph == 1)))
+
+    def test_a_vertical_anchor_without_an_origin_stamp_takes_the_computed_x(self):
+        from dataclasses import replace
+        from viewer.renderer import anchor_point
+        sc = parse(anchored_page())
+        nested = sc.layers[0].strokes[0]
+        lines = layout_text(sc)
+        self.assertTrue(nested.anchor.origin_set)
+        nested.anchor = replace(nested.anchor, origin_set=False)
+        self.assertEqual(stroke_offsets(sc, lines)[id(nested)], anchor_point(sc, lines, (1, 7)))
+
+    def test_anchor_without_text_draws_at_offset_zero(self):
         data = v6_file(tree_node(GROUP, "", True, anchor=((1, 7), 100.0)), group_item(LAYER, (1, 2), GROUP),
                        line_item(GROUP, (1, 3), tool=17, color=0, points=points_v2([(0, 50, 0, 0, 1, 1)])))
         sc = parse(data)
-        self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(sc.strokes[0])], (100.0, 0.0))
+        self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(sc.strokes[0])], (0.0, 0.0))
 
     def test_bounds_include_offset_ink_and_text(self):
         many = "\n" * 40 + "bottom line"

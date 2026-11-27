@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 import struct
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import Callable, Sequence
 
@@ -377,11 +377,14 @@ class TextLayout:
 
     def group_position(self, anchor: "NodeAnchor") -> tuple[float, float]:
         """Where a group anchored so is drawn: type 2 at its stored originX, type 1 at the
-        character's x; an id the text does not hold keeps the text's top (renderer.stroke_offsets)."""
+        character's x; an id the text does not hold is drawn at offset (0, 0), and a type 2
+        originX stamped 0:0 takes the character's x (renderer.stroke_offsets, 0x14097c4f0)."""
         point = renderer.anchor_point(self.scene, self.lines, anchor.char_id, self.measure)
         if point is None:
-            return anchor.origin_x, self.block.y
-        return point if anchor.kind == BIDIRECTIONAL else (anchor.origin_x, point[1])
+            return 0.0, 0.0
+        if anchor.kind == BIDIRECTIONAL:
+            return point
+        return (anchor.origin_x if anchor.origin_set else point[0]), point[1]
 
     # -- over the text
 
@@ -490,6 +493,7 @@ class NodeAnchor:
     kind: int
     threshold: float
     origin_x: float
+    origin_set: bool = field(default=True, compare=False)    # originX's timestamp is not 0:0
 
     @property
     def valid(self) -> bool:
@@ -516,10 +520,12 @@ def read_anchors(blocks: list[w.Block]) -> dict[tuple[int, int], NodeAnchor]:
         char, kind, threshold, origin = value(7), value(8), value(9), value(10)
         if char is None or char[0] != w.TAG_ID:
             continue
+        stamp = ({j: (k, v) for j, k, v in w.read_values(subs[10])}.get(1)) if 10 in subs else None
         out[node] = NodeAnchor(
             char[1], int(kind[1]) if kind is not None and kind[0] == w.TAG_BYTE1 else 0,
             struct.unpack("<f", threshold[1])[0] if threshold is not None and threshold[0] == w.TAG_BYTE4 else 0.0,
-            struct.unpack("<f", origin[1])[0] if origin is not None and origin[0] == w.TAG_BYTE4 else 0.0)
+            struct.unpack("<f", origin[1])[0] if origin is not None and origin[0] == w.TAG_BYTE4 else 0.0,
+            stamp is not None and stamp[0] == w.TAG_ID and tuple(stamp[1]) != (0, 0))
     return out
 
 

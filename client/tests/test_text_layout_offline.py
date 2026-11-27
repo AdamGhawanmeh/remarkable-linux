@@ -167,7 +167,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(line.marker, "☑")
         (line,) = self.lines([("open", (3, 0x210))])
         self.assertFalse(line.pieces[0][1].strike)
-        self.assertEqual(line.marker, "☐")
+        self.assertEqual(line.marker, "▣")      # state 2 is indeterminate in 3.29 (0x1408b5ef0), not struck out
 
     @needs_fonts
     def test_the_apps_fonts_are_registered(self):

@@ -27,9 +27,10 @@ What the app does around typing, and this does too:
   text instead of joining it to the line above; backspacing a paragraph into an
   empty one above keeps its own style. Deleting a selection that starts a paragraph
   keeps the style of the paragraph it ends in.
-  A space typed after "*", "+" or "-" alone at the start of a paragraph that is not
-  a list turns it into a bullet point (0x14094d080), the marker and the space taken
-  out.
+  A space typed after "*", "+" or "-" (bullet point), "[]" (unchecked checkbox) or
+  "1." (numbered list) alone at the start of a paragraph that is not a list turns it
+  into that list (0x14094d080), the marker and the space taken out; a paragraph that
+  already is a list keeps the word.
   Paragraph style buttons (cycleParagraphStyle, 0x14043ca20): a list button on a
   paragraph of that list kind cycles its indent (0, 1, 2); any other sets the style.
   Bold and italic (setTextStyle, 0x140954a40): on a selection, all of it styled, or
@@ -40,9 +41,8 @@ What the app does around typing, and this does too:
   the paragraph (and its style, its list marker) goes on.
   A click on a checkbox (toggleCheckboxByIndex, 0x140988a80) checks or unchecks it.
 
-Not done as the app does: the checkbox and numbered-list typing shortcuts (their
-strings live in the app's settings, not decoded) are not made; clicking below the text
-moves the cursor to its end rather than adding empty lines down to the click.
+Not done as the app does: clicking below the text moves the cursor to its end rather
+than adding empty lines down to the click.
 """
 
 from __future__ import annotations
@@ -94,7 +94,8 @@ STYLE_ACTIONS = {TITLE_STYLE: ParagraphStyle.TITLE, SUBHEADING_STYLE: ParagraphS
                  BULLETPOINT_STYLE: ParagraphStyle.BULLETPOINT, CHECKBOX_STYLE: ParagraphStyle.CHECKBOX_UNCHECKED,
                  NUMBERED_LIST: ParagraphStyle.NUMBERED_LIST}
 BOLD_FLAG, ITALIC_FLAG, LINK_FLAG = 1, 2, 4          # scene::CharacterStyle::Types
-_BULLET_TYPED = re.compile(r"^[\*\+\-]$")
+_BULLET_TYPED = re.compile(r"^[\*\+\-]$")           # static regex 0x141259379
+_CHECKBOX_TYPED, _NUMBERED_TYPED = "[]", "1."        # SceneKeyHandler+0x160 / +0x178
 _WORD = re.compile(r"\w", re.UNICODE)
 
 
@@ -502,16 +503,28 @@ class TextSession:
                 self._format(start, end, name, want, changes)
 
     def _bullet_typed(self) -> None:
-        """"* " (or "+ ", "- ") typed at the start of a paragraph that is not a list
-        makes it a bullet point (0x14094d080)."""
+        """Autoformat after a single " " typed (handleKeyStroke, 0x14094d080, ARCHITECTURE.md
+        Text mode): the word before it, read back to the previous " " or the
+        paragraph start, counts only when it starts the paragraph (0x140936980). "*", "+" or
+        "-" makes a bullet point, "[]" an unchecked checkbox, "1." a numbered list; a
+        paragraph that is already a list is left as it is. The word and the space are
+        deleted and the style set as one undo step (0x140949960)."""
         start, _ = self.paragraph_range(self.cursor)
         word = rm_text.cut(self.plain(), start, self.cursor - 1)
-        if self.cursor - start != 2 or not _BULLET_TYPED.match(word) or is_list(*held(self.stored_style())):
+        if " " in word or is_list(*held(self.stored_style())):
+            return
+        if _BULLET_TYPED.match(word) and "\n" not in word:
+            style = ParagraphStyle.BULLETPOINT
+        elif word == _CHECKBOX_TYPED:
+            style = ParagraphStyle.CHECKBOX_UNCHECKED
+        elif word == _NUMBERED_TYPED:
+            style = ParagraphStyle.NUMBERED_LIST
+        else:
             return
         self._stop_typing()
         changes: list = []
         self._delete(start, self.cursor, changes)
-        self._set_style(start, rm_text.stored_style(ParagraphStyle.BULLETPOINT), changes)
+        self._set_style(start, rm_text.stored_style(style), changes)
         self._step(changes)
 
     def enter(self) -> None:

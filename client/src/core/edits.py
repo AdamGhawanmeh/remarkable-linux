@@ -89,6 +89,7 @@ from viewer import rm_text
 from viewer.rm_parser import ParagraphStyle, RmParseError
 
 from .config import atomic_write_json, ensure_private_dir, read_json
+from .highlights import highlights_json
 from .models import Document, check_format, json_bytes
 from .pagemap import PageMap, PageMapError, is_legacy, upgrade
 
@@ -2565,6 +2566,21 @@ def document_files(doc: Document, edits: list[Edit], read: Callable[[str], bytes
         else:
             for copy, data in staged.page_extras(page_id):
                 out[copy] = data()
+        # The highlights file is rebuilt from the page each time the app stores it
+        # (0x1405a8760, section 5.11): only for the pages written here.
+        if new is not None:
+            highlights_name = f"{doc.id}.highlights/{page_id}.json"
+            try:
+                highlights = highlights_json(new)
+            except (RmParseError, ValueError, struct.error):
+                highlights, highlights_name = None, ""
+            if highlights is not None:
+                out[highlights_name] = highlights
+            elif highlights_name and (origin is not None or highlights_name in doc.files):
+                if origin is None:
+                    out[highlights_name] = None
+                else:
+                    out.pop(highlights_name, None)      # a copy does not take the source's
     for page_id in staged.removed():
         for name in page_files(doc, page_id):
             out[name] = None
