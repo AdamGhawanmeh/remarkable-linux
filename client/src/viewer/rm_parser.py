@@ -250,8 +250,17 @@ class ParagraphStyle(IntEnum):
 # properties is the heading level):
 #   base 1 nothing; 2 text, level 0 body, 1 title, 2 subheading 2, 3 subheading;
 #        3 list, properties = indent | kind << 4 | state << 8, kind 0 bullet, 1 checkbox,
-#          2 numbered, state 1 checked; 4 image.
+#          2 numbered, state 1 checked; 2 indeterminate (checkbox_indeterminate.svg,
+#          0x1408b5ef0; drawn as unchecked here); 3 also checked for paint and strike-out
+#          (0x1408b5d20), though the legacy byte (0x140a93100) writes it as unchecked;
+#        4 image.
 STYLE_NONE, STYLE_TEXT, STYLE_LIST, STYLE_IMAGE = 1, 2, 3, 4
+
+
+def checkbox_checked(base: int, properties: int) -> bool:
+    """Whether a style is drawn (and struck out) as a checked checkbox (0x1408b5d20):
+    a list, kind 1 (checkbox), state 1 or 3."""
+    return base == STYLE_LIST and properties >> 4 & 0xF == 1 and properties >> 8 & 7 in (1, 3)
 
 
 def _style_from_legacy(legacy: int) -> tuple[int, int]:
@@ -351,6 +360,10 @@ class StyleEntry:
         base, properties = self.base
         if base == STYLE_TEXT and properties & 0xFF == 3:
             return ParagraphStyle.SUBHEADING
+        # Display (0x1408b5d20); the writer's legacy byte (_style_to_legacy, 0x140a93100) still says unchecked for state 3.
+        if checkbox_checked(base, properties):
+            return (ParagraphStyle.CHECKBOX_CHECKED_INDENTED if properties & 0xF
+                    else ParagraphStyle.CHECKBOX_CHECKED)
         return _LEGACY_TYPE.get(_style_to_legacy(base, properties), ParagraphStyle.PARAGRAPH)
 
 

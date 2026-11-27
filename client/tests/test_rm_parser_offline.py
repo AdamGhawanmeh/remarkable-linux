@@ -28,8 +28,9 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from viewer.rm_parser import (  # noqa: E402
     ANCHOR_SENTINEL_START, FORMAT_LINK_END, FORMAT_LINK_START, Anchor, Color, PageScene, ParagraphStyle, Point,
-    RmParseError, RootText, Stroke, StyleEntry, TextItem, Tool, block_name, decode_root_text, parse, parse_file,
-    parse_header, text_block, text_order)
+    RmParseError, RootText, Stroke, StyleEntry, TextItem, Tool, _Values, _decode_style_entry, _style_to_legacy,
+    block_name, checkbox_checked, decode_root_text, parse, parse_file, parse_header, text_block, text_order)
+from viewer import rm_text  # noqa: E402
 from viewer.renderer import (  # noqa: E402
     PALETTE_ARGB, estimate_width, image_matrix, image_size, layout_text, render_bounds, render_image,
     render_svg, stroke_offsets, stroke_runs, stroke_style)
@@ -445,6 +446,25 @@ class RootTextTests(unittest.TestCase):
         self.assertEqual(StyleEntry(ZERO, (1, 1)).style, ParagraphStyle.PARAGRAPH)
         entry = decode_root_text(root_text([], [paragraph_format((1, 6), 5, (1, 7), base=3, properties=1)])[8:]).styles
         self.assertEqual(entry, [StyleEntry((1, 6), (1, 7), 5, 3, 1)])
+
+    def test_checkbox_state_3_displays_as_checked(self):
+        # 0x1408b5d20: state 1 and 3 are checked; the writer (0x140a93100) still says unchecked for 3.
+        for properties, style in ((0x310, ParagraphStyle.CHECKBOX_CHECKED),
+                                  (0x311, ParagraphStyle.CHECKBOX_CHECKED_INDENTED),
+                                  (0x210, ParagraphStyle.CHECKBOX_UNCHECKED)):
+            self.assertEqual(StyleEntry(ZERO, (1, 1), 6, 3, properties).style, style, hex(properties))
+        self.assertEqual((_style_to_legacy(3, 0x310), _style_to_legacy(3, 0x311)), (6, 8))
+        self.assertEqual([checkbox_checked(3, state << 8 | 0x10) for state in range(8)],
+                         [False, True, False, True, False, False, False, False])
+        self.assertFalse(checkbox_checked(3, 0x300))              # a bullet
+        self.assertFalse(checkbox_checked(2, 0x310))              # not a list
+
+    def test_checkbox_state_3_round_trips(self):
+        entry = StyleEntry((1, 5), (1, 6), 6, 3, 0x310, b"")
+        data = rm_text.encode_style_entry(entry)
+        back = _decode_style_entry(_Values(data, "test"))
+        self.assertEqual(rm_text.encode_style_entry(back), data)
+        self.assertEqual((back.legacy, back.properties), (6, 0x310))
 
     def test_bold_italic_and_link_markers(self):
         items = [text_item((1, 1), ZERO, text="a"), text_item((1, 2), (1, 1), fmt=1),

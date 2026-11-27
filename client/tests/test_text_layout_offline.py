@@ -160,6 +160,15 @@ class LayoutTests(unittest.TestCase):
         self.assertTrue(line.pieces[0][1].strike)
         self.assertIn('text-decoration="line-through"', R.render_svg(parse(styled_page([("done", 7)]))))
 
+    def test_a_state_3_checkbox_is_struck_out_and_marked_checked(self):
+        # 0x1408b5d20: state 3 displays like checked (state 1), although the legacy byte says unchecked.
+        (line,) = self.lines([("done", (3, 0x310))])
+        self.assertTrue(line.pieces[0][1].strike)
+        self.assertEqual(line.marker, "☑")
+        (line,) = self.lines([("open", (3, 0x210))])
+        self.assertFalse(line.pieces[0][1].strike)
+        self.assertEqual(line.marker, "☐")
+
     @needs_fonts
     def test_the_apps_fonts_are_registered(self):
         from PySide6.QtGui import QFontDatabase, QFontInfo

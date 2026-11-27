@@ -1381,7 +1381,8 @@ position as a QPointF (never stored).
   top margin and heading level (1, 2, 3), so their lines have no extra distance; the image
   block format is the body one with a fixed line distance 20 (0x140c8d5c8). The font
   function sets PreferNoHinting, family "reMarkable Sans" or "reMarkable Serif Small"
-  (0x140d70a88/a98), and strike-out for a checked checkbox. A list paragraph gets
+  (0x140d70a88/a98), and strike-out for a checked checkbox (0x1408b5d20: list, kind 1,
+  state bits 8..10 = 1 or 3; the legacy writer 0x140a93100 counts only 1 as checked). A list paragraph gets
   BlockIndent = its indent level + 1 (0x1408b64d0), i.e. text at 48 or 96. The tab stop
   distance is the indent width. textWidth = the box width (0x140942c90; a zero width
   lays out at 1404 × 0.5 = 702; one view mode, not pages, uses another width at +0x508),
@@ -1393,7 +1394,11 @@ position as a QPointF (never stored).
   integer QFontMetrics::ascent as baseline: bullets "•" / "◦" / "-" by level (static
   QStrings 0x1412592d8 / a8 / 90) with the glyph's left at +20; a checkbox is the
   resource `:/images/checkbox_unchecked.svg` or `checkbox_checked.svg` (renderers at
-  text+0x678 / 0x688; 0x698 indeterminate) rendered into (x, y − 2, 40, 40); a number is
+  text+0x678 / 0x688; 0x698 indeterminate) rendered into (x, y − 2, 40, 40), chosen as:
+  checked when 0x1408b5d20 holds (state 1 or 3), else 0x678 + 0x20 × (state == 2,
+  0x1408b5ef0), i.e. indeterminate for state 2 and unchecked otherwise. Which renderer
+  loads which SVG is [I: the three resource strings 0x140d6a190 / 1d0 / 210 lie in the
+  order unchecked, checked, indeterminate]; the client draws state 2 as unchecked. A number is
   QTextBlock::userState formatted by level mod 3 (decimal, letters A–Z base 26, roman
   0x140941a10), lower-cased, + ".", right-aligned so it ends at +30 (its integer
   boundingRect width). How userState is numbered is not traced [I: consecutive items per

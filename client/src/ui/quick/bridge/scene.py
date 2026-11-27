@@ -56,7 +56,7 @@ from PySide6.QtQuick import QQuickItem, QQuickPaintedItem
 from core import handwriting as hwc
 from core.edits import EditError
 from core.models import FileType, LoadErrorType, load_error_text
-from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, Layer, Tool
+from viewer.rm_parser import PAGE_HEIGHT, PAGE_WIDTH, Layer, Tool, checkbox_checked
 from viewer.rm_parser import parse as parse_page
 from viewer import rm_stroke
 from viewer.rm_parser import ParagraphStyle as StyleType
@@ -315,7 +315,7 @@ class _ParagraphStyle:
 
     @Slot(result=bool)
     def isChecked(self) -> bool:
-        return self.isCheckbox() and self._held()[1] >> 8 & 7 == 1
+        return self.isCheckbox() and checkbox_checked(*self._held())
 
 
 ParagraphStyle = qml_class("scene::ParagraphStyle", name="ParagraphStyle", behaviour=_ParagraphStyle)
