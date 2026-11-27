@@ -60,7 +60,29 @@ def index_rows(data: bytes) -> list[list[str]]:
     return [ln.split(":") for ln in lines[1:] if len(ln.split(":")) == 5]
 
 
-ABSENT = object()      # FakeCloud.deleted_immutable_action: the key is left out of the root reply
+class _Absent:
+    """Marks a root-reply key the fake cloud leaves out; one instance, kept by copies."""
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return (_Absent, ())
+
+    def __repr__(self):
+        return "ABSENT"
+
+
+ABSENT = _Absent()     # FakeCloud.deleted_immutable_action: the key is left out of the root reply
 
 
 class FakeCloud:

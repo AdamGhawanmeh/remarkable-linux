@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s client/tests -p 'test_*offline.py'
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import tempfile
@@ -195,6 +196,14 @@ class PersistenceTests(Base):
         client = self.new_client()
         client.refresh()
         self.assertEqual(self.new_client().deleted_immutable_action(), "ReDownload")
+
+    def test_absent_survives_deepcopy_of_the_cloud(self):
+        clone = copy.deepcopy(FakeCloud(4))
+        self.assertIs(clone.deleted_immutable_action, ABSENT)
+        response = clone("GET", "https://sync.example/sync/v4/root",
+                         {"Authorization": "Bearer synthetic"}, None, 10)
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("deletedImmutableAction", json.loads(response.body))
 
     def test_unknown_stored_value_reads_as_none(self):
         self.sync.refresh()
