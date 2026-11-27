@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from viewer import rm_anchor
+from viewer import rm_anchoring
 from viewer import rm_layer
 from viewer import rm_select
 from viewer import rm_stroke
@@ -546,6 +547,54 @@ class AnchoredGroupAdd:
                        raw.get("anchor_type") or 2, raw.get("uid") or "", raw.get("layer"))
 
 
+def _anchor_ref(value) -> tuple:
+    """A character an anchor names: a CharRef, or ("page", 0, 0) for no anchor (RemoveAnchorAction)."""
+    ref = tuple(value)
+    whole = len(ref) == 3 and isinstance(ref[2], int) and not isinstance(ref[2], bool) and ref[2] >= 0
+    if whole and ref[0] == "page" and isinstance(ref[1], int) and not isinstance(ref[1], bool) and 0 <= ref[1] <= 0xFF:
+        return ref
+    if whole and ref[0] == "edit" and isinstance(ref[1], str) and ref[1]:
+        return ref
+    raise EditError(f"not an anchor reference: {value!r}")
+
+
+@dataclass(frozen=True)
+class AnchorSet:
+    """An anchored group of a page brought to a state (viewer.rm_anchoring.set_node): what
+    undo and redo write for the actions that make, move and detach anchored groups (a
+    stroke placed on a page with text, an eraser regrouping): `anchor` (the character the
+    group is anchored to; ("page", 0, 0) for none), `origin_x`, whether it hangs under
+    `layer` (`attached`), and `values`, the items rewritten in place as (item, value hex).
+    A field that is None, or that the node has already, is left as it is."""
+
+    doc_id: str
+    page_id: str
+    node: ItemRef
+    created_ms: int
+    anchor: tuple | None = None
+    origin_x: float | None = None
+    attached: bool | None = None
+    layer: ItemRef | None = None
+    values: tuple[tuple[ItemRef, str], ...] = ()
+    uid: str = ""
+
+    @classmethod
+    def new(cls, doc_id: str, page_id: str, node, created_ms: int, anchor=None, origin_x=None, attached=None,
+            layer=None, values=(), uid: str | None = None) -> "AnchorSet":
+        kept = tuple((_ref(ref), bytes.fromhex(value).hex()) for ref, value in values)
+        return cls(str(doc_id), str(page_id), _ref(node), int(created_ms),
+                   None if anchor is None else _anchor_ref(anchor),
+                   None if origin_x is None else _number(origin_x, "anchor origin"),
+                   None if attached is None else bool(attached), _opt_ref(layer), kept,
+                   uuid.uuid4().hex if uid is None else str(uid))
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "AnchorSet":
+        return cls.new(raw["doc_id"], raw["page_id"], raw["node"], raw["created_ms"], raw.get("anchor"),
+                       raw.get("origin_x"), raw.get("attached"), raw.get("layer"), raw.get("values") or (),
+                       raw.get("uid") or "")
+
+
 # ------------------------------------------------------------------ layers & SceneInfo
 
 @dataclass(frozen=True)
@@ -771,7 +820,8 @@ LAYER_EDITS = (LayerAdd, LayerDelete, LayerReattach, LayerRename, LayerVisibilit
                LayerMove, LayerMergeDown, LayerUnmerge, SceneFlags)
 
 
-STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore, StrokePaste, ItemsTransform, AnchoredGroupAdd)
+STROKE_EDITS = (StrokeAdd, StrokeErase, StrokeDelete, StrokeRestore, StrokePaste, ItemsTransform, AnchoredGroupAdd,
+                AnchorSet)
 
 
 # ------------------------------------------------------------------ the pen settings of a document
@@ -1110,7 +1160,7 @@ DEFAULT_TEMPLATE = "Blank"      # the template of the page a document left empty
 Edit = (ImageInsert | ImageTransform | ImageDelete | ImageRestore | PageAdd | PageCopy | PageMove | PageDelete
         | PageTemplate | TextEdit | StrokeAdd | StrokeErase | StrokeDelete | StrokeRestore | StrokePaste | ItemsTransform
         | ToolSettings | LayerAdd | LayerDelete | LayerReattach | LayerRename | LayerVisibility | LayerMove
-        | LayerMergeDown | LayerUnmerge | SceneFlags | AnchoredGroupAdd)
+        | LayerMergeDown | LayerUnmerge | SceneFlags | AnchoredGroupAdd | AnchorSet)
 KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransform, "image-delete": ImageDelete,
                           "image-restore": ImageRestore, "page-add": PageAdd, "page-copy": PageCopy, "page-import": PageImport,
                           "page-move": PageMove, "page-delete": PageDelete, "page-template": PageTemplate,
@@ -1121,7 +1171,7 @@ KINDS: dict[str, type] = {"image": ImageInsert, "image-transform": ImageTransfor
                           "layer-add": LayerAdd, "layer-delete": LayerDelete, "layer-reattach": LayerReattach,
                           "layer-rename": LayerRename, "layer-visible": LayerVisibility, "layer-move": LayerMove,
                           "layer-merge": LayerMergeDown, "layer-unmerge": LayerUnmerge, "scene-flags": SceneFlags,
-                          "anchored-group": AnchoredGroupAdd}
+                          "anchored-group": AnchoredGroupAdd, "anchor-set": AnchorSet}
 
 
 class PendingEdits:
@@ -1541,6 +1591,11 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 page = erased.page
                 for n, piece in enumerate(erased.made):
                     made[f"{edit.uid}/{n}"] = piece
+                # What the regroup of the anchored groups it touched made (named g<k>, c<k>).
+                for n, node in enumerate(erased.nodes):
+                    made[f"{edit.uid}/g{n}"] = node
+                for n, item in enumerate(erased.clones):
+                    made[f"{edit.uid}/c{n}"] = item
             continue
         if isinstance(edit, StrokeDelete):
             if page is not None:
@@ -1577,6 +1632,25 @@ def replay(page: bytes | None, edits: list[Edit], author: bytes) -> Replay:
                 raise EditError(f"the anchored group does not fit the page: {err}") from err
             if edit.uid:
                 made[edit.uid] = node
+            continue
+        if isinstance(edit, AnchorSet):
+            done = Replay(page, made, removed, typed)
+            node = done.resolve(edit.node)
+            if page is None or node is None:
+                log.warning("not setting a group on page %s: it is not known", edit.page_id)
+                continue
+            values = {}
+            for ref, value in edit.values:
+                item = done.resolve(ref)
+                if item is not None:
+                    values[item] = bytes.fromhex(value)
+            try:
+                page = rm_anchoring.set_node(
+                    page, author=author, node=node, char_id=done.char(edit.anchor) if edit.anchor is not None else None,
+                    origin_x=edit.origin_x, attached=edit.attached,
+                    parent=done.resolve(edit.layer) if edit.layer is not None else None, values=values)
+            except (RmParseError, ValueError) as err:
+                raise EditError(f"the group does not fit the page: {err}") from err
             continue
         if isinstance(edit, StrokePaste):
             done = Replay(page, made, removed, typed)
@@ -1673,7 +1747,21 @@ def _draw(page: bytes | None, edits: list[StrokeAdd], author: bytes, made: dict[
             lines.append(line)
             uids.append(edit.uid)
     if lines:
-        page, ids = rm_stroke.append_strokes(page, author=author, lines=lines, layer=layer)
+        # On a page with typed text each stroke is placed in a group anchored to it
+        # (rm_anchoring.place); what a placement made besides the stroke is named
+        # <uid>/g<k> (group nodes) and <uid>/c<k> (clones).
+        drawn = rm_anchoring.place_strokes(page, author=author, lines=lines, layer=layer)
+        if drawn is not None:
+            page, ids = drawn.page, drawn.ids
+            for uid, placed in zip(uids, drawn.placements):
+                if not uid:
+                    continue
+                for k, node in enumerate(placed.nodes):
+                    made[f"{uid}/g{k}"] = node
+                for k, item in enumerate(placed.clones):
+                    made[f"{uid}/c{k}"] = item
+        else:
+            page, ids = rm_stroke.append_strokes(page, author=author, lines=lines, layer=layer)
         made.update((uid, item) for uid, item in zip(uids, ids) if uid)
     return page
 
@@ -1861,6 +1949,63 @@ class StrokeChange:
 
 
 @dataclass(frozen=True)
+class NodeSnap:
+    """An anchored group as a step of the history holds it: its anchor character (a
+    CharRef, ("page", 0, 0) for none), originX, whether it hangs under its layer, and the
+    items rewritten in place with their values (hex)."""
+
+    anchor: tuple
+    origin_x: float
+    attached: bool
+    values: tuple[tuple[ItemRef, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class AnchorChange:
+    """What an action did to one anchored group (the anchor manager's actions: createGroup,
+    SetAnchorIdAction, RemoveAnchorAction, SceneDeleteGroup): `readd`, the state it had
+    before (what undo sets), `remove`, the state it has now; swapped by every undo and redo
+    (AnchorSet). `layer`: where the group hangs while attached."""
+
+    node: ItemRef
+    layer: ItemRef | None
+    readd: NodeSnap
+    remove: NodeSnap
+
+
+def scene_changes(before: Replay, after: Replay, *, erase: bool = False) -> tuple | None:
+    """The history step of an action that placed strokes in anchored groups or regrouped
+    them (`before`, `after`: the page without and with its edit), or None when it was no
+    more than strokes added (one) and deleted: the nodes made or changed (AnchorChange,
+    first), then the strokes it added and deleted (one StrokeChange). Undo swaps them last
+    to first: the strokes go and come back, then the nodes are put as they were."""
+    if before.page is None or after.page is None:
+        return None
+    delta = rm_anchoring.delta(before.page, after.page)
+    plain = not delta.nodes and not delta.moved and (erase or (not delta.deleted and len(delta.added) <= 1))
+    if plain:
+        return None
+    rewritten: dict[tuple[int, int], list] = {}
+    for item, parent, old, new in delta.moved:
+        rewritten.setdefault(parent, []).append((before.ref(item), old.hex(), new.hex()))
+    changes: list = []
+    for node, parent, old, new in delta.nodes:
+        values = rewritten.pop(node, [])
+        char = after.char_ref(new.char)
+        was = NodeSnap(after.char_ref(old.char) if old is not None else char,
+                       old.origin_x if old is not None else new.origin_x, old.attached if old is not None else False,
+                       tuple((ref, was_value) for ref, was_value, _ in values))
+        now = NodeSnap(char, new.origin_x, new.attached, tuple((ref, value) for ref, _, value in values))
+        changes.append(AnchorChange(after.ref(node), after.ref(parent) if parent != rm_writer.ZERO_ID else None,
+                                    was, now))
+    strokes = StrokeChange(remove=tuple(StrokePart(after.ref(i), v.hex()) for i, _, v in delta.added),
+                           readd=tuple(StrokePart(before.ref(i), v.hex()) for i, _, v in delta.deleted))
+    if strokes.remove or strokes.readd:
+        changes.append(strokes)
+    return tuple(changes)
+
+
+@dataclass(frozen=True)
 class LayerAttachChange:
     """A layer added (attached=True) or deleted (attached=False), swapped by undo/redo
     between LayerDelete and LayerReattach."""
@@ -2006,6 +2151,18 @@ def swapped(changes: tuple, doc_id: str, page_id: str, now_ms: int,
         if isinstance(change, SceneFlagChange):
             edits.append(SceneFlags.new(doc_id, page_id, now_ms, **{change.field: change.old_value}))
             back.append(SceneFlagChange(change.field, change.new_value, change.old_value))
+            continue
+        if isinstance(change, AnchorChange):
+            node = name(change.node)
+            layer = name(change.layer) if change.layer is not None else None
+            snap = change.readd
+            values = tuple((name(ref), value) for ref, value in snap.values)
+            edits.append(AnchorSet.new(doc_id, page_id, node, now_ms, snap.anchor, snap.origin_x, snap.attached,
+                                       layer, values))
+            back.append(AnchorChange(node, layer, NodeSnap(change.remove.anchor, change.remove.origin_x,
+                                                           change.remove.attached,
+                                                           tuple((name(r), v) for r, v in change.remove.values)),
+                                     NodeSnap(snap.anchor, snap.origin_x, snap.attached, values)))
             continue
         if isinstance(change, StrokeChange):
             gone = tuple(StrokePart(name(p.ref), p.value, p.origin) for p in change.remove)
@@ -2285,6 +2442,13 @@ class Staged:
     def replay(self, page_id: str) -> Replay:
         try:
             return replay(self.base(page_id), self.page_edits.get(page_id, []), self.author)
+        except (RmParseError, ValueError) as err:
+            raise EditError(f"the page cannot be edited: {err}") from err
+
+    def replay_before_last(self, page_id: str) -> Replay:
+        """The page as it was before its last pending edit."""
+        try:
+            return replay(self.base(page_id), self.page_edits.get(page_id, [])[:-1], self.author)
         except (RmParseError, ValueError) as err:
             raise EditError(f"the page cannot be edited: {err}") from err
 

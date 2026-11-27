@@ -1565,8 +1565,9 @@ class _Controller:
         action when Clipboard.lastCopiedType is Items). The app (0x1404425c0) posts a
         SceneInsertItemsAfterActionCrdt to the page's worker: the items go in a group
         anchored to the text after the cursor. Here they are placed with their box's
-        top-left at the caret (kept on the paper), unanchored, as pen strokes on a page
-        with text are here: one undo step, pending edits, then the selection."""
+        top-left at the caret (kept on the paper), unanchored (pen strokes on a page
+        with text are anchored, rm_anchoring): one undo step, pending edits, then the
+        selection."""
         if self.view is not None:
             self.view.insert_items_at_cursor(_js(items) or [])
 

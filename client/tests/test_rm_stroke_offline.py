@@ -358,24 +358,36 @@ class AppendTests(unittest.TestCase):
         with mock.patch.object(s, "MAX_LINE_POINTS", 2), self.assertRaises(s.StrokeError):
             s.append_stroke(None, author=DESKTOP, line=line)
 
-    def test_a_page_with_typed_text_is_drawn_and_erased_on_its_layer(self):
-        from viewer import rm_text
+    def test_a_page_with_typed_text_anchors_what_is_drawn_and_erases_it(self):
+        from viewer import renderer, rm_anchoring, rm_text
         empty_box = page(stroke((1, 15)), extra=root_text([], []))
         typed = rm_text.edit_text(page(stroke((1, 15))), author=DESKTOP,
                                   change=lambda doc, clock: doc.insert(0, "meeting notes", clock))
-        for data in (empty_box, typed):
-            self.assertTrue(s.has_text(w.split(data)[1]))
-            text_block = [b.payload for b in w.split(data)[1] if b.type == w.BLOCK_ROOT_TEXT]
-            drawn = s.append_stroke(data, author=DESKTOP, line=ruled())
-            [new] = [x for x in s.strokes(drawn) if x.item not in {y.item for y in s.strokes(data)}]
-            # On the layer itself, unanchored, after the layer's last item.
-            self.assertEqual((new.parent, new.left), (LAYER, w.sequence(w.split(data)[1], LAYER)[-1][0]))
-            self.assertEqual([b.payload for b in w.split(drawn)[1] if b.type == w.BLOCK_ROOT_TEXT], text_block)
-            erased = s.erase(drawn, author=DESKTOP, eraser=upright())
-            self.assertIn(new.item, erased.deleted)
-            self.assertEqual([b.payload for b in w.split(erased.page)[1] if b.type == w.BLOCK_ROOT_TEXT], text_block)
-            self.assertEqual(parse(erased.page).text.text if parse(erased.page).text else "",
-                             parse(data).text.text if parse(data).text else "")
+        with mock.patch.object(rm_anchoring, "default_measure", lambda: renderer.estimate_width):
+            for data in (empty_box, typed):
+                self.assertTrue(s.has_text(w.split(data)[1]))
+                text_block = [b.payload for b in w.split(data)[1] if b.type == w.BLOCK_ROOT_TEXT]
+                drawn, [item] = s.append_strokes(data, author=DESKTOP, lines=[ruled()])
+                [new] = [x for x in s.strokes(drawn) if x.item == item]
+                # Not on the layer: in a group anchored to the text (3.29's anchorItems,
+                # rm_anchoring); above the empty box's top it is the before-text sentinel.
+                self.assertNotEqual(new.parent, LAYER)
+                self.assertIn(new.parent, s.anchored_nodes(w.split(drawn)[1]))
+                if data is empty_box:
+                    self.assertEqual(rm_anchoring.read_anchors(w.split(drawn)[1])[new.parent].char_id,
+                                     rm_anchoring.BEFORE_TEXT)
+                self.assertEqual([b.payload for b in w.split(drawn)[1] if b.type == w.BLOCK_ROOT_TEXT], text_block)
+                # The eraser reaches it where the page draws it (the group's anchor position).
+                scene = parse(drawn)
+                by_object = renderer.stroke_offsets(scene, renderer.layout_text(scene, renderer.estimate_width))
+                where = {tuple(x.item_id): by_object[id(x)] for x in scene.strokes if id(x) in by_object}
+                anchors = {x.parent: where[x.item] for x in s.strokes(drawn) if x.item in where}
+                erased = s.erase(drawn, author=DESKTOP, eraser=upright(), anchors=anchors)
+                self.assertIn(new.item, erased.deleted)
+                self.assertEqual([b.payload for b in w.split(erased.page)[1] if b.type == w.BLOCK_ROOT_TEXT],
+                                 text_block)
+                self.assertEqual(parse(erased.page).text.text if parse(erased.page).text else "",
+                                 parse(data).text.text if parse(data).text else "")
         # Undo of the erasure puts the stroke back on the text page too.
         restored, _ = s.restore_stroke(erased.page, author=DESKTOP, item=new.item, line=new.line)
         self.assertIn(new.line.points, [x.line.points for x in s.strokes(restored)])
@@ -766,7 +778,16 @@ class StrokeEditTests(Base):
         self.sync.edits.add(typed)
         self.assertEqual(rm_text.page_text(self.source.staged(self.doc).page(PAGE1)).text, "agenda")
         edit = self.source.add_stroke(self.doc, PAGE1, self.line(), NOW + 1)
-        erase = self.source.erase_strokes(self.doc, PAGE1, upright(), NOW + 2)
+        # Our stroke is now in a group anchored to the text, so, as the app does, the eraser is
+        # given where the page draws it (stroke id -> anchor position); without it the group
+        # is left alone.
+        from viewer import renderer, rm_anchoring
+        scene = parse(self.source.staged(self.doc).page(PAGE1))
+        measure = rm_anchoring.default_measure()
+        by_object = renderer.stroke_offsets(scene, renderer.layout_text(scene, measure), measure)
+        offsets = {tuple(x.item_id): by_object[id(x)] for x in scene.strokes if id(x) in by_object}
+        self.assertTrue(offsets)
+        erase = self.source.erase_strokes(self.doc, PAGE1, upright(), NOW + 2, offsets)
         self.assertIsNotNone(erase)
         self.assertEqual(self.sync.edits.of(THROWAWAY), [create, typed, edit, erase])
         uploaded = self.files(self.sync.edits.of(THROWAWAY))[f"{THROWAWAY}/{PAGE1}.rm"]

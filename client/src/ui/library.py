@@ -30,7 +30,7 @@ from core.edits import (IMPORT_FILES, PAGE_EDITS, AnchoredGroupAdd, Change, Edit
                         SceneFlags,
                         Staged, StrokeAdd, StrokeChange, StrokeDelete, StrokeErase, StrokePart, StrokePaste,
                         ToolSettings, current_content, document_files, import_path, page_files, page_images, rebase_refs,
-                        swapped, _alias)
+                        scene_changes, swapped, _alias)
 from core.sync import SyncClient, SyncError, build_index, file_entry, sha256_hex
 from core.config import atomic_write_json, read_json
 from viewer import rm_layer, rm_select, rm_stroke, rm_writer
@@ -1241,17 +1241,25 @@ class LibrarySource:
         """Keep a stroke drawn on a page: `line` as the app would add it
         (viewer.rm_stroke.draw), one action for undo (the app's AddItem). Refused, with
         nothing kept, on a document that may not be edited. On a page with typed text
-        it goes on the layer, unanchored (viewer.rm_stroke.has_text)."""
+        it goes into a group anchored to the text, as 3.29 places it (viewer.rm_anchoring):
+        still one action for undo, which also puts back the groups it merged and
+        re-anchored and the loose strokes it absorbed (core.edits.scene_changes)."""
         with self._history_lock:
             doc = self._editable(doc, page_id)
             history = self._history(doc.id, page_id)
             layer_ref, _ = self._layer_ref(doc, page_id, layer_index)
             edit = StrokeAdd.new(doc.id, page_id, line, now_ms, layer=layer_ref)
             self._add_edit(doc, edit)
-            done = self.staged(doc).replay(page_id)
+            staged = self.staged(doc)
+            done = staged.replay(page_id)
             item = done.made.get(edit.uid)
             value = _stroke_values(done.page).get(item) if item is not None else None
-            if value is not None:
+            changes = None
+            if item is not None and done.page is not None and rm_stroke.has_text(rm_writer.split(done.page)[1]):
+                changes = scene_changes(staged.replay_before_last(page_id), done)
+            if changes:
+                history.push(list(changes))
+            elif value is not None:
                 history.push([StrokeChange(remove=(StrokePart(("edit", edit.uid), value),))])
             history.seen = self._seen(doc.id, page_id)
         return edit
@@ -1288,6 +1296,13 @@ class LibrarySource:
             self._add_edit(doc, edit)
             old = _stroke_values(before.page)
             after = self.staged(doc).replay(page_id)
+            regrouped = scene_changes(before, after, erase=True) if erased.nodes or erased.clones or anchors else None
+            if regrouped:
+                # Anchored groups were regrouped: the nodes, the clones and what moved are
+                # one step with the strokes (core.edits.scene_changes).
+                history.push(list(regrouped))
+                history.seen = self._seen(doc.id, page_id)
+                return edit
             new = _stroke_values(after.page)
             readd = tuple(StrokePart(before.ref(item), old[item]) for item in erased.deleted if item in old)
             pieces = []

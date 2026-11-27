@@ -1082,14 +1082,11 @@ in id order (`rm_writer.sequence`). Item blocks are stored sorted by (parent, id
 (0x0A: loads, merges, textChars, textLines, keyboardCount) has no stroke counters; the writer
 stores `loads + 1` on every save and the rest as they are. On a page with typed text the
 scene has an anchoring manager (0x14096ca70) that puts the stroke into a group anchored
-to a text line instead (not traced). On the 30 cached pages with a RootText block, the
+to a text line instead (see "Text-anchored stroke groups", Where a new stroke goes). On the 30 cached pages with a RootText block, the
 tablet's strokes are in such groups: all 472 on the 5 pages with real text, 3,664 of 3,907
 on the 25 with an empty box; the other 243 (4 pages, all with an empty box) sit directly
 on the layer, so a layer stroke beside a RootText block is a page the tablet writes and
-reads. `rm_stroke` draws on such pages as on any other: the stroke goes on the current
-layer, unanchored (it will not follow the text when the text reflows on the tablet, as
-the tablet's own anchored strokes do; no cached page has an unanchored stroke beside real
-text). The eraser takes the layer's line items and those of every group below it,
+reads. The client anchors a drawn stroke there as 3.29 does (`viewer.rm_anchoring`). The eraser takes the layer's line items and those of every group below it,
 the tablet's anchored strokes included where the page draws them (see "Text-anchored
 stroke groups", Eraser), leaving the text block byte for byte as it was.
 
@@ -1421,13 +1418,72 @@ position as a QPointF (never stored).
   at 1871.2; on empty Title boxes the sentinel-anchored ink starts at y 5.98 / 6.13.
   Not traced: what 3.29 does with an anchor id the text does not hold beyond the warning
   (kept at the text box's top here).
-- **Where a new stroke goes** (0x14096ca70 → 0x140977bf0): items larger than 178.74 (20
-  mm) both ways, or not over text, are type 2; an item over text (0x1409741d0: its box
-  grown by a third of a line, against the text lines' rectangles; for a stroke one of its
-  points must lie in one) is type 1. It joins the overlapping group with the most children
-  (0x140971e20, within the threshold) or a new group anchored at the character under the
-  centre of its box (0x140974950: above the box → before-text sentinel, below → after-text
-  sentinel), and is stored translated by −anchor position (float32 adds, 0x1405b8440).
+- **Where a new stroke goes** [O, read 2026-11-27: 0x14096ca70, 0x140971e20, 0x140977bf0,
+  0x140974950, 0x1409741d0, 0x140a58a30, 0x140a58e00, 0x140a57d70, 0x140a5a1a0, 0x140a5a550,
+  0x140a5a6a0, 0x140a5a370, 0x140a59b90, 0x140b3e5f0]. On a page with typed text every
+  finished stroke goes to `anchorItems(items, layer, mode, noMerge)` (0x14096ca70; one
+  stroke through 0x14096d360; paste and image insertion pass mode 2, 0x140951040):
+  1. **Kind.** mode 0 becomes 2 when an item's bounds are wider **and** taller than
+     178.74015748 (20 mm). Mode 2 → **Vertical** (type 2), distance d = 35.748032
+     (manager+0x18). Otherwise, if any item is **over text** (below) → **Bidirectional**
+     (type 1), d = 0; else Vertical, d = 35.748032.
+  2. **Over text** (0x1409741d0): the item's bounds grown by LH/3 up and down, LH = the
+     body line height kept at text+0x4e8 (text ctor 0x1409247b0: `lineHeight(QTextLine
+     height, 1.0)` of the body block format + max(top margin, bottom margin) = 38 + 7.55 +
+     24 = 69.55 with the app's fonts). The text index at the grown box's top-left
+     (0x140974950, clamped ≥ 0) starts a walk over the visual lines (0x1409243f0), taking
+     each line's rectangle until a line's top is below the grown box's bottom; then each
+     rectangle's bottom is set to the next one's top, the first top −10, the last bottom
+     +10. A stroke is over text when one of its points lies in a rectangle that meets its
+     (ungrown) bounds; any other item when its bounds meet one.
+  3. **What it joins** (0x140971e20, `noMerge` 0 only): (g) every anchored group item on
+     the layer (a group with anchorId 0:0 or type 0 is skipped with "non-anchor group
+     detected") of the **same type**, whose leaves come within min(d, the group's own
+     threshold) of a new item (0x140a587a0 → 0x140a57d70); (i)/(r) the layer's loose items
+     clustered with d (0x140a58e00, groups left out): a cluster within d of a new item
+     (0x140a57cf0) is absorbed (its items join the new ones, "i"); every other cluster (r)
+     is anchored too, each into its own new group [I: the decompiler drops that call's
+     arguments, 0x14096d070].
+  4. **Group** (0x140977bf0): the anchor index is that of the **gravity** of all items
+     (new, absorbed, and the joined groups' leaves): 0x140a58a30, the mean of every point
+     (in scene coordinates) weighted w = max(0.01, (100 − h)/100)², h = how far the point's
+     x lies outside [text left − 50, text right + 50] (0 inside); no points → the text
+     box's centre. 0x140974950: y above the text box → −1 (before-text sentinel), below →
+     length (after-text sentinel), else the hit-tested index (0x14093a750) clamped to
+     length − 1. Position P = the anchor position of that index clamped to 0..length−1.
+     No joined group → **new group** (`createGroup` N, group item N+1, anchorId N+2, type
+     N+3, threshold N+4 (d), originX P.x at N, as `rm_anchor.add_group`). Else the joined
+     group with the **most children** (first on ties) is kept and **re-anchored** to the
+     new index (SetAnchorIdAction below); every other joined group loses its anchor
+     (RemoveAnchorAction), its items are cloned moved by (its position − P) into the kept
+     group and deleted, and it is detached (SceneDeleteGroupActionCrdt). Absorbed loose
+     items are deleted from the layer and added to the group as clones at −P. Last the
+     new items are added at −P. Each add takes the next ids, appended in order; clones
+     keep moveId = the original's moveId, or its id when that is 0:0.
+  5. **SetAnchorIdAction** (vtable 0x140d6c728, redo 0x1409773b0): stamps the new anchorId,
+     computes the new position Q (index clamped to 0..length−1), moves every item of the
+     group **in place** (same ids) by (old position − Q), then sets originX = Q.x with the
+     next id. A re-anchor to the anchorId the group already has does nothing (0x140976450).
+- **Proximity** (all distances in scene pixels, 227 dpi). Items: strokes (all tools; the
+  eraser tools too unless `ANCHORING_EXCLUDE_ERASER` is set, 0x140a5a480), shapes and
+  images; groups are walked to their leaves with their anchor positions added
+  (ItemIterator 0x140a32750). Two items A, B are **within d** (0x140a57d70) when A's bounds
+  grown by (2d, d) meet B's, and for some leaf pair whose grown boxes meet: both small
+  (bounds < 89.37 both ways: a radius r = max(w, h)/(π/2) + t, 0x140a5a1a0) and their
+  centres pass `near`; or (both ≤ 256 points) some point pair passes `near` with the
+  points' tolerances t (0x140a5a550: stroke = 0.25 × (thickness × tool factor + 2),
+  0x140b3e5f0; shape = max(1, pen/2 + 1)), or more than half of one's points lie inside
+  the other's polygon when that polygon is closed (0x140a5a370: length ≥ 10 and
+  end-gap/length < 0.5); or (more than 256 points) a point of the smaller lies in the
+  other's grown box. `near(p, q, rp, rq)` (0x140a5a6a0): dist < 1e−6, or dist < (|dx|/dist
+  + 1) × d + rp + rq. Polygons are the points with long segments split every 44.685 px
+  (5 mm, 0x140a59b90). Tool factors: 0/1 50, 2/15/19/20 2, 3/16 20, 4/7/8/11/17 3, 5/18 30,
+  6/22 10 × thickness, 10/23 10, 12 15, 13 4, 14 18, 21 6, else 1.
+- **Clustering** (0x140a58e00): items sorted by bounds bottom; each joins every cluster
+  whose bounds grown by (2d, d) meet its own and that holds an item within reach (both
+  small: `near` on centres; else 0x140a57d70); several such clusters merge into the first;
+  none → a new cluster. Output in creation order, each cluster's items in their original
+  order.
 - **Eraser** (0x140996ae0): the outline is built once in scene coordinates; the layer's own
   items are searched (0x140996fb0), then every group node below it at any depth, through
   live group items (visitor 0x1408d1670, callback 0x140991f10). In a node whose anchorId is
@@ -1435,21 +1491,31 @@ position as a QPointF (never stored).
   (0x140a63920 takes it as dx, dy); cuts are parametric, so the pieces keep the group's
   local coordinates and are inserted after the erased item in the same group, as on a
   layer. A glyph range goes when more than half of its rectangles' centres are inside.
-  Afterwards, per touched anchored group (0x140979810): what is left is clustered by the
-  threshold, the largest cluster stays, the others are deleted and anchored afresh
-  (clones in scene coordinates, moveId = the old item); a group left empty loses its
-  anchor and is detached by a second SceneTreeMove (new id, node N, is_update 0, parent
-  `0:0`; real pages have these, with the group item still live). The client
-  (`rm_stroke.erase`, `anchors`) does the first part: the layer's items, then each
-  group node below it (`group_nodes`, depth first in sequence order), an anchored node's
-  strokes tested at the anchor position the page draws them at (`renderer.stroke_offsets`,
-  so what is erased is what is seen; a node below an anchored group takes its position),
-  the pieces put after the erased item in the same group, in its own coordinates; all
-  hits deleted first, then the pieces given ids in hit order. The positions are kept in
-  the `StrokeErase` edit (node, x, y) so the edit is made again identically; an anchored
-  group with no position given is left alone. Not done: the clustering and re-anchoring
-  afterwards and the detaching of an emptied group (its tree node, anchor and group item
-  stay byte for byte, the group just holds fewer strokes).
+  Afterwards, per touched anchored group (0x140979810): its items are clustered with d
+  (type 2: 35.748032, type 1: 0); the cluster with the **fewest** items (first on ties)
+  stays; the items of all others are deleted in one action, then each other cluster is
+  cloned into scene coordinates (+ the group's position; moveId as above) and anchored
+  afresh with `noMerge` (a new group each, kind decided as for a new stroke). Then a group
+  with a live item left is re-anchored to the gravity of what it holds (0x140976450 →
+  SetAnchorIdAction when the anchorId changes); an empty one leaves the manager and is
+  detached (SceneDeleteGroupActionCrdt: SceneTreeMove new id, node N, is_update 0, parent
+  `0:0`; real pages have these, with the group item still live).
+- **The client** (`viewer.rm_anchoring`, milestone parity/text-anchoring-h2-m4) does all of
+  the above on pages with a RootText block, for drawn strokes (`rm_stroke.append_strokes`
+  via the anchoring step) and after the eraser (`rm_stroke.erase` → regroup), with the
+  layout's line rectangles and anchor positions from `renderer.layout_text`. Each drawn
+  stroke or erase stays one undo step (`edits.scene_changes`: `AnchorChange` + the
+  stroke changes); replay re-runs the same placement, so a restarted ledger gives the
+  same bytes; undo restores the same scene, not the same bytes (it appends, as every
+  undo here does). Inferred and kept so [I]: the (r) clusters' groups (kind decided as
+  for a new stroke, `noMerge`); the stroke polygon is its points (0x140b3fd90 not read);
+  the line rectangle is the QTextLine's (x, top, width up to text right − 4, height) and
+  the text box (x, y, x + width (0 → 702), last line bottom + 4); item bounds are the
+  stroke's bounding rect; the 256-point limit counts densified points; point-in-polygon
+  is even-odd; RemoveAnchorAction is stamping anchorId `0:0` with the next id; "most
+  children" counts the node's own live items; only strokes take part (images and glyph
+  ranges are left where they are); the measure is Qt's when a QGuiApplication exists,
+  else the estimates.
 
 **Moving, scaling and rotating a selection** [O; the stroke math checked on a real library:
 4,226 cached v6 pages, 31,999 live strokes with a moveId]. There is no transform on nodes; a

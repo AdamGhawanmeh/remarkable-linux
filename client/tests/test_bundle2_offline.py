@@ -44,6 +44,7 @@ from ui.pages import PageContent, render_content  # noqa: E402
 from ui.quick.bridge import pen as pen_bridge  # noqa: E402
 from ui.quick.bridge import scene as scene_bridge  # noqa: E402
 from viewer import renderer  # noqa: E402
+from viewer import rm_anchoring  # noqa: E402
 from viewer import rm_select as sel  # noqa: E402
 from viewer import rm_stroke as s  # noqa: E402
 from viewer import rm_text  # noqa: E402
@@ -261,6 +262,13 @@ class NibTests(unittest.TestCase):
 # ------------------------------------------------------------------ 4. anchored strokes
 
 class AnchoredEraseTests(unittest.TestCase):
+    def setUp(self):
+        # The regroup after an erase lays the text out with the app's fonts when a Qt
+        # application exists; the offsets these tests work from are laid out with estimates.
+        patcher = mock.patch.object(rm_anchoring, "default_measure", lambda: renderer.estimate_width)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def drawn_at(self, data: bytes) -> tuple[float, float]:
         """Where the middle of the anchored stroke is drawn (scene coordinates)."""
         dx, dy = offsets_of(data)[ANCHORED]
@@ -279,18 +287,28 @@ class AnchoredEraseTests(unittest.TestCase):
         self.assertEqual([x.item for x in groups[GROUP]], [(2, 35), (2, 36)])
         self.assertEqual([x.item for x in groups[LAYER]], [LOOSE])
         left, right = [x.line.unpacked() for x in groups[GROUP]]
-        # Still in the group's own coordinates: level at y -10, cut around x 100.
+        # In the group's own coordinates, level at y -10. The group is then re-anchored to the
+        # gravity of what is left (0x140976450: here to a character of "Hello" under the
+        # strokes' middle), its strokes moved in place: so the cut is checked where the
+        # strokes are drawn (the group's anchor position + the stored point), around x 100
+        # from the origin the group had.
         self.assertEqual({p.y for p in left + right}, {-10.0})
-        self.assertLess(left[-1].x, 100.0)
-        self.assertGreater(right[0].x, 100.0)
-        self.assertEqual(left[0].x, 0.0)
-        self.assertEqual(right[-1].x, 200.0)
-        # Put right after the erased stroke in the group's sequence; the anchor, the
-        # group item and the text are kept byte for byte.
+        dx = offsets_of(erased.page)[(2, 35)][0]
+        self.assertLess(left[-1].x + dx, ORIGIN_X + 100.0)
+        self.assertGreater(right[0].x + dx, ORIGIN_X + 100.0)
+        self.assertAlmostEqual(left[0].x + dx, ORIGIN_X, delta=0.01)
+        self.assertAlmostEqual(right[-1].x + dx, ORIGIN_X + 200.0, delta=0.01)
+        # Put right after the erased stroke in the group's sequence; the group item, the
+        # tree moves and the text are kept byte for byte; the node keeps its type and
+        # threshold and is anchored to a character of "Hello" (1:26 .. 1:30).
         order = [i for i, _ in w.sequence(w.split(erased.page)[1], GROUP)]
         self.assertEqual(order, [ANCHORED, (2, 35), (2, 36)])
-        for kind in (w.BLOCK_TREE_NODE, w.BLOCK_TREE_MOVE, w.BLOCK_ROOT_TEXT, w.BLOCK_GROUP_ITEM):
+        for kind in (w.BLOCK_TREE_MOVE, w.BLOCK_ROOT_TEXT, w.BLOCK_GROUP_ITEM):
             self.assertEqual(blocks_of(erased.page, kind), blocks_of(data, kind))
+        was = rm_anchoring.read_anchors(w.split(data)[1])[GROUP]
+        now = rm_anchoring.read_anchors(w.split(erased.page)[1])[GROUP]
+        self.assertEqual((now.kind, now.threshold), (was.kind, was.threshold))
+        self.assertIn(now.char_id, [(1, n) for n in range(26, 31)])
         scene = parse(erased.page)
         self.assertEqual(len([x for x in scene.strokes if x.anchor is not None]), 2)
 
@@ -370,8 +388,12 @@ class AnchoredEraseEditTests(unittest.TestCase):
         files = document_files(doc, self.sync.edits.of(THROWAWAY), lambda name: self.source.blob(doc, name),
                                lambda e: b"", self.sync.author())
         out = files[f"{THROWAWAY}/{PAGE1}.rm"]
-        for kind in (w.BLOCK_TREE_NODE, w.BLOCK_ROOT_TEXT):
-            self.assertEqual(blocks_of(out, kind), blocks_of(data, kind))
+        # The text is untouched; the group keeps its type and threshold (the eraser's regroup
+        # re-anchored it to the gravity of its strokes).
+        self.assertEqual(blocks_of(out, w.BLOCK_ROOT_TEXT), blocks_of(data, w.BLOCK_ROOT_TEXT))
+        was = rm_anchoring.read_anchors(w.split(data)[1])[GROUP]
+        now = rm_anchoring.read_anchors(w.split(out)[1])[GROUP]
+        self.assertEqual((now.kind, now.threshold), (was.kind, was.threshold))
         self.assertEqual(len(parse(out).strokes), 3)
 
 
@@ -561,7 +583,12 @@ class Bundle2QmlTests(unittest.TestCase):
         self.drag(view, [(-200.0 + 10 * n, 1000.0) for n in range(20)])
         self.assertTrue(self.wait_for(lambda: any(x.line.tool == 23 for x in s.strokes(self.page()))), self.notices)
         [shaded] = [x for x in s.strokes(self.page()) if x.line.tool == 23]
-        self.assertEqual((shaded.parent, shaded.line.color, shaded.line.thickness_scale), (LAYER, 1, 2.0))
+        self.assertEqual((shaded.line.color, shaded.line.thickness_scale), (1, 2.0))
+        # The page has typed text: 3.29 anchors every finished stroke, the shader's too, in a
+        # group node anchored to the text, under the layer.
+        blocks = w.split(self.page())[1]
+        self.assertIn(shaded.parent, [n for n, _ in s.group_nodes(blocks, LAYER)])
+        self.assertIn(shaded.parent, s.anchored_nodes(blocks))
         self.assertEqual(self.source.tool_settings(self.source.sync.tree.get(THROWAWAY))["LastTool"], "ShadingMarker")
         self.assertEqual(tq.real_warnings(self.app.warnings), [])
 

@@ -66,7 +66,7 @@ from viewer.rm_parser import Color, Tool
 
 from .edits import (EditError, ImageDelete, ImageInsert, ImageRestore, ImageTransform, ItemsTransform, PageAdd,
                     PageCopy, PageDelete, PageImport, PageMove, PageTemplate, PendingEdits, STROKE_EDITS, StrokePaste, StrokeAdd, StrokeDelete, StrokeErase, StrokeRestore,
-                    TextEdit, ToolSettings, LAYER_EDITS, SceneFlags, AnchoredGroupAdd,
+                    TextEdit, ToolSettings, LAYER_EDITS, SceneFlags, AnchoredGroupAdd, AnchorSet,
                     document_files)
 from .models import (COLLECTION_TYPE, DOCUMENT_TYPE, ROOT_ID, TRASH_ID, Content, Document,
                      UnsupportedFormatError, check_format, DocumentTree, FileType, Metadata, Node, json_bytes, make_node, ms_timestamp,
@@ -525,6 +525,8 @@ def describe_edit(e) -> str:
         _ANCHORED_UIDS.add(e.uid)
         what = {1: "bidirectional", 2: "vertical"}.get(e.anchor_type, str(e.anchor_type))
         return f"  group anchored to the typed text ({what}, origin x {e.origin_x:g}) on page {e.page_id}"
+    if isinstance(e, AnchorSet):
+        return f"  anchored group set on page {e.page_id} (undo/redo of a stroke or an eraser on typed text)"
     if isinstance(e, ItemsTransform):
         m = e.matrix
         what = "move" if rm_select.is_translation(m) else "move/scale/turn"

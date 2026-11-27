@@ -564,13 +564,14 @@ def strokes(page: bytes | None, parent: tuple[int, int] | None = None) -> list[S
 
 
 def has_text(blocks: list[w.Block]) -> bool:
-    """Whether the page has a text box (RootText, 0x07). Strokes are drawn and erased on
-    such a page as on any other: a new one goes on the current layer itself, unanchored;
-    the eraser takes the layer's line items and those of the groups below it, those
-    anchored to the text where the page draws them (erase, `anchors`), and leaves the
-    text as it is. (The app puts strokes drawn on a page with text into anchored
-    groups, which follow the text when it reflows: 472 of 472 strokes on the cached
-    pages with real text, ARCHITECTURE.md 5.1. New ones are not made here.)"""
+    """Whether the page has a text box (RootText, 0x07). A stroke drawn on such a page goes
+    into a group anchored to the text, which follows the text when it reflows (472 of 472
+    strokes on the cached pages with real text, ARCHITECTURE.md 5.1): append_strokes
+    places it as 3.29 does (viewer.rm_anchoring.place: a new group, or one it joins, the
+    loose strokes near it absorbed). The eraser takes the layer's line items and those
+    of the groups below it, those anchored to the text where the page draws them (erase,
+    `anchors`), leaves the text as it is, and regroups each anchored group it touched
+    (rm_anchoring.regroup)."""
     return any(b.type == w.BLOCK_ROOT_TEXT for b in blocks)
 
 
@@ -598,8 +599,15 @@ def _drawable(line: LineValue) -> LineValue:
 def append_strokes(page: bytes | None, *, author: bytes, lines: list[LineValue],
                    layer: tuple[int, int] | None = None) -> tuple[bytes, list[tuple[int, int]]]:
     """(`page` with `lines` drawn on top of `layer` one after the other, the ids they
-    took): append_stroke for several."""
+    took): append_stroke for several. On a page with typed text each stroke is placed
+    as 3.29 places it, into a group anchored to the text (rm_anchoring.place_strokes);
+    on any other page it goes on the layer itself."""
     lines = [_drawable(line) for line in lines]
+    if page is not None and has_text(w.split(page)[1]):
+        from . import rm_anchoring
+        drawn = rm_anchoring.place_strokes(page, author=author, lines=lines, layer=layer)
+        if drawn is not None:
+            return drawn.page, drawn.ids
     header, blocks = w.split(w.blank_page(author) if page is None else page)
     before, original = list(blocks), [b.payload for b in blocks]
     me = w._author_index(blocks, author)
@@ -621,7 +629,8 @@ def append_stroke(page: bytes | None, *, author: bytes, line: LineValue,
     """`page` (None: no .rm yet) with `line` drawn on top of `layer` (default: the
     current layer), as addLine (0x1409578c0) and the layer (0x1408c2bc0) add it: the
     item takes the page's next id, its left neighbour is the layer's last item, its
-    right 0:0. Every other block stays as it is, byte for byte."""
+    right 0:0. Every other block stays as it is, byte for byte (on a page with typed
+    text the stroke is anchored to the text instead: append_strokes)."""
     return append_strokes(page, author=author, lines=[line], layer=layer)[0]
 
 
@@ -1083,11 +1092,14 @@ def erase_line(outline: Outline, line: LineValue, dx: float = 0.0, dy: float = 0
 @dataclass(frozen=True)
 class Erased:
     """A page after an eraser went over it: the strokes it deleted, and for each the
-    ids of the pieces put in its place."""
+    ids of the pieces put in its place. `nodes` and `clones`: the group nodes and the
+    items the regroup of the anchored groups it touched made (rm_anchoring.regroup)."""
 
     page: bytes
     deleted: tuple[tuple[int, int], ...]
     pieces: tuple[tuple[tuple[int, int], ...], ...]
+    nodes: tuple[tuple[int, int], ...] = ()
+    clones: tuple[tuple[int, int], ...] = ()
 
     @property
     def made(self) -> tuple[tuple[int, int], ...]:
@@ -1149,9 +1161,13 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
     to the stroke's points for the cut test only (0x140a63920 takes it as dx, dy), so
     the pieces keep the group's own coordinates. A node below an anchored group takes
     the nearest anchored group's position. An anchored group whose position is not
-    given is left alone (it cannot be told where it is drawn). The group's anchor is
-    not touched; the app's clustering and re-anchoring afterwards (0x140979810) is not
-    done. Untouched when the eraser meets nothing."""
+    given is left alone (it cannot be told where it is drawn).
+
+    Afterwards each anchored group the eraser touched (its position given) is regrouped
+    as the app does (0x140979810, rm_anchoring.regroup): its items clustered, all
+    clusters but the one with the fewest items cloned into groups of their own, the
+    group re-anchored to the gravity of what is left, or detached when it is empty.
+    Untouched when the eraser meets nothing."""
     if eraser.tool not in (ERASER, ERASE_SECTION):
         raise StrokeError(f"tool {eraser.tool} does not erase")
     if eraser.count >= MAX_STORED_POINTS:
@@ -1213,7 +1229,17 @@ def erase(page: bytes, *, author: bytes, eraser: LineValue, layer: tuple[int, in
         made.append(tuple(ids))
     for chain in chains.values():
         blocks = chain.write(blocks)
-    return Erased(w.join(header, blocks), tuple(item.item for item, _, _ in hit), tuple(made))
+    page = w.join(header, blocks)
+    nodes_made: tuple[tuple[int, int], ...] = ()
+    clones_made: tuple[tuple[int, int], ...] = ()
+    touched_parents = {item.parent for item, _, _ in hit}
+    touched = [n for n in nodes[1:] if n in touched_parents and n in anchored and offset.get(n) is not None]
+    if touched and has_text(blocks):
+        from . import rm_anchoring
+        regrouped = rm_anchoring.regroup(page, author=author, layer=layer, nodes=touched)
+        if regrouped is not None:
+            page, nodes_made, clones_made = regrouped.page, tuple(regrouped.nodes), tuple(regrouped.clones)
+    return Erased(page, tuple(item.item for item, _, _ in hit), tuple(made), nodes_made, clones_made)
 
 
 @dataclass(frozen=True)
@@ -1247,8 +1273,8 @@ def clear_layer(page: bytes, *, layer: tuple[int, int] | None = None) -> Cleared
     that kind is a line or a PDF/EPUB text highlight (glyph range, 0x03), and both go;
     strokes stored with version 1 points (which this client cannot put back) are left. The app also detaches
     a group node that is left empty (SceneDeleteGroupActionCrdt, a SceneTreeMove to 0:0)
-    and drops its anchor; the client leaves such a group in place, empty, as its eraser
-    does. Untouched when the layer holds no stroke."""
+    and drops its anchor; the client leaves such a group in place, empty, here (its
+    eraser detaches one, rm_anchoring.regroup). Untouched when the layer holds no stroke."""
     header, blocks = w.split(page)
     layer = _layer(blocks, layer)
     nodes = [layer] + [node for node, _ in group_nodes(blocks, layer)]
