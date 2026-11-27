@@ -829,6 +829,126 @@ Tests: `client/tests/test_outgoing_sync_offline.py`, all over the fake cloud
 - incoming and outgoing together with no edit lost;
 - the QML cell and the entry states.
 
+### 3.8 Missing hashes, check-files and `deletedImmutableAction` (audit M3)
+
+**Root reply** [O, `download-roothash-job.cpp` parseReply 0x1402b2e28]:
+- `hasMissingHashes`: `toBool(false)`.
+- `schemaVersion`: `toInt(-1)`, accepted only in 1..4 ("Unsupported schema version
+  value specified. Ignoring").
+- `disableHTTP2`: read only if present.
+- `maxNetworkJobs`: `toInt(-1)`, used only if > 0, clamped to 64.
+- `deletedImmutableAction`: read only if the key is present. It is a string, compared
+  ASCII case-insensitively (exact length) against the enum table at 0x141011bc0:
+  - 0 `None`
+  - 1 `FailEntry`
+  - 2 `Rollback`
+  - 3 `ReDownload`
+
+  Anything else logs "Unable to parse DeletedImmutableAction from JSON: {}" and leaves
+  the field unset.
+
+**Applying the hints** [O, `onServerRootHashAvailable` 0x140208330]:
+- When the field is set and differs from the stored sync setting, it logs "cloud
+  signalled deletedImmutableAction change: {} -> {}" and the setting is replaced.
+- The settings are saved when anything changed.
+- An absent or unparsable field keeps the previous value.
+- Schema downgrades are ignored. HTTP/2 and maxNetworkJobs are applied likewise.
+
+**Resolve** [O, `resolve-tree.cpp` 0x140240e20]:
+- The sync finishes early ("Root local hash matches server hash… Finishing sync
+  early") only when all of these hold:
+  - the root hashes match;
+  - `hasMissingHashes` is false;
+  - no child needs a schema upload;
+  - no child carries marker 0x8000.
+- Otherwise a full tree sync runs.
+
+**`GET /sync/v3/missing`** (`"/sync/v3/"` 0x140ff6cc0 + `"{}missing"`) [O]:
+- `DownloadMissingHashesJob` makeRequest 0x1402b0460 builds a method-0 request with no
+  body. Method 0 is GET [I from the enum order].
+- parseReply 0x1402b04e0 parses `{"hashes": [...]}` (`parseMissingHashes` 0x1402365b0,
+  key `hashes`):
+  - Each string is parsed as a hash. A bad one logs "Failed to parse missing hash from
+    server: '{}'" and is skipped.
+  - The all-zero hash is dropped.
+  - A JSON parse error fails the job ("JSON parse error {} in download missing
+    hashes").
+
+`RequestMissingHashesAction` [O, 0x1401f8900 / 0x1401fb0e0]:
+- It runs only for a non-empty reply.
+- It walks either one entry or every entry of the tree. For the entry node and then
+  each of its file children whose current hash is in the set, it:
+  - logs " - found missing hash in server entry {}";
+  - sets marker 0x800 on that node, which forces it to be uploaded again.
+- Hashes not matched log " - did not find missing hashes: {}".
+- A failed download logs " - onDownloadMissingHashesFailed: {}" and the action
+  finishes normally (0x1401f9b10). It does not fail the sync.
+
+**Blob download failures** [O, `transfers-and-removal.cpp` 0x140278c60 / 0x140278950]:
+- Download errors 7 and 12 trigger `registerFileForReupload`: "Failure {} triggers
+  forced re-upload for EntryNode {}". Codes 7/12 most likely include the server's
+  not-found [I].
+- The download is converted to an upload ("File {} queued from download to force
+  upload") only when all of these hold:
+  - the entry still exists;
+  - the file is present locally;
+  - its local hash is not empty;
+  - its previous hash matches the file on disk.
+- Otherwise it logs "No suitable local equivalent for file {} exists" and the download
+  fails as before.
+
+**`POST /sync/v3/check-files`** [O, `CheckMissingFilesJob` makeRequest 0x1402aef10]:
+- Method 2 (POST [I]). The JSON body is:
+  - `files`: the hashes as 64-char hex strings;
+  - `filename`: the entry's name, or `"root"` when the entry id is empty;
+  - `reason`: one of `ReasonForRequest` {0 `Other`, 1 `Logout`, 2 `Archive`}, table
+    0x141018b88.
+- The reply's `missingFiles` array is the answer ("JSON parse error {} in check missing
+  files").
+- The caller and what 3.29 does with the answer were not traced [I]. The client
+  implements the request as a helper only and does not call it in sync.
+
+**`deletedImmutableAction`** [O, `build-local-tree.cpp` checkFileIntegrity 0x14025eef0]:
+- The immutable files are an entry's `{id}.pdf` and `{id}.epub` (UTF-16 suffixes at
+  0x141015830 / 0x141015840).
+- The action applies when such a file is known to the local tree but missing on disk,
+  and the entry does not carry marker 0x200. The event (`SyncReport` kind 7) is
+  reported, then the stored action decides what happens:
+  - **None (0):** nothing more.
+  - **FailEntry (1):** " - failing entry since file {} is missing". checkFileIntegrity
+    returns the error "Missing file:{}", so the entry fails.
+  - **Rollback (2):** " - rollback entry due to missing file:{}". Marker 0x100
+    (rollback) is set: the entry is skipped and rolled back to the previous tree.
+  - **ReDownload (3):** " - force download of missing file:{}". Marker 0x2000 (force
+    download) is set, so the file is fetched again.
+- A *changed* (not deleted) immutable file logs "Local immutable file changed:{}" and is
+  reported as kind 6; the policy does not apply to it.
+- The default before any cloud hint was not traced; the client uses None [I].
+
+**The client** (`client/src/core/sync.py`):
+- `RootInfo` keeps `has_missing_hashes` and `deleted_immutable_action`.
+- The action, when present, is stored in `state.json` under
+  `root.deleted_immutable_action`; an absent or bad value keeps the old one.
+- A refresh whose root has `hasMissingHashes`:
+  - asks `/sync/v3/missing`;
+  - uploads again each listed blob it holds (blob cache, or a downloaded copy whose
+    SHA-256 matches), under the `rm-filename` of the index entry that names it;
+  - logs the rest.
+
+  A failed or unreadable `missing` reply is logged and the sync goes on. A failed upload
+  fails the sync, as any upload does.
+- A blob GET that answers 404 is uploaded from a matching local copy when there is one,
+  instead of failing.
+- For a downloaded document whose `{id}.pdf` / `{id}.epub` is gone from its local copy:
+  - None keeps today's behaviour (the copy shows as locally changed);
+  - ReDownload restores the missing file from the blob;
+  - Rollback re-materialises the whole document from the server's version;
+  - FailEntry records the error "Missing file:<name>" for that document, without
+    stopping the rest of the refresh.
+- The client has no early-finish path, so `hasMissingHashes` has nothing to skip there.
+
+Tests: `client/tests/test_missing_hashes_offline.py`, all over the fake cloud.
+
 ## 4. LiveView / Screen Share
 
 Stack [O]: `screenshare/core` (`broker`, `roombroker`, `restbroker`, `reconnector`,

@@ -60,6 +60,9 @@ def index_rows(data: bytes) -> list[list[str]]:
     return [ln.split(":") for ln in lines[1:] if len(ln.split(":")) == 5]
 
 
+ABSENT = object()      # FakeCloud.deleted_immutable_action: the key is left out of the root reply
+
+
 class FakeCloud:
     def __init__(self, schema: int = 4) -> None:
         self.schema = schema
@@ -85,6 +88,14 @@ class FakeCloud:
         self.handwriting_requests: list[dict] = []
         self.handwriting_text = "hello world"
         self.handwriting = None
+        # Missing hashes (ARCHITECTURE.md 3.8): a list makes the root reply say
+        # hasMissingHashes and GET /sync/v3/missing answer it; `missing_reply` is a raw body
+        # override. `deleted_immutable_action` goes into the root reply verbatim unless ABSENT.
+        self.missing_hashes: list | None = None
+        self.missing_reply: bytes | None = None
+        self.deleted_immutable_action: object = ABSENT
+        self.check_files_missing: list[str] = []
+        self.check_files_requests: list[dict] = []     # POST /sync/v3/check-files bodies (JSON)
 
     # -- content ------------------------------------------------------------
 
@@ -153,6 +164,13 @@ class FakeCloud:
             return HttpResponse(401, {}, b"")
         if method == "POST" and path == "/convert/v1/handwriting":
             return self._handwriting(headers, body)
+        if method == "POST" and path == "/sync/v3/check-files":
+            self.check_files_requests.append(json.loads(body or b"{}"))
+            return HttpResponse(200, {}, json.dumps({"missingFiles": self.check_files_missing}).encode())
+        if method == "GET" and path == "/sync/v3/missing":
+            if self.missing_reply is not None:
+                return HttpResponse(200, {}, self.missing_reply)
+            return HttpResponse(200, {}, json.dumps({"hashes": self.missing_hashes or []}).encode())
         if method == "PUT":
             return self._put(path, headers, body)
         if path == "/sync/v4/root":
@@ -267,6 +285,10 @@ class FakeCloud:
             return HttpResponse(404, {}, b"sync/root-not-found")
         payload = {"hash": self.root_hash, "generation": self.generation,
                    "schemaVersion": self.schema, **self.root_extra}
+        if self.missing_hashes is not None:
+            payload["hasMissingHashes"] = True
+        if self.deleted_immutable_action is not ABSENT:
+            payload["deletedImmutableAction"] = self.deleted_immutable_action
         return HttpResponse(200, {}, json.dumps(payload).encode())
 
     def blob_requests(self) -> list[str]:

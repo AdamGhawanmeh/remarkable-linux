@@ -79,6 +79,13 @@ ROOT_V3_PATH = "/sync/v3/root"
 FILES_PATH = "/sync/v3/files/"
 FILENAME_HEADER = "rm-filename"
 ROOT_INDEX_NAME = "root.docSchema"
+MISSING_PATH = "/sync/v3/missing"
+CHECK_FILES_PATH = "/sync/v3/check-files"
+# 3.29's DeletedImmutableAction enum (table 0x141011bc0), index = its value; and the
+# ReasonForRequest enum (table 0x141018b88) of the check-files request.
+DELETED_IMMUTABLE_ACTIONS = ("None", "FailEntry", "Rollback", "ReDownload")
+REQUEST_REASONS = ("Other", "Logout", "Archive")
+IMMUTABLE_SUFFIXES = (".pdf", ".epub")
 
 ROOT_ENTRY_TYPE = "80000000"   # root index rows, documents and folders alike
 FILE_ENTRY_TYPE = "0"          # document index rows
@@ -158,6 +165,7 @@ class SyncStatus(str, Enum):
     SYNCED = "synced"                   # local copy matches the remote version
     OUTDATED = "outdated"               # remote changed since the local copy
     LOCAL_MODIFIED = "local_modified"   # local files edited since download
+    ENTRY_FAILED = "entry-failed"       # an immutable file went missing and the cloud's action fails the entry
     REMOVED_REMOTE = "removed_remote"   # gone from the cloud, still cached locally
 
 
@@ -171,6 +179,41 @@ def sha256_hex(data: bytes) -> str:
 
 # ------------------------------------------------------------------- root/index
 
+def parse_deleted_immutable_action(value: Any) -> str | None:
+    """A root reply's deletedImmutableAction as its canonical name: a string equal to
+    one of DELETED_IMMUTABLE_ACTIONS, ASCII case-insensitively (as 3.29 compares it);
+    anything else is logged and None."""
+    if isinstance(value, str) and value.isascii():
+        for name in DELETED_IMMUTABLE_ACTIONS:
+            if len(value) == len(name) and value.lower() == name.lower():
+                return name
+    log.warning("Unable to parse DeletedImmutableAction from JSON: %r", value)
+    return None
+
+
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def parse_missing_hashes(body: bytes) -> set[str]:
+    """The hashes of a GET /sync/v3/missing reply ({"hashes": [...]}), lowercase. Items
+    that are not 64-character hex strings are logged and skipped; the all-zero hash is
+    dropped (parseMissingHashes, 3.29)."""
+    try:
+        raw = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        raise SyncError(f"JSON parse error {err} in download missing hashes") from err
+    if not isinstance(raw, dict) or not isinstance(raw.get("hashes"), list):
+        raise SyncError("JSON parse error: no \"hashes\" array in download missing hashes")
+    out: set[str] = set()
+    for item in raw["hashes"]:
+        if not isinstance(item, str) or len(item) != 64 or not set(item) <= _HEX:
+            log.warning("Failed to parse missing hash from server: %r", item)
+            continue
+        if item.strip("0"):
+            out.add(item.lower())
+    return out
+
+
 @dataclass
 class RootInfo:
     hash: str
@@ -178,6 +221,7 @@ class RootInfo:
     schema_version: int = 3
     has_missing_hashes: bool = False
     max_network_jobs: int | None = None
+    deleted_immutable_action: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -203,12 +247,15 @@ class RootInfo:
         if refusal:
             raise UnsupportedProtocolError(refusal)
         jobs = raw.get("maxNetworkJobs")
+        action = parse_deleted_immutable_action(raw["deletedImmutableAction"]) \
+            if "deletedImmutableAction" in raw else None
         return cls(
             hash=root_hash,
             generation=generation,
             schema_version=int(raw.get("schemaVersion") or 3),
             has_missing_hashes=bool(raw.get("hasMissingHashes", False)),
             max_network_jobs=int(jobs) if isinstance(jobs, int) and jobs > 0 else None,
+            deleted_immutable_action=action,
             raw=raw,
         )
 
@@ -749,6 +796,8 @@ class SyncClient:
         self.throttled = False                # the cloud answered 429 during this refresh
         self.edits = PendingEdits(self.root_dir / "pending")    # made here, not uploaded yet
         self.tree_complete = False            # the tree was refreshed with every entry loaded
+        self.last_missing_hashes: dict[str, list[str]] | None = None   # last refresh's reupload outcome
+        self.entry_failures: dict[str, str] = {}     # doc id -> why its entry failed (immutable file missing)
 
     # -- transport ------------------------------------------------------------
 
@@ -819,7 +868,13 @@ class SyncClient:
             raise NotCachedError(f"{filename} ({blob_hash[:12]}) is not cached")
         resp = self._get(FILES_PATH + blob_hash, {FILENAME_HEADER: filename})
         if resp.status == 404:
-            raise SyncError(f"blob {blob_hash} not found on server")
+            local = None if index else self._local_equivalent(blob_hash)
+            if local is None:
+                raise SyncError(f"blob {blob_hash} not found on server")
+            # 3.29 converts the failed download into an upload when a local file matches.
+            log.info("Failure 404 triggers forced re-upload for %s", filename)
+            self.upload_blob(blob_hash, filename, local)
+            return local
         data = resp.body
         if index:
             if not index_hash_matches(data, blob_hash):
@@ -829,6 +884,26 @@ class SyncClient:
             raise IntegrityError(f"blob {blob_hash} failed integrity check")
         self.blobs.put(blob_hash, data)
         return data
+
+    def _local_file_bytes(self, doc_id: str, name: str, blob_hash: str) -> bytes | None:
+        """The downloaded copy's file `name` of a document if its sha256 is `blob_hash`."""
+        try:
+            data = (self.local_dir(doc_id) / self._safe_relpath(name)).read_bytes()
+        except (OSError, SyncError):
+            return None
+        return data if sha256_hex(data) == blob_hash else None
+
+    def _local_equivalent(self, blob_hash: str) -> bytes | None:
+        """Bytes of a downloaded document file that was downloaded as `blob_hash` and
+        still hashes to it, else None."""
+        with self._lock:
+            candidates = [(doc_id, name) for doc_id, rec in self.state["docs"].items()
+                          for name, h in (rec.get("files") or {}).items() if h == blob_hash]
+        for doc_id, name in candidates:
+            data = self._local_file_bytes(doc_id, name, blob_hash)
+            if data is not None:
+                return data
+        return None
 
     def get_index(self, blob_hash: str, filename: str, cached_only: bool = False) -> Index:
         return parse_index(self.get_blob(blob_hash, filename, index=True, cached_only=cached_only))
@@ -899,7 +974,141 @@ class SyncClient:
         429 (it is retried)."""
         with self._busy:
             self.throttled = False
-            return self._apply_root(self.fetch_root(), progress)
+            tree = self._apply_root(self.fetch_root(), progress)
+            self.last_missing_hashes = None
+            if self.root is not None and self.root.has_missing_hashes:
+                self._handle_missing_hashes()
+            self.check_immutable_files()
+            return tree
+
+    # -- missing hashes, check-files, deleted immutable files (ARCHITECTURE.md 3.8) --
+
+    def fetch_missing_hashes(self) -> set[str]:
+        """GET /sync/v3/missing: the hashes the cloud says it lacks."""
+        return parse_missing_hashes(self._request("GET", MISSING_PATH, accept=(200,)).body)
+
+    def _handle_missing_hashes(self) -> None:
+        try:
+            hashes = self.fetch_missing_hashes()
+        except SyncError as err:           # NetworkError too: the sync goes on (3.29 as well)
+            log.warning(" - onDownloadMissingHashesFailed: %s", err)
+            return
+        if not hashes:
+            return
+        reuploaded, not_found = self.reupload_missing(hashes)
+        self.last_missing_hashes = {"reuploaded": sorted(reuploaded), "not_found": sorted(not_found)}
+
+    def reupload_missing(self, hashes: Iterable[str]) -> tuple[set[str], set[str]]:
+        """Upload again the blobs of the current tree whose hash is in `hashes`, from the
+        blob cache or a matching downloaded file. Returns (reuploaded, not found); upload
+        errors propagate."""
+        wanted = {h.lower() for h in hashes}
+        names: dict[str, tuple[str, str | None]] = {}      # hash -> (rm-filename, document id)
+
+        def note(blob_hash: str, name: str, doc_id: str | None) -> None:
+            if blob_hash in wanted and blob_hash not in names:
+                names[blob_hash] = (name, doc_id)
+
+        if self.root is not None and self.root.hash:
+            note(self.root.hash, ROOT_INDEX_NAME, None)
+        for entry in self.root_index.entries if self.root_index else []:
+            index_name = f"{entry.id}.docSchema"
+            note(entry.hash, index_name, None)
+            try:
+                doc_index = self.get_index(entry.hash, index_name, cached_only=True)
+            except SyncError:              # NotCachedError, or an unreadable index
+                continue
+            for item in doc_index.entries:
+                note(item.hash, item.id, entry.id)
+        reuploaded: set[str] = set()
+        not_found: set[str] = set()
+        for blob_hash in sorted(wanted):
+            name, doc_id = names.get(blob_hash, ("", None))
+            data = self.blobs.get(blob_hash) if name else None
+            if data is None and name and doc_id is not None:
+                data = self._local_file_bytes(doc_id, name, blob_hash)
+            if data is None:
+                not_found.add(blob_hash)
+                continue
+            self.upload_blob(blob_hash, name, data)
+            reuploaded.add(blob_hash)
+        if not_found:
+            log.info(" - did not find missing hashes: %s", ", ".join(sorted(not_found)))
+        return reuploaded, not_found
+
+    def check_files(self, hashes: Iterable[str], filename: str = "", reason: str = "Other") -> list[str]:
+        """POST /sync/v3/check-files: which of `hashes` the cloud does not have."""
+        if reason not in REQUEST_REASONS:
+            raise ValueError(f"reason must be one of {REQUEST_REASONS}, not {reason!r}")
+        body = json.dumps({"files": list(hashes), "filename": filename or "root", "reason": reason}).encode()
+        resp = self._request("POST", CHECK_FILES_PATH, headers={"Content-Type": "application/json"},
+                             body=body, accept=(200,))
+        try:
+            raw = json.loads(resp.body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            raise SyncError(f"JSON parse error {err} in check missing files") from err
+        if not isinstance(raw, dict):
+            raise SyncError("JSON parse error: reply is not an object in check missing files")
+        missing = raw.get("missingFiles", [])
+        if not isinstance(missing, list):
+            raise SyncError("JSON parse error: \"missingFiles\" is not an array in check missing files")
+        return [h for h in missing if isinstance(h, str)]
+
+    def deleted_immutable_action(self) -> str:
+        """The action the cloud last signalled for immutable files gone from disk."""
+        stored = (self.state.get("root") or {}).get("deleted_immutable_action")
+        return stored if stored in DELETED_IMMUTABLE_ACTIONS else "None"
+
+    def check_immutable_files(self) -> dict[str, str]:
+        """Apply the stored deletedImmutableAction to downloaded documents whose
+        <id>.pdf / <id>.epub is missing on disk (checkFileIntegrity, 3.29). Returns the
+        entries that failed, {doc id: error}; also kept in `entry_failures`, which
+        status() reports. Nothing here raises."""
+        failures: dict[str, str] = {}
+        action = self.deleted_immutable_action()
+        if action != "None":
+            with self._lock:
+                docs = [(doc_id, dict(rec.get("files") or {})) for doc_id, rec in self.state["docs"].items()
+                        if rec.get("downloaded_hash")]
+            for doc_id, files in docs:
+                base = self.local_dir(doc_id)
+                if not files or not base.is_dir():
+                    continue
+                for name in (f"{doc_id}{suffix}" for suffix in IMMUTABLE_SUFFIXES):
+                    if name not in files or (base / name).exists():
+                        continue
+                    try:
+                        error = self._immutable_missing(doc_id, name, files[name], action)
+                    except (SyncError, OSError, ValueError) as err:
+                        log.warning("could not restore missing file %s: %s", name, err)
+                        error = f"{name}: {err}"
+                    if error:
+                        failures[doc_id] = error
+        self.entry_failures = failures
+        return dict(failures)
+
+    def _immutable_missing(self, doc_id: str, name: str, blob_hash: str, action: str) -> str:
+        """One missing immutable file under `action`; the entry's error, or ""."""
+        if action == "FailEntry":
+            log.info(" - failing entry since file %s is missing", name)
+            return f"Missing file:{name}"
+        if action == "ReDownload":
+            log.info(" - force download of missing file:%s", name)
+            data = self.get_blob(blob_hash, name)
+            path = self.local_dir(doc_id) / self._safe_relpath(name)
+            fd, tmp = tempfile.mkstemp(prefix=".restore.", dir=path.parent)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                os.replace(tmp, path)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+        elif action == "Rollback":
+            log.info(" - rollback entry due to missing file:%s", name)
+            if isinstance(self.tree.get(doc_id), Document):
+                self.download_document(doc_id)
+        return ""
 
     def forget(self) -> None:
         """Delete the cached library (blobs, materialised documents, sync state), as logging
@@ -964,8 +1173,17 @@ class SyncClient:
                     rec.setdefault("removed_at", now)
                 else:
                     del docs[doc_id]
+            previous = (self.state.get("root") or {}).get("deleted_immutable_action")
+            action = previous
+            if root.deleted_immutable_action is not None:
+                action = root.deleted_immutable_action
+                if action != previous:
+                    log.info("cloud signalled deletedImmutableAction change: %s -> %s",
+                             previous or "None", action)
             self.state["root"] = {"hash": root.hash, "generation": root.generation,
                                   "schema_version": root.schema_version, "fetched_at": now}
+            if action is not None:
+                self.state["root"]["deleted_immutable_action"] = action
             self.state["last_sync_at"] = now
             self._save_state()
         log.info("tree refreshed: %d items (%d failed)", len(nodes), len(failures))
@@ -1022,6 +1240,7 @@ class SyncClient:
             rec.update(downloaded_hash=doc.hash, downloaded_at=_now(self._clock),
                        files=dict(doc.files))
             rec.pop("removed_at", None)
+            self.entry_failures.pop(doc_id, None)
             self._save_state()
         log.info("downloaded %s (%d files) to %s", doc.name, len(blobs), target)
         return target
@@ -1533,6 +1752,8 @@ class SyncClient:
             return SyncStatus.NOT_DOWNLOADED
         if rec.get("removed_at"):
             return SyncStatus.REMOVED_REMOTE
+        if doc_id in self.entry_failures:
+            return SyncStatus.ENTRY_FAILED
         if self.local_changes(doc_id):
             return SyncStatus.LOCAL_MODIFIED
         if rec["downloaded_hash"] != rec.get("hash"):
