@@ -31,7 +31,7 @@ from viewer.rm_parser import (  # noqa: E402
     RmParseError, RootText, Stroke, StyleEntry, TextItem, Tool, block_name, decode_root_text, parse, parse_file,
     parse_header, text_block, text_order)
 from viewer.renderer import (  # noqa: E402
-    LINE_PX, PALETTE_ARGB, estimate_width, image_matrix, image_size, layout_text, render_bounds, render_image,
+    PALETTE_ARGB, estimate_width, image_matrix, image_size, layout_text, render_bounds, render_image,
     render_svg, stroke_offsets, stroke_runs, stroke_style)
 
 # Fonts need an application; a QApplication (not just QGuiApplication) so the UI tests
@@ -638,15 +638,24 @@ class AnchorTests(unittest.TestCase):
         hello_baseline = next(l.baseline for l in lines if l.paragraph == 1)
         self.assertEqual(offsets[id(nested)], (-464.0, hello_baseline))
         self.assertNotIn(id(free), offsets)
-        self.assertAlmostEqual(hello_baseline - next(l.baseline for l in lines if l.paragraph == 0), LINE_PX)
+        # 3.29's body pitch (ARCHITECTURE.md 5.1): top margin 24 + line 38 + 0.2 x 37.75 in 1/64 px.
+        self.assertAlmostEqual(hello_baseline - next(l.baseline for l in lines if l.paragraph == 0), 69.546875)
         runs = stroke_runs(sc, nested, offsets[id(nested)])
         self.assertEqual(runs[0].points[0], (702 - 464 + 10, hello_baseline - 5))
 
-    def test_sentinel_or_unknown_anchor_sits_at_text_top(self):
-        for char in ((0, ANCHOR_SENTINEL_START), (9, 9)):
+    def test_sentinel_anchors_sit_on_the_first_or_last_line(self):
+        # 0x14097c4f0: the before-text sentinel is index -1, the after-text one the
+        # text's length, both clamped to a character: the first line's baseline
+        # (234 + margin 4 + ascent 29.59375) and the last one's (+ the body pitch).
+        for char, y in (((0, ANCHOR_SENTINEL_START), 267.59375), ((0, ANCHOR_SENTINEL_START + 1), 337.140625)):
             sc = parse(anchored_page(anchor_char=char))
             nested = sc.layers[0].strokes[0]
-            self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(nested)], (-464.0, 234.0))
+            self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(nested)], (-464.0, y))
+
+    def test_unknown_anchor_sits_at_text_top(self):
+        sc = parse(anchored_page(anchor_char=(9, 9)))
+        nested = sc.layers[0].strokes[0]
+        self.assertEqual(stroke_offsets(sc, layout_text(sc))[id(nested)], (-464.0, 234.0))
 
     def test_anchor_without_text_has_no_vertical_offset(self):
         data = v6_file(tree_node(GROUP, "", True, anchor=((1, 7), 100.0)), group_item(LAYER, (1, 2), GROUP),
@@ -658,7 +667,7 @@ class AnchorTests(unittest.TestCase):
         many = "\n" * 40 + "bottom line"
         data = v6_file(root_text([text_item((1, 1), ZERO, text=many)], []))
         x, y, w, h = render_bounds(parse(data))
-        self.assertGreater(y + h, 234 + 40 * LINE_PX)           # page grew to fit the text
+        self.assertGreater(y + h, 234 + 40 * 69.546875)         # page grew to fit the text
         svg = ET.fromstring(render_svg(parse(data)))
         self.assertGreater(float(svg.get("height")), 1872)
 
@@ -716,8 +725,9 @@ class RendererTests(unittest.TestCase):
     def test_bounds(self):
         self.assertEqual(render_bounds(self.scene), (0, 0, 1404, 1872))
         x, y, w, h = render_bounds(self.scene, "content", margin=10)
-        # ink spans x 602..1002; the typed text starts at x 234 (-468 + 702)
-        self.assertEqual((x, y, w, h), (224, 40, 788, 470))
+        # ink spans x 602..1002; the typed text starts at x 238 (-468 + 702 + the
+        # QTextDocument's margin 4)
+        self.assertEqual((x, y, w, h), (228, 40, 784, 470))
         off_page = PageScene(version=5, layers=[])
         off_page.layers.append(type(self.scene.layers[0])(strokes=[
             self.stroke(Tool.FINELINER, points=[Point(-50, 2500, width=1)])]))
@@ -798,7 +808,7 @@ class RendererTests(unittest.TestCase):
         self.assertGreater(len(lines), 3)                        # first paragraph wrapped
         self.assertTrue(all(estimate_width(t, f) <= 300 for line in lines[:-2] for t, f in line.pieces))
         self.assertEqual((lines[-2].marker, lines[-1].marker), ("1.", "☑"))
-        self.assertEqual(lines[0].x, 234)                        # centred x -468 + 702
+        self.assertEqual(lines[0].x, 238)                        # centred x -468 + 702, margin 4
         baselines = [line.baseline for line in lines]
         self.assertEqual(baselines, sorted(baselines))
 
@@ -812,14 +822,16 @@ class RendererTests(unittest.TestCase):
                          [[("boldword", True)], [("w" * 30, False)]])
 
     def test_list_markers(self):
-        cases = {4: "•", 5: "•", 6: "☐", 8: "☐", 9: "☑", 10: "1.", 11: "1.", 2: "", 1: "", 0: ""}
+        # An indented bullet is "◦" and an indented numbered item lettered (0x14093c348,
+        # 0x14093c49e).
+        cases = {4: "•", 5: "◦", 6: "☐", 8: "☐", 9: "☑", 10: "1.", 11: "a.", 2: "", 1: "", 0: ""}
         for style, marker in cases.items():
             scene = parse(v6_file(root_text([text_item((1, 1), ZERO, text="x")],
                                             [paragraph_format(ZERO, style)])))
             self.assertEqual(layout_text(scene)[0].marker, marker, style)
         indented = parse(v6_file(root_text([text_item((1, 1), ZERO, text="x")],
                                            [paragraph_format(ZERO, 5)])))
-        self.assertEqual(layout_text(indented)[0].x, 234 + 96)
+        self.assertEqual(layout_text(indented)[0].x, 238 + 96)
 
     def test_text_in_svg_and_image(self):
         scene = parse(v6_file(sample_text_block()))
@@ -830,7 +842,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("TiXtle", spans)
         self.assertIn("•", [t.text for t in texts])
         bold = [ts for t in texts for ts in t.findall(f"{ns}tspan") if ts.text == "Hel"]
-        self.assertEqual(bold[0].get("font-weight"), "bold")
+        self.assertEqual(bold[0].get("font-weight"), "700")
         self.assertIn("reMarkable Sans", bold[0].get("font-family"))
 
         img = render_image(scene, scale=0.5)

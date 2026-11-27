@@ -243,7 +243,7 @@ def anchor_offsets(scene) -> dict:
     if scene is None or not any(s.anchor is not None for s in scene.strokes):
         return {}
     from viewer.renderer import layout_text, stroke_offsets
-    by_object = stroke_offsets(scene, layout_text(scene, qt_measure))
+    by_object = stroke_offsets(scene, layout_text(scene, qt_measure), qt_measure)
     return {tuple(s.item_id): by_object[id(s)] for s in scene.strokes
             if s.item_id is not None and id(s) in by_object}
 
@@ -2494,7 +2494,7 @@ class _SceneView:
         offsets = None
         if scene is not None and any(s.anchor is not None for s in scene.strokes):
             from viewer.renderer import layout_text, stroke_offsets
-            offsets = stroke_offsets(scene, layout_text(scene, qt_measure))
+            offsets = stroke_offsets(scene, layout_text(scene, qt_measure), qt_measure)
         items = selecting.selectable(scene, layer, offsets)
         self._picked = (content, layer, items)
         return items

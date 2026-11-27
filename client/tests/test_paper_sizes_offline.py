@@ -223,8 +223,9 @@ class PaperDrawingTests(unittest.TestCase):
                                  change=lambda text, clock: text.insert(0, "Wide", clock))
         lines = layout_text(rm_parser.parse(page), qt_measure)
         # A new text box is 936 wide at scene x -468 whatever the paper (createRootDocument
-        # 0x1408a55f0 uses a fixed 1404 x 1872): page x 810 - 468.
-        self.assertAlmostEqual(lines[0].x, 810 - 468, delta=1)
+        # 0x1408a55f0 uses a fixed 1404 x 1872): page x 810 - 468, its text 4 further in
+        # (the QTextDocument's margin, ARCHITECTURE.md 5.1).
+        self.assertAlmostEqual(lines[0].x, 810 - 468 + 4, delta=1)
 
 
 class PaperLibraryTests(unittest.TestCase):

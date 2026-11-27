@@ -407,6 +407,10 @@ class TextBlock:
     # anchors refer to these. A newline belongs to the paragraph it ends.
     char_paragraph: dict[tuple[int, int], int] = field(default_factory=dict)
     root: RootText | None = field(default=None, repr=False, compare=False)    # as stored
+    # Every character id -> its index in `text` (UTF-16 units, a newline counted), what
+    # an anchor resolves to (ARCHITECTURE.md 5.1); a deleted character or a format
+    # marker takes the index of the character that follows it.
+    char_index: dict[tuple[int, int], int] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def text(self) -> str:
@@ -1062,10 +1066,16 @@ def text_block(root: RootText, authors: dict[int, bytes] | None = None) -> TextB
     markers = {FORMAT_BOLD_START: ("bold", 1), FORMAT_BOLD_END: ("bold", -1),
                FORMAT_ITALIC_START: ("italic", 1), FORMAT_ITALIC_END: ("italic", -1),
                FORMAT_LINK_START: ("link", 1), FORMAT_LINK_END: ("link", -1)}
+    char_index: dict[tuple[int, int], int] = {}
+    at = 0
     for c in text_order(root.items, authors):
         char_paragraph[c.id] = len(paragraphs) - 1
+        char_index[c.id] = at
         if c.char is not None and ord(c.char) > 0xFFFF:
             char_paragraph[(c.id[0], c.id[1] + 1)] = len(paragraphs) - 1    # its second unit
+            char_index[(c.id[0], c.id[1] + 1)] = at + 1
+        if c.char is not None and c.fmt is None:
+            at += 2 if ord(c.char) > 0xFFFF else 1
         if c.fmt is not None:
             if c.fmt in markers:
                 name, step = markers[c.fmt]
@@ -1079,7 +1089,7 @@ def text_block(root: RootText, authors: dict[int, bytes] | None = None) -> TextB
             else:
                 spans.append(TextSpan(c.char, **on))
     return TextBlock(x=root.x, y=root.y, width=root.text_width, paragraphs=paragraphs,
-                     char_paragraph=char_paragraph, root=root)
+                     char_paragraph=char_paragraph, root=root, char_index=char_index)
 
 
 def _decode_root_text(payload: bytes, authors: dict[int, bytes] | None = None) -> TextBlock:

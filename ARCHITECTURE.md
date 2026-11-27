@@ -1373,9 +1373,49 @@ position as a QPointF (never stored).
   widths 936 and 1152); on empty Title boxes at y 234 the anchored strokes' stored y starts
   at −291…−294, which is the page top (3…6) only with the baseline 234 + 4 + 59.19, and a
   page holding both kinds ends at 1869 (anchored) and 1871 (layer strokes).
-  **Deviation to fix in the client**: `renderer.stroke_offsets` uses the box top for
-  sentinel anchors (63 px too high on such pages) and the paragraph's first line for the
-  others; the 71.5 line height of §5.2 is a fit, not the app's 69.55.
+  **Format details** [O, 0x140a3c480 / 0x140a3c280 / 0x140a3bfd0 / 0x140a3d380, read
+  2026-11-27]: the top margins are the body font's pixel size (32) × 0.75 / 2.75 / 1.75 /
+  1.25 (constants 0x140d70ab8, ac8, ac0, 0x14102b738); the 0.2 × height line distance
+  (0x140d70ab0, LineHeight 0x1048 type 4) is set on the body block format only, and the
+  list styles' block formats are copies of it; Title, Subheading and Subheading2 set only
+  top margin and heading level (1, 2, 3), so their lines have no extra distance; the image
+  block format is the body one with a fixed line distance 20 (0x140c8d5c8). The font
+  function sets PreferNoHinting, family "reMarkable Sans" or "reMarkable Serif Small"
+  (0x140d70a88/a98), and strike-out for a checked checkbox. A list paragraph gets
+  BlockIndent = its indent level + 1 (0x1408b64d0), i.e. text at 48 or 96. The tab stop
+  distance is the indent width. textWidth = the box width (0x140942c90; a zero width
+  lays out at 1404 × 0.5 = 702; one view mode, not pages, uses another width at +0x508),
+  so the `(boxWidth − textWidth)/2` term above is 0 on pages. Qt itself drops the first
+  block's top margin; a line is ceil(ascent + descent) high (38, 76, 55, 43), the line
+  distance kept in 1/64 px (7.546875).
+  **List markers** [O, the text's paint 0x14093bb80], drawn from the block's rectangle
+  (x = text x + 4, y = the first line's top) at level × 48 in, with the paragraph font's
+  integer QFontMetrics::ascent as baseline: bullets "•" / "◦" / "-" by level (static
+  QStrings 0x1412592d8 / a8 / 90) with the glyph's left at +20; a checkbox is the
+  resource `:/images/checkbox_unchecked.svg` or `checkbox_checked.svg` (renderers at
+  text+0x678 / 0x688; 0x698 indeterminate) rendered into (x, y − 2, 40, 40); a number is
+  QTextBlock::userState formatted by level mod 3 (decimal, letters A–Z base 26, roman
+  0x140941a10), lower-cased, + ".", right-aligned so it ends at +30 (its integer
+  boundingRect width). How userState is numbered is not traced [I: consecutive items per
+  level].
+- **The client** (`viewer.renderer`, H1 of the 2026-11-27 audit, fixed): `layout_text(scene,
+  qt_measure)` builds this QTextDocument (`_qt_blocks`: margin 4, indent 48, tab stop 48,
+  the formats above, PreferNoHinting fonts via `_qfont`) and reads every QTextLine back
+  (x, top, ascent, height, text range); with another measure (headless SVG) the same rules
+  run on estimated widths (`_estimated_blocks`; the fonts' vertical metrics are taken as
+  proportional to the pixel size, which they are for these fonts), so baselines agree
+  with Qt's to < 0.01 px. The app's fonts are registered from `client/src/assets/fonts`
+  by `renderer.ensure_fonts` wherever Qt is used (Quick app, widgets, offscreen tests).
+  `stroke_offsets` resolves each anchor with `anchor_index` (TextBlock.char_index: every
+  character id, deleted ones and format markers included, → its text index; sentinels −1
+  / length; clamped) and `anchor_point`: the baseline of the visual line holding the
+  character, x = anchorOriginX (type 2) or the character's x (type 1). Pasting at the
+  cursor (`textedit.anchor_under`), the eraser and moving/scaling/rotating anchored
+  groups all take their anchor positions from it. Checked on the cached library: on a
+  page holding both kinds the sentinel-anchored ink now ends at 1869.6 and the layer ink
+  at 1871.2; on empty Title boxes the sentinel-anchored ink starts at y 5.98 / 6.13.
+  Not traced: what 3.29 does with an anchor id the text does not hold beyond the warning
+  (kept at the text box's top here).
 - **Where a new stroke goes** (0x14096ca70 → 0x140977bf0): items larger than 178.74 (20
   mm) both ways, or not over text, are type 2; an item over text (0x1409741d0: its box
   grown by a third of a line, against the text lines' rectangles; for a stroke one of its
@@ -1546,9 +1586,8 @@ moved stroke is a new item.
   page parses, every other block except the authors list is byte for byte the same, moveId,
   timestamp, speed, direction and pressure as above. **Deviations**: (1) strokes of a
   text-anchored group are transformed in their own group with the conjugated transform, but
-  the group is not re-anchored afterwards (0x140975b10 not traced), and the anchor position
-  comes from `renderer.stroke_offsets` (exact for moves; for scales and turns off by the
-  known error of that offset); (2) a lasso takes an image when all four corners are inside;
+  the group is not re-anchored afterwards (0x140975b10 not traced); the anchor position
+  comes from `renderer.stroke_offsets` (3.29's layout, §5.1); (2) a lasso takes an image when all four corners are inside;
   (3) a paste adds its strokes before its images instead of in clipboard order; (4) Shift-
   toggling while a move is pending commits the move first, then toggles on the new items.
 
@@ -1677,10 +1716,10 @@ outside the stroke rasteriser (`renderPencil`/`renderMarker…` at 0x140b37d00+)
 nothing ties them to highlighters, so highlighters render at full opacity
 (`HIGHLIGHTER_OPACITY` in renderer.py).
 
-**Text line metrics** [fitted]: body line height 71.5 px. Real anchored groups all carry
-threshold 35.75 (= 71.5 / 2), consistent with the ~71 px other tools measured; with it,
-anchored handwriting on a real page (100 groups, 437 strokes) lays out as clean,
-non-overlapping lines. Not found as a constant in the binary.
+**Text line metrics** [O, §5.1]: no longer fitted. The client lays typed text out in
+3.29's QTextDocument (body pitch 69.546875, Title/Subheading/Subheading2 as decoded); the
+old 71.5 px line and scaled bold headings are gone. The anchors' threshold 35.748032 is
+4 mm at 227 dpi (manager+0x18), not half a line.
 
 **PDF placement** [verified on real files]: a PDF page is drawn at physical size on the
 226 DPI screen grid, i.e. **226/72 page px per PDF point**, centred on the page's vertical
@@ -3029,8 +3068,9 @@ group, `("edit", uid)`) are kept as **one** undo step (the text's steps and the 
 `StrokeChange`; undo takes the strokes, then the styles, then the lines). The text
 session is read again afterwards (the group and strokes took ids it did not know). The
 strokes then reflow with the text (`renderer.stroke_offsets`). Deviations: the number of
-new lines uses the app's body line (69.546875, §5.1) but positions come from this
-client's layout (71.5 per body line), so the room is slightly taller here; the pasted
+new lines uses the app's body line (69.546875, §5.1) and positions come from the same
+QTextDocument layout, the anchor's y being the baseline of the line the room's centre is
+on (2026-11-27; before, the paragraph's first line and a 71.5 px line); the pasted
 strokes always make one new group (no clustering, no joining a group they overlap);
 images are placed in the room but not anchored (this client draws no anchored images);
 undo leaves the emptied group node (as the eraser does). `AnchoredGroupAdd` replay makes

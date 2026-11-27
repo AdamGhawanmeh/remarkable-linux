@@ -56,7 +56,7 @@ from PySide6.QtCore import QModelIndex, QRectF
 
 from ui.pdftext import MIN_BOX_PT, pdf_frame, selection_boxes, to_scene
 from ui.pdftext import solid as _solid
-from viewer.renderer import BASELINE_AT, caret_x, layout_text, qt_measure
+from viewer.renderer import caret_x, layout_text, qt_measure
 from viewer.rm_parser import PageScene
 
 log = logging.getLogger("rm.ui.docsearch")
@@ -195,7 +195,7 @@ def text_hits(scene: PageScene | None, term: str, measure=qt_measure) -> list[li
             a, b = max(start, line.start), min(end, line.end)
             if a >= b:
                 continue
-            top = line.baseline - line.height * BASELINE_AT
+            top = line.top
             x0 = caret_x(line, a, measure) - origin
             x1 = caret_x(line, b, measure) - origin
             if x1 <= x0:

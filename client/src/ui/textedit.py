@@ -55,7 +55,7 @@ from typing import Callable
 from core.edits import (BODY_TEXT, CharRef, Replay, StyleChange, TextChange, TextEdit, TextPart,
                         apply_text_edit)
 from viewer import rm_text, rm_writer as w
-from viewer.renderer import BASELINE_AT, LINE_SEPARATOR, TextLine, caret_x, index_at, layout_text, line_of
+from viewer.renderer import LINE_SEPARATOR, TextLine, caret_x, index_at, index_point, layout_text, line_of
 from viewer.rm_parser import (FORMAT_BOLD_START, FORMAT_ITALIC_START, STYLE_LIST, STYLE_TEXT, PageScene,
                               ParagraphStyle, StyleEntry, _style_from_legacy, text_block)
 
@@ -262,10 +262,10 @@ class TextSession:
         index = self.cursor if index is None else index
         if not lines:
             root = self.text.root
-            return Caret(root.x, root.y, 71.5, 0, True)
+            return Caret(root.x, root.y, 38.0, 0, True)     # a body line (renderer.BODY)
         n = line_of(lines, index)
         line = lines[n]
-        top = line.baseline - line.height * BASELINE_AT
+        top = line.top
         return Caret(caret_x(line, index, self.measure) - self.origin, top, line.height, n, line.start == line.end)
 
     def selection(self) -> tuple[int, int]:
@@ -282,7 +282,7 @@ class TextSession:
             a, b = max(start, line.start), min(end, line.end)
             if a >= b and not (line.start == line.end and start <= line.start < end):
                 continue
-            top = line.baseline - line.height * BASELINE_AT
+            top = line.top
             x0 = caret_x(line, a, self.measure) - self.origin
             x1 = caret_x(line, b, self.measure) - self.origin
             out.append((x0, top, max(x1 - x0, 6.0), line.height))
@@ -296,8 +296,7 @@ class TextSession:
             return c.x, c.top, self.text.root.text_width, c.height
         para = lines[line_of(lines, self.cursor)].paragraph
         mine = [l for l in lines if l.paragraph == para]
-        top = mine[0].baseline - mine[0].height * BASELINE_AT
-        bottom = mine[-1].baseline + mine[-1].height * (1 - BASELINE_AT)
+        top, bottom = mine[0].top, mine[-1].bottom
         return self.text.root.x, top, self.text.root.text_width, bottom - top
 
     def index_at(self, x: float, y: float) -> int:
@@ -903,8 +902,7 @@ def _block_rect(session: "TextSession", index: int) -> tuple[float, float] | Non
         return None
     para = lines[line_of(lines, index)].paragraph
     mine = [line for line in lines if line.paragraph == para]
-    return (mine[0].baseline - mine[0].height * BASELINE_AT,
-            mine[-1].baseline + mine[-1].height * (1 - BASELINE_AT))
+    return mine[0].top, mine[-1].bottom
 
 
 def make_room(session: "TextSession", needed: float, pitch: float = APP_BODY_PITCH) -> Room:
@@ -966,22 +964,22 @@ def anchor_under(session: "TextSession", x: float, y: float) -> tuple[CharRef, f
     """(the character to anchor to, anchorOriginX, the anchor's y) for items whose box is
     centred on scene (x, y), as a new type 2 group is anchored (0x140974950: the
     character under the centre; above the text box the before-text sentinel, below it
-    the after-text one, 0x140972ed0 / 0x140972cf0). x is that character's x on its line
-    (stored as anchorOriginX); y the baseline the page draws the group's strokes from
-    (renderer.stroke_offsets: the first line of the paragraph holding the character)."""
+    the after-text one, 0x140972ed0 / 0x140972cf0). Both come from the anchor position
+    3.29 computes (0x14097c4f0, renderer.anchor_point): x of the character on its line
+    (stored as anchorOriginX), y the baseline of the visual line holding it; a sentinel
+    takes the text's first (before) or last (after) character."""
     from viewer.rm_anchor import AFTER_TEXT, BEFORE_TEXT
     lines = session.lines()
     root = session.text.root
-    if not lines or session.text.length == 0:
-        return ("page", *BEFORE_TEXT), float(root.x), float(root.y)
-    top = lines[0].baseline - lines[0].height * BASELINE_AT
-    bottom = lines[-1].baseline + lines[-1].height * (1 - BASELINE_AT)
-    if y < top:
-        return ("page", *BEFORE_TEXT), session.caret(0).x, float(root.y)
-    if y > bottom:
-        return ("page", *AFTER_TEXT), session.caret(session.text.length).x, float(root.y)
-    index = min(session.index_at(x, y), session.text.length - 1)
-    char = session.text.id_at(index)
-    para = lines[line_of(lines, index)].paragraph
-    first = next(line for line in lines if line.paragraph == para)
-    return session.ref(char), session.caret(index).x, first.baseline
+    length = session.text.length
+    if not lines:
+        return ("page", *BEFORE_TEXT), float(root.x) + 4.0, float(root.y)
+    if length == 0 or y < lines[0].top:
+        char, index = ("page", *BEFORE_TEXT), 0
+    elif y > lines[-1].bottom:
+        char, index = ("page", *AFTER_TEXT), length - 1
+    else:
+        index = min(session.index_at(x, y), length - 1)
+        char = session.ref(session.text.id_at(index))
+    ax, ay = index_point(session.shown_scene(), lines, max(index, 0), session.measure)
+    return char, ax, ay

@@ -9,10 +9,11 @@ Fidelity (ARCHITECTURE.md §5.2):
     has no Multiply mode, sets QPainter::CompositionMode_Darken in its paint
     paths, and its highlighter colours are fully opaque. Darken over white gives
     the exact colour and leaves darker ink underneath untouched.
-  * Approximations: pencil/brush textures (the app rasterises those itself),
-    shader opacity, and typed-text font sizes (held in C++ enums, not recoverable
-    statically). The app's own fonts are reMarkable Sans / Serif Small; those are
-    used if installed, otherwise Noto Sans / sans-serif.
+  * Typed text is laid out as 3.29 lays it out, in a QTextDocument with the app's
+    block and character formats (layout_text with qt_measure); the app's fonts,
+    reMarkable Sans / Serif Small, are registered from the assets (ensure_fonts),
+    otherwise Noto Sans / Serif stand in. Approximations: pencil/brush textures (the
+    app rasterises those itself) and shader opacity.
 
 Stroke widths come from each point's recorded width, so pressure-sensitive tools
 taper naturally. Eraser strokes (legacy files) take away the ink drawn before them and
@@ -69,7 +70,7 @@ HIGHLIGHTER_OPACITY = 1.0
 FALLBACK_WIDTH = {"highlighter": 30.0, "shader": 30.0, "marker": 6.0, "paintbrush": 6.0}
 
 TEXT_COLOR = "#000000"
-FONT_FAMILIES = ("reMarkable Sans", "Noto Sans", "sans-serif")
+FONT_FAMILIES = ("reMarkable Sans", "Noto Sans", "sans-serif")   # UI text elsewhere
 
 
 def argb_to_hex(argb: int) -> str:
@@ -182,48 +183,104 @@ def stroke_runs(scene: PageScene, stroke: Stroke,
 
 
 # ----------------------------------------------------------------- typed text
+#
+# 3.29 lays typed text out with a QTextDocument (ARCHITECTURE.md 5.1, text ctor
+# 0x1409247b0, formats 0x140a3c480, fonts 0x140a3c280): document margin 4, indent width
+# 48 (also the tab stop), fonts with PreferNoHinting. The block formats take their top
+# margins from the body font's pixel size (32) times 0.75 / 2.75 / 1.75 / 1.25; only
+# body text (and the list styles, copies of it) adds a line distance of 0.2 x the font's
+# height after each line; an image block adds 20. Qt drops the first block's top margin.
+# With the app's fonts the body pitch is 69.546875 and the first baseline pos_y + 4 +
+# 29.59375. layout_text(scene, qt_measure) builds that QTextDocument; with any other
+# measure (headless SVG) the same rules run on estimated widths.
+
+SANS = "reMarkable Sans"
+SERIF = "reMarkable Serif Small"
+FALLBACK_FAMILIES = {SANS: ("Noto Sans", "sans-serif"), SERIF: ("Noto Serif", "serif")}
+
+DOCUMENT_MARGIN = 4.0
+INDENT = 48.0
+BODY_PX = 32
+LINE_DISTANCE = 0.2          # x the font's height (0x140d70ab0), LineDistanceHeight
+IMAGE_LINE_DISTANCE = 20.0   # the image block's line distance (0x140c8d5c8)
+NO_WIDTH = 702.0             # a box of width 0 lays out at half the 1404 page (0x140942d16)
+
 
 @dataclass(frozen=True)
 class TextFont:
     size: float          # pixels on the 1404 × 1872 page
     bold: bool = False
     italic: bool = False
+    family: str = SANS
+    weight: int = 400    # the style's weight; a bold span draws at 700
+    strike: bool = False  # a checked checkbox's text (0x140a3c3e1)
 
 
-# Approximate sizes: the real values live in C++ (crdt::TextProperties::FontSize).
-# Body line height: fitted, not decoded. Anchored groups in real files carry
-# threshold 35.75 (half of 71.5), matching the ~71 px measured by other tools.
-LINE_PX = 71.5
-_BODY = 34.0
-STYLE_FONTS: dict[ParagraphStyle, tuple[float, bool]] = {
-    ParagraphStyle.TITLE: (2.0, True),
-    ParagraphStyle.SUBHEADING: (1.4, True),
-    ParagraphStyle.SUBHEADING_2: (1.15, True),
+@dataclass(frozen=True)
+class BlockStyle:
+    family: str
+    size: int
+    weight: int
+    top: float                       # top margin
+    line_distance: float | None      # None: none; else x the font height (body) ...
+    fixed_distance: float = 0.0      # ... or a fixed distance (image block)
+
+
+BODY = BlockStyle(SANS, BODY_PX, 400, 0.75 * BODY_PX, LINE_DISTANCE)
+BLOCK_STYLES: dict[ParagraphStyle, BlockStyle] = {
+    ParagraphStyle.TITLE: BlockStyle(SERIF, 64, 300, 2.75 * BODY_PX, None),
+    ParagraphStyle.SUBHEADING: BlockStyle(SERIF, 46, 400, 1.75 * BODY_PX, None),
+    ParagraphStyle.SUBHEADING_2: BlockStyle(SANS, 36, 500, 1.25 * BODY_PX, None),
+    ParagraphStyle.IMAGE_BLOCK: BlockStyle(SANS, BODY_PX, 400, 0.75 * BODY_PX, None, IMAGE_LINE_DISTANCE),
 }
-BASELINE_AT = 0.75     # baseline position within a line box (fraction of its height)
+
 # The line break Shift+Enter types (SceneController::keyAction 0x140443380, action
 # LineBreak: the keystroke path with QString(QChar(0x2028))): a character of the
 # paragraph's text, stored like any other, that ends the line but not the paragraph.
-LINE_SEPARATOR = "\u2028"
-INDENT = 48.0
+LINE_SEPARATOR = " "
+
+# List markers, drawn by the text's paint (0x14093bb80) in the paragraph's indent; a
+# list paragraph's text is indented by (level + 1) x 48 (0x140a3d3df, 0x1408b64d0).
+BULLETS = ("•", "◦", "-")                 # by level (static QStrings 0x1412592d8/a8/90)
+BULLET_X = 20.0                           # glyph left: block x + level x 48 + 20
+NUMBER_RIGHT = 30.0                       # number + "." ends at block x + level x 48 + 30
+CHECKBOX_SIZE, CHECKBOX_RAISE = 40.0, 2.0  # its SVG drawn in (block x + level x 48, top - 2, 40, 40)
+CHECKBOX_MARKERS = ("☐", "☑")
+
+_LIST_KINDS = {
+    ParagraphStyle.BULLETPOINT: ("bullet", 0), ParagraphStyle.BULLETPOINT_INDENTED: ("bullet", 1),
+    ParagraphStyle.CHECKBOX_UNCHECKED: ("unchecked", 0), ParagraphStyle.CHECKBOX_UNCHECKED_INDENTED: ("unchecked", 1),
+    ParagraphStyle.CHECKBOX_CHECKED: ("checked", 0), ParagraphStyle.CHECKBOX_CHECKED_INDENTED: ("checked", 1),
+    ParagraphStyle.NUMBERED_LIST: ("number", 0), ParagraphStyle.NUMBERED_LIST_INDENTED: ("number", 1),
+}
 
 
-def _prefix(style: ParagraphStyle, number: int) -> tuple[str, float]:
-    """Marker drawn before a list paragraph, and the paragraph's indent."""
-    indented = style in (ParagraphStyle.BULLETPOINT_INDENTED,
-                         ParagraphStyle.CHECKBOX_UNCHECKED_INDENTED,
-                         ParagraphStyle.CHECKBOX_CHECKED_INDENTED,
-                         ParagraphStyle.NUMBERED_LIST_INDENTED)
-    indent = INDENT * (2 if indented else 1)
-    if style in (ParagraphStyle.BULLETPOINT, ParagraphStyle.BULLETPOINT_INDENTED):
-        return "•", indent
-    if style in (ParagraphStyle.CHECKBOX_UNCHECKED, ParagraphStyle.CHECKBOX_UNCHECKED_INDENTED):
-        return "☐", indent
-    if style in (ParagraphStyle.CHECKBOX_CHECKED, ParagraphStyle.CHECKBOX_CHECKED_INDENTED):
-        return "☑", indent
-    if style in (ParagraphStyle.NUMBERED_LIST, ParagraphStyle.NUMBERED_LIST_INDENTED):
-        return f"{number}.", indent
-    return "", 0.0
+def block_style(style: ParagraphStyle) -> BlockStyle:
+    return BLOCK_STYLES.get(style, BODY)
+
+
+def paragraph_font(style: ParagraphStyle) -> TextFont:
+    """The paragraph's own font (0x140a3c280), before bold and italic spans."""
+    bs = block_style(style)
+    return TextFont(bs.size, family=bs.family, weight=bs.weight,
+                    strike=_LIST_KINDS.get(style, ("", 0))[0] == "checked")
+
+
+def _list_level(style: ParagraphStyle) -> int | None:
+    kind = _LIST_KINDS.get(style)
+    return None if kind is None else kind[1]
+
+
+def _number_label(number: int, level: int) -> str:
+    """The numbered list's label by level (0x14093c49e): decimal, then lower-case
+    letters (A..Z, base 26, lowered); a third level would be roman (not reachable)."""
+    if level % 3 == 1:
+        out, n = "", number
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            out = chr(0x61 + r) + out
+        return out + "."
+    return f"{number}."
 
 
 @dataclass(frozen=True)
@@ -231,7 +288,7 @@ class TextLine:
     x: float                                  # page coordinates of the baseline start
     baseline: float
     pieces: tuple[tuple[str, TextFont], ...]  # consecutive runs of text on the line
-    marker: str = ""                          # list marker drawn left of x
+    marker: str = ""                          # list marker (first line of a list paragraph)
     marker_font: TextFont | None = None
     paragraph: int = 0
     # Where the line is in the text (TextBlock.text, counted in UTF-16 units): its first
@@ -242,6 +299,18 @@ class TextLine:
     end: int = 0
     height: float = 0.0
     segments: tuple[tuple[int, str, TextFont], ...] = ()
+    ascent: float = 0.0                       # baseline - top of the line
+    # Where the marker is drawn: a text marker's baseline start, or a checkbox's box
+    # (x, y, width, height); page coordinates.
+    marker_at: tuple[float, ...] = ()
+
+    @property
+    def top(self) -> float:
+        return self.baseline - self.ascent
+
+    @property
+    def bottom(self) -> float:
+        return self.top + self.height
 
 
 def _units(text: str) -> int:
@@ -254,84 +323,291 @@ Measure = Callable[[str, TextFont], float]
 
 def estimate_width(text: str, font: TextFont) -> float:
     """Font-free width estimate for headless SVG layout."""
-    return len(text) * font.size * (0.58 if font.bold else 0.53)
+    return len(text) * font.size * (0.58 if font.bold or font.weight >= 600 else 0.53)
+
+
+# The app's fonts' vertical metrics are proportional to the pixel size (reMarkable Sans
+# 32: ascent 29.59375, height 37.75; Serif Small 64: 59.1875, 75.5); used without Qt.
+ASCENT_PER_PX = 29.59375 / 32
+HEIGHT_PER_PX = 37.75 / 32
+
+
+def _fixed(value: float) -> float:
+    """A length as Qt's layout keeps it (QFixed, 1/64 px)."""
+    return round(value * 64) / 64
+
+
+def estimate_metrics(font: TextFont) -> tuple[float, float, int]:
+    """(ascent, height, integer ascent) of a font without Qt."""
+    ascent, height = font.size * ASCENT_PER_PX, font.size * HEIGHT_PER_PX
+    return ascent, height, round(ascent)
+
+
+def qt_metrics(font: TextFont) -> tuple[float, float, int]:
+    from PySide6.QtGui import QFontMetrics, QFontMetricsF
+    qf = _qfont(font)
+    m = QFontMetricsF(qf)
+    return m.ascent(), m.height(), QFontMetrics(qf).ascent()
+
+
+def _spans(para, base: int) -> list[tuple[int, str, TextFont]]:
+    """(text index, text, font) of each span of a paragraph."""
+    own = paragraph_font(para.style)
+    out, at = [], base
+    for span in para.spans:
+        if span.text:
+            out.append((at, span.text, TextFont(own.size, span.bold, span.italic, own.family, own.weight,
+                                                own.strike)))
+            at += _units(span.text)
+    return out
+
+
+def _slice(spans, start: int, end: int) -> list[tuple[int, str, TextFont]]:
+    """The parts of `spans` between text indexes start and end."""
+    out = []
+    for at, text, font in spans:
+        n = _units(text)
+        a, b = max(start, at), min(end, at + n)
+        if a >= b:
+            continue
+        raw = text.encode("utf-16-le", "surrogatepass")[2 * (a - at):2 * (b - at)]
+        out.append((a, raw.decode("utf-16-le", "surrogatepass"), font))
+    return out
+
+
+def _line(x: float, baseline: float, ascent: float, height: float, para_index: int,
+          spans, start: int, end: int) -> TextLine:
+    segments = []
+    for at, text, font in _slice(spans, start, end):
+        cut = text.find(LINE_SEPARATOR)
+        if cut >= 0:
+            text = text[:cut]
+        if text:
+            segments.append((at, text, font))
+    pieces = _merge([(t, f) for _, t, f in segments])
+    while pieces and not pieces[-1][0].strip():
+        pieces.pop()
+    if pieces:
+        pieces[-1] = (pieces[-1][0].rstrip(" "), pieces[-1][1])
+    return TextLine(x, baseline, tuple(pieces), paragraph=para_index, start=start, end=end,
+                    height=height, segments=tuple(segments), ascent=ascent)
+
+
+@dataclass
+class _Block:
+    """One laid-out paragraph: its rectangle (blockBoundingRect, page coordinates) and lines."""
+    x: float
+    y: float
+    lines: list
 
 
 def layout_text(scene: PageScene, measure: Measure = estimate_width) -> list[TextLine]:
-    """Greedy word-wrap of the scene's typed text into positioned lines."""
+    """The scene's typed text as positioned lines, laid out as 3.29 lays it out: with
+    qt_measure in a QTextDocument configured as the app's, otherwise by the same rules
+    on `measure`'s widths. Lines are in page coordinates."""
     block: TextBlock | None = scene.text
     if block is None:
         return []
     left, _ = scene.to_page(block.x, block.y)
-    y = block.y
-    lines: list[TextLine] = []
-    number = 0
-    base = 0                                    # text index of the paragraph's first character
-    for index, para in enumerate(block.paragraphs):
-        scale, heading_bold = STYLE_FONTS.get(para.style, (1.0, False))
-        size = _BODY * scale
-        line_h = LINE_PX * scale
-        number = number + 1 if para.style in (ParagraphStyle.NUMBERED_LIST,
-                                              ParagraphStyle.NUMBERED_LIST_INDENTED) else 0
-        marker, indent = _prefix(para.style, number)
-        x0, max_w = left + indent, max(block.width - indent, size)
-        words: list[tuple[str, TextFont, int]] = []
-        at = base
-        for span in para.spans:
-            font = TextFont(size, span.bold or heading_bold, span.italic)
-            for i, part in enumerate(span.text.split(" ")):
+    if getattr(measure, "qt_document", False):
+        blocks, metrics = _qt_blocks(block, left), qt_metrics
+    else:
+        blocks, metrics = _estimated_blocks(block, left, measure), estimate_metrics
+    return _with_markers(block, blocks, metrics, measure)
+
+
+def _bases(block: TextBlock) -> list[int]:
+    out, at = [], 0
+    for para in block.paragraphs:
+        out.append(at)
+        at += _units(para.text) + 1
+    return out
+
+
+def _estimated_blocks(block: TextBlock, left: float, measure: Measure) -> list[_Block]:
+    """QTextDocument's block layout, word-wrapped on `measure` (no Qt needed)."""
+    width = (block.width or NO_WIDTH) - 2 * DOCUMENT_MARGIN
+    y = block.y + DOCUMENT_MARGIN
+    out = []
+    for index, (para, base) in enumerate(zip(block.paragraphs, _bases(block))):
+        bs = block_style(para.style)
+        own = paragraph_font(para.style)
+        ascent, height, _ = estimate_metrics(own)
+        line_h = float(math.ceil(height))
+        gap = (_fixed(bs.line_distance * height) if bs.line_distance is not None else bs.fixed_distance)
+        if index:
+            y += bs.top
+        level = _list_level(para.style)
+        indent = INDENT * (level + 1) if level is not None else 0.0
+        x0, max_w = left + DOCUMENT_MARGIN + indent, max(width - indent, own.size)
+        spans = _spans(para, base)
+        words: list[tuple[int, str, TextFont]] = []
+        for at, text, font in spans:
+            for i, part in enumerate(text.split(" ")):
                 if i:
-                    words.append((" ", font, at))
+                    words.append((at, " ", font))
                     at += 1
                 for j, piece in enumerate(part.split(LINE_SEPARATOR)):
                     if j:
-                        words.append((LINE_SEPARATOR, font, at))
+                        words.append((at, LINE_SEPARATOR, font))
                         at += 1
                     if piece:
-                        words.append((piece, font, at))
+                        words.append((at, piece, font))
                         at += _units(piece)
         end = base + _units(para.text)
-        current: list[tuple[str, TextFont, int]] = []
-        width = 0.0
-        first = True
-        start = base
-
-        def flush(next_start: int):
-            nonlocal current, width, first, y, start
-            y += line_h
-            pieces = _merge([(t, f) for t, f, _ in current])
-            while pieces and not pieces[-1][0].strip():
-                pieces.pop()
-            if pieces:
-                pieces[-1] = (pieces[-1][0].rstrip(" "), pieces[-1][1])
-            lines.append(TextLine(x0, y - line_h * (1 - BASELINE_AT), tuple(pieces),
-                                  marker if first else "",
-                                  TextFont(size, heading_bold) if first and marker else None,
-                                  index, start, next_start, line_h,
-                                  tuple((i, t, f) for t, f, i in current)))
-            current, width, first, start = [], 0.0, False, next_start
-
-        for text, font, i in words:
+        breaks, used, start, started = [], 0.0, base, False
+        for at, text, font in words:
             if text == LINE_SEPARATOR:
-                # A line break typed with Shift+Enter: the line ends here, the
-                # paragraph goes on (QTextDocument's QChar::LineSeparator).
-                flush(i + 1)
+                breaks.append((start, at + 1))
+                start, used, started = at + 1, 0.0, False
                 continue
             w = measure(text, font)
-            if text != " " and current and width + w > max_w:
-                flush(i)
-            if text == " " and not current:
-                if start == i:
-                    start = i + 1                   # a space a line does not start with
+            if text != " " and started and used + w > max_w:
+                breaks.append((start, at))
+                start, used, started = at, 0.0, False
+            if text == " " and not started:
+                if start == at:
+                    start = at + 1            # a space a line does not start with
                 continue
-            current.append((text, font, i))
-            width += w
-        flush(end)
-        base = end + 1
-    return lines
+            started = True
+            used += w
+        breaks.append((start, end))
+        lines = []
+        top = y
+        for n, (a, b) in enumerate(breaks):
+            nxt = breaks[n + 1][0] if n + 1 < len(breaks) else end
+            lines.append(_line(x0, y + ascent, ascent, line_h, index, spans, a, nxt))
+            y += line_h + gap
+        out.append(_Block(left + DOCUMENT_MARGIN, top, lines))
+    return out
 
 
-CHECKBOX_MARKERS = ("☐", "☑")
+_fonts_loaded = False
+
+
+def ensure_fonts() -> None:
+    """Register the app's fonts (client/src/assets/fonts) with Qt once, so that layout
+    and painting use reMarkable Sans / Serif Small in the Quick app, the widgets and
+    offscreen test runs alike. Needs a QGuiApplication; does nothing without one."""
+    global _fonts_loaded
+    if _fonts_loaded:
+        return
+    from pathlib import Path
+    from PySide6.QtGui import QFontDatabase, QGuiApplication
+    if QGuiApplication.instance() is None:
+        return
+    _fonts_loaded = True
+    have = set(QFontDatabase.families())
+    if SANS in have and SERIF in have:
+        return
+    for path in sorted((Path(__file__).resolve().parents[1] / "assets" / "fonts").glob("reMarkable*.ttf")):
+        QFontDatabase.addApplicationFont(str(path))
+
+
+def _qt_blocks(block: TextBlock, left: float) -> list[_Block]:
+    """The text in a QTextDocument set up as 3.29 sets up its text (0x1409247b0,
+    0x140a3c480, 0x140a3d380), read back line by line."""
+    from PySide6.QtGui import QTextBlockFormat, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
+    ensure_fonts()
+    doc = QTextDocument()
+    doc.setDocumentMargin(DOCUMENT_MARGIN)
+    doc.setIndentWidth(INDENT)
+    option = doc.defaultTextOption()
+    option.setTabStopDistance(doc.indentWidth())
+    doc.setDefaultTextOption(option)
+    doc.setTextWidth(block.width or NO_WIDTH)
+    cursor = QTextCursor(doc)
+    bases = _bases(block)
+    span_lists = []
+    for index, (para, base) in enumerate(zip(block.paragraphs, bases)):
+        bs = block_style(para.style)
+        own = paragraph_font(para.style)
+        fmt = QTextBlockFormat()
+        fmt.setTopMargin(bs.top)
+        if bs.line_distance is not None:
+            fmt.setLineHeight(bs.line_distance * qt_metrics(own)[1], 4)       # LineDistanceHeight
+        elif bs.fixed_distance:
+            fmt.setLineHeight(bs.fixed_distance, 4)
+        level = _list_level(para.style)
+        if level is not None:
+            fmt.setProperty(QTextFormat.Property.BlockIndent, level + 1)
+        chars = QTextCharFormat()
+        chars.setFont(_qfont(own))
+        if index == 0:
+            cursor.setBlockFormat(fmt)
+            cursor.setBlockCharFormat(chars)
+        else:
+            cursor.insertBlock(fmt, chars)
+        spans = _spans(para, base)
+        span_lists.append(spans)
+        for _, text, font in spans:
+            run = QTextCharFormat()
+            run.setFont(_qfont(font))
+            cursor.insertText(text, run)
+    layout = doc.documentLayout()
+    out = []
+    qb = doc.begin()
+    index = 0
+    while qb.isValid() and index < len(block.paragraphs):
+        rect = layout.blockBoundingRect(qb)
+        tl = qb.layout()
+        base = bases[index]
+        end = base + _units(block.paragraphs[index].text)
+        lines = []
+        count = tl.lineCount()
+        for k in range(count):
+            ln = tl.lineAt(k)
+            a = base + ln.textStart()
+            b = base + tl.lineAt(k + 1).textStart() if k + 1 < count else end
+            lines.append(_line(left + rect.x() + ln.x(), block.y + rect.y() + ln.y() + ln.ascent(), ln.ascent(),
+                               ln.height(), index, span_lists[index], a, b))
+        out.append(_Block(left + rect.x(), block.y + rect.y(), lines))
+        qb = qb.next()
+        index += 1
+    return out
+
+
+def _with_markers(block: TextBlock, blocks: list[_Block], metrics, measure: Measure) -> list[TextLine]:
+    """The lines, each list paragraph's first line with its marker placed as the text's
+    paint places it (0x14093bb80): from the block's rectangle (x, y), level x 48 in."""
+    from dataclasses import replace
+    out: list[TextLine] = []
+    numbers = [0, 0]
+    for index, (para, laid) in enumerate(zip(block.paragraphs, blocks)):
+        kind = _LIST_KINDS.get(para.style)
+        # userState (the number) is not traced; counted per level over consecutive items.
+        if kind is None or kind[0] != "number":
+            numbers = [0, 0]
+        elif kind[1] == 0:
+            numbers = [numbers[0] + 1, 0]
+        else:
+            numbers[1] += 1
+        lines = laid.lines
+        if kind is not None and lines:
+            what, level = kind
+            font = paragraph_font(para.style)
+            indent = level * INDENT
+            _, _, int_ascent = metrics(font)
+            if what == "bullet":
+                marker = BULLETS[level]
+                at = (laid.x + indent + BULLET_X, laid.y + int_ascent)
+            elif what == "number":
+                marker = _number_label(numbers[level], level)
+                at = (laid.x + indent + NUMBER_RIGHT - _ink_width(marker, font, measure), laid.y + int_ascent)
+            else:
+                marker = CHECKBOX_MARKERS[what == "checked"]
+                at = (laid.x + indent, laid.y - CHECKBOX_RAISE, CHECKBOX_SIZE, CHECKBOX_SIZE)
+            lines = [replace(lines[0], marker=marker, marker_font=replace(font, strike=False), marker_at=at)] + lines[1:]
+        out.extend(lines)
+    return out
+
+
+def _ink_width(text: str, font: TextFont, measure: Measure) -> float:
+    """QFontMetrics::boundingRect(text).width() (integer), or the estimate without Qt."""
+    if getattr(measure, "qt_document", False):
+        from PySide6.QtGui import QFontMetrics
+        return float(QFontMetrics(_qfont(font)).boundingRect(text).width())
+    return float(round(measure(text, font)))
 
 
 def checkbox_boxes(scene: PageScene, lines: list[TextLine],
@@ -340,21 +616,16 @@ def checkbox_boxes(scene: PageScene, lines: list[TextLine],
     starts, its box (x, y, width, height) in page coordinates). The index is what the
     app's checkbox links carry ("rmcheckbox://index=<n>": the scene's checkbox table
     is keyed by character position and shifted as the text changes, 0x140989280); the
-    box is the marker drawn left of the paragraph, with the gap to the text."""
+    box is where the app draws the checkbox (0x14093c41a)."""
     block = scene.text
     if block is None:
         return []
-    starts, at = [], 0
-    for para in block.paragraphs:
-        starts.append(at)
-        at += _units(para.text) + 1
+    starts = _bases(block)
     out = []
     for line in lines:
-        if line.marker not in CHECKBOX_MARKERS or line.marker_font is None or line.paragraph >= len(starts):
+        if line.marker not in CHECKBOX_MARKERS or len(line.marker_at) != 4 or line.paragraph >= len(starts):
             continue
-        width = measure(line.marker, line.marker_font)
-        size = line.marker_font.size
-        out.append((starts[line.paragraph], (line.x - 8 - width, line.baseline - size, width + 8, size * 1.25)))
+        out.append((starts[line.paragraph], tuple(line.marker_at)))
     return out
 
 
@@ -388,10 +659,8 @@ def index_at(lines: list[TextLine], x: float, y: float, measure: Measure = estim
     nearest), then the caret place nearest x on it."""
     if not lines:
         return 0
-    def top(line):
-        return line.baseline - line.height * BASELINE_AT
-    n = min(range(len(lines)), key=lambda k: 0 if top(lines[k]) <= y < top(lines[k]) + lines[k].height
-            else min(abs(y - top(lines[k])), abs(y - top(lines[k]) - lines[k].height)))
+    n = min(range(len(lines)), key=lambda k: 0 if lines[k].top <= y < lines[k].bottom
+            else min(abs(y - lines[k].top), abs(y - lines[k].bottom)))
     line = lines[n]
     last = line.end if line_of(lines, line.end) == n else max(line.start, line.end - 1)
     best, best_d = line.start, abs(caret_x(line, line.start, measure) - x)
@@ -412,27 +681,74 @@ def _merge(pieces: list[tuple[str, TextFont]]) -> list[tuple[str, TextFont]]:
     return out
 
 
-def stroke_offsets(scene: PageScene, lines: list[TextLine]) -> dict[int, tuple[float, float]]:
-    """Offset per anchored stroke (keyed by id(stroke)): (anchor origin x, line baseline).
+def text_length(block: TextBlock) -> int:
+    return sum(_units(p.text) for p in block.paragraphs) + max(len(block.paragraphs) - 1, 0)
 
-    The line is the first line of the paragraph holding the anchor character.
-    Sentinel anchors and anchors without a matching character sit at the top of
-    the text box (their exact meaning is not decoded).
-    """
+
+def anchor_index(block: TextBlock, char_id: tuple[int, int]) -> int | None:
+    """The text index an anchor resolves to (0x14097c4f0): its character's, the
+    before-text sentinel -1, the after-text one the text's length, clamped to
+    0..length-1; None for an id the text does not hold."""
+    from .rm_parser import ANCHOR_SENTINEL_START
+    length = text_length(block)
+    if char_id == (0, ANCHOR_SENTINEL_START):
+        i = -1
+    elif char_id == (0, ANCHOR_SENTINEL_START + 1):
+        i = length
+    elif char_id in block.char_index:
+        i = block.char_index[char_id]
+    elif char_id in block.char_paragraph:
+        i = _bases(block)[block.char_paragraph[char_id]]
+    else:
+        return None
+    return max(0, min(i, length - 1))
+
+
+def anchor_point(scene: PageScene, lines: list[TextLine], char_id: tuple[int, int],
+                 measure: Measure = estimate_width) -> tuple[float, float] | None:
+    """Where the character an anchor names is (0x14097c4f0, 0x1409342a0): x = text x
+    + layout x + cursorToX(i), in scene coordinates, and y = the baseline of the visual
+    line holding character i. None when the page has no text or the id is not in it."""
+    block = scene.text
+    if block is None or not lines:
+        return None
+    i = anchor_index(block, char_id)
+    if i is None:
+        return None
+    return index_point(scene, lines, i, measure)
+
+
+def index_point(scene: PageScene, lines: list[TextLine], index: int,
+                measure: Measure = estimate_width) -> tuple[float, float]:
+    """(scene x of a caret before character `index`, the baseline of its visual line)."""
+    line = lines[line_of(lines, index)]
+    return caret_x(line, index, measure) - scene.x_origin, line.baseline
+
+
+def stroke_offsets(scene: PageScene, lines: list[TextLine],
+                   measure: Measure = estimate_width) -> dict[int, tuple[float, float]]:
+    """Offset per anchored stroke (keyed by id(stroke)): the group's anchor position,
+    which 3.29 adds to every stored point (ARCHITECTURE.md 5.1): x = the stored
+    anchorOriginX (type 2; type 1 follows its character sideways, x of the character),
+    y = the baseline of the visual line holding the anchor character (a sentinel takes
+    the first or the last character). An id the text does not hold keeps the text's
+    top, and a page without text puts the group at y 0 (neither is traced)."""
     text = scene.text
-    baselines: dict[int, float] = {}
-    for line in lines:
-        baselines.setdefault(line.paragraph, line.baseline)
     offsets: dict[int, tuple[float, float]] = {}
+    found: dict[tuple, tuple[float, float] | None] = {}
     for stroke in scene.strokes:
         a = stroke.anchor
         if a is None:
             continue
-        dy = 0.0
-        if text is not None:
-            para = text.char_paragraph.get(a.char_id)
-            dy = baselines.get(para, text.y) if para is not None else text.y
-        offsets[id(stroke)] = (a.origin_x, dy)
+        if a.char_id not in found:
+            found[a.char_id] = anchor_point(scene, lines, a.char_id, measure)
+        point = found[a.char_id]
+        if point is None:
+            offsets[id(stroke)] = (a.origin_x, text.y if text is not None else 0.0)
+        elif a.type == 1:
+            offsets[id(stroke)] = point
+        else:
+            offsets[id(stroke)] = (a.origin_x, point[1])
     return offsets
 
 
@@ -450,9 +766,8 @@ def _ink_bounds(scene: PageScene, lines: list[TextLine], offsets, measure: Measu
     for line in lines:
         if line.pieces:
             width = sum(measure(t, f) for t, f in line.pieces)
-            size = max(f.size for _, f in line.pieces)
             xs += [line.x, line.x + width]
-            ys += [line.baseline - size, line.baseline + size * 0.3]
+            ys += [line.top, line.bottom]
     if not xs:
         return None
     return min(xs), min(ys), max(xs), max(ys)
@@ -474,7 +789,7 @@ def render_bounds(scene: PageScene, crop: str = "page", margin: float = 20.0,
     if crop == "clip":
         return 0.0, 0.0, float(scene.width), float(scene.height)
     lines = layout_text(scene, measure)
-    content = _ink_bounds(scene, lines, stroke_offsets(scene, lines), measure)
+    content = _ink_bounds(scene, lines, stroke_offsets(scene, lines, measure), measure)
     if crop == "content":
         if content is None:
             return 0.0, 0.0, float(scene.width), float(scene.height)
@@ -558,11 +873,30 @@ def _svg_image(scene: PageScene, image: ImageItem) -> str | None:
 
 # ------------------------------------------------------------------------ SVG
 
+def _families(font: TextFont) -> list[str]:
+    return [font.family, *FALLBACK_FAMILIES.get(font.family, FALLBACK_FAMILIES[SANS])]
+
+
+def _weight(font: TextFont) -> int:
+    return 700 if font.bold else font.weight
+
+
 def _svg_font(font: TextFont) -> str:
-    families = ", ".join(f"'{f}'" if " " in f else f for f in FONT_FAMILIES)
-    weight = ' font-weight="bold"' if font.bold else ""
+    families = ", ".join(f"'{f}'" if " " in f else f for f in _families(font))
+    weight = f' font-weight="{_weight(font)}"' if _weight(font) != 400 else ""
     style = ' font-style="italic"' if font.italic else ""
-    return f'font-family="{families}" font-size="{font.size:g}"{weight}{style}'
+    strike = ' text-decoration="line-through"' if font.strike else ""
+    return f'font-family="{families}" font-size="{font.size:g}"{weight}{style}{strike}'
+
+
+# The checkbox when the app's own image (":/images/checkbox_*.svg", 48 x 48 drawn into
+# the 40 x 40 box) is not to hand: its square, 8..40 of 48, and a tick when checked.
+def _checkbox_shapes(box, checked: bool):
+    x, y, w, h = box
+    k = w / 48.0
+    square = (x + 8 * k, y + 8 * k, 32 * k, 32 * k)
+    tick = ((x + 15 * k, y + 24.5 * k), (x + 21 * k, y + 30.5 * k), (x + 33 * k, y + 18.5 * k)) if checked else ()
+    return square, tick, 2.5 * k
 
 
 def is_eraser(stroke) -> bool:
@@ -645,7 +979,7 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
     mask what was drawn before them (eraser_outline); `measure` lays out the text (qt_measure: as the
     viewer wraps it); `decimals` is the precision of stroke coordinates."""
     lines = layout_text(scene, measure)
-    offsets = stroke_offsets(scene, lines)
+    offsets = stroke_offsets(scene, lines, measure)
     done: list[str] = []            # finished layers
     masks: list[str] = []           # one <mask> per eraser stroke (legacy pages)
     patterns: dict[tuple, tuple] = {}  # (tile, colour, alpha, angle) -> (id, <pattern>) (textured strokes)
@@ -708,8 +1042,15 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
     if lines and (include_hidden or scene.root_document_visible):
         out.append(f'<g id="text" fill="{TEXT_COLOR}">')
         for line in lines:
-            if line.marker and line.marker_font:
-                out.append(f'<text x="{line.x - 8:.2f}" y="{line.baseline:.2f}" text-anchor="end" '
+            if line.marker in CHECKBOX_MARKERS and len(line.marker_at) == 4:
+                (sx, sy, sw, sh), tick, width = _checkbox_shapes(line.marker_at, line.marker == CHECKBOX_MARKERS[1])
+                out.append(f'<rect x="{sx:.2f}" y="{sy:.2f}" width="{sw:.2f}" height="{sh:.2f}" fill="none" '
+                           f'stroke="{TEXT_COLOR}" stroke-width="{width:g}"/>')
+                if tick:
+                    out.append(f'<polyline points="{" ".join(f"{px:.2f},{py:.2f}" for px, py in tick)}" fill="none" '
+                               f'stroke="{TEXT_COLOR}" stroke-width="{width:g}"/>')
+            elif line.marker and line.marker_font and len(line.marker_at) == 2:
+                out.append(f'<text x="{line.marker_at[0]:.2f}" y="{line.marker_at[1]:.2f}" '
                            f'{_svg_font(line.marker_font)}>{escape(line.marker)}</text>')
             if line.pieces:
                 spans = "".join(f'<tspan {_svg_font(font)}>{escape(text)}</tspan>'
@@ -736,18 +1077,26 @@ def render_svg(scene: PageScene, *, background: str | None = "#ffffff",
 # ------------------------------------------------------------------- QPainter
 
 def _qfont(font: TextFont):
+    """The QFont 3.29 makes for a paragraph style (0x140a3c280): family, pixel size,
+    weight, PreferNoHinting, struck out for a checked checkbox; bold and italic spans."""
     from PySide6.QtGui import QFont
+    ensure_fonts()
     qf = QFont()
-    qf.setFamilies(list(FONT_FAMILIES))
+    qf.setFamilies(_families(font))
     qf.setPixelSize(max(1, round(font.size)))
-    qf.setBold(font.bold)
+    qf.setWeight(QFont.Weight(_weight(font)))
     qf.setItalic(font.italic)
+    qf.setStrikeOut(font.strike)
+    qf.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     return qf
 
 
 def qt_measure(text: str, font: TextFont) -> float:
     from PySide6.QtGui import QFontMetricsF
     return QFontMetricsF(_qfont(font)).horizontalAdvance(text)
+
+
+qt_measure.qt_document = True       # layout_text lays out in a real QTextDocument with it
 
 
 LAYERS = ("all", "darken", "normal")
@@ -773,7 +1122,7 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
     lines = layout_text(scene, qt_measure)
-    offsets = stroke_offsets(scene, lines)
+    offsets = stroke_offsets(scene, lines, qt_measure)
     drawn = 0
     ordered = [item for layer in _visible_layers(scene, include_hidden) for item in layer.items()]
     erased = erased_after(scene, ordered, offsets) if any(is_eraser(i) for i in ordered) else {}
@@ -863,17 +1212,44 @@ def _paint_text(painter, scene: PageScene, lines: list, include_hidden: bool) ->
     painter.setPen(QColor(TEXT_COLOR))
     for line in lines:
         drawn += 1
-        if line.marker and line.marker_font:
-            mf = _qfont(line.marker_font)
-            painter.setFont(mf)
-            painter.drawText(QPointF(line.x - 8 - qt_measure(line.marker, line.marker_font),
-                                     line.baseline), line.marker)
+        if line.marker in CHECKBOX_MARKERS and len(line.marker_at) == 4:
+            _paint_checkbox(painter, line.marker_at, line.marker == CHECKBOX_MARKERS[1])
+        elif line.marker and line.marker_font and len(line.marker_at) == 2:
+            painter.setFont(_qfont(line.marker_font))
+            painter.drawText(QPointF(*line.marker_at), line.marker)
         x = line.x
         for text, font in line.pieces:
             painter.setFont(_qfont(font))
             painter.drawText(QPointF(x, line.baseline), text)
             x += qt_measure(text, font)
     return drawn
+
+
+def _paint_checkbox(painter, box, checked: bool) -> None:
+    """The app's checkbox image (":/images/checkbox_checked.svg" / "unchecked", when the
+    app's resources are registered) in its box, else _checkbox_shapes."""
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import QColor, QPen, QPolygonF
+    from PySide6.QtCore import QFile
+    path = f":/images/checkbox_{'checked' if checked else 'unchecked'}.svg"
+    svg = None
+    if QFile.exists(path):
+        try:
+            from PySide6.QtSvg import QSvgRenderer
+            svg = QSvgRenderer(path)
+        except ImportError:
+            pass
+    if svg is not None and svg.isValid():
+        svg.render(painter, QRectF(*box))
+        return
+    (sx, sy, sw, sh), tick, width = _checkbox_shapes(box, checked)
+    painter.save()
+    painter.setPen(QPen(QColor(TEXT_COLOR), width))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawRect(QRectF(sx, sy, sw, sh))
+    if tick:
+        painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in tick]))
+    painter.restore()
 
 
 def _paint_glyphs(painter, scene: PageScene, glyph: GlyphRange, blend_modes: bool) -> bool:
