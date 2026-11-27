@@ -1344,9 +1344,12 @@ class SvgExportTests(DemoCase):
         self.assertEqual({g.get("stroke") for g in strokes} >= {"#000000", "#304ae0", "#c23132"}, True)
         highlighter = next(g for g in strokes if g.get("data-tool").startswith("highlighter"))
         self.assertEqual(highlighter.get("style"), "mix-blend-mode:darken")
-        widths = {float(line.get("stroke-width")) for g in strokes for line in g}
+        raster = [g for g in strokes if g.find(f"{SVG}image") is not None]     # v2 pencils / Shader: per pixel
+        self.assertTrue(all(g.get("data-tool") in ("shading_marker", "pencil_v2", "sharp_pencil_v2") for g in raster))
+        widths = {float(line.get("stroke-width")) for g in strokes if g not in raster for line in g}
         self.assertGreater(len(widths), 3)                                # widths follow the pen
-        self.assertIsNone(root.find(f".//{SVG}image"))                    # no raster part
+        images = root.findall(f".//{SVG}image")                           # no raster part besides those strokes
+        self.assertEqual(len(images), len(raster))
 
     def test_typed_text(self):
         root = ET.fromstring(page_svg(self.content("Meeting notes", 1)))

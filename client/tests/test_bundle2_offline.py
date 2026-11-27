@@ -158,8 +158,10 @@ class ShaderTests(unittest.TestCase):
         self.assertTrue(style.blend_darken)
         image = renderer.render_image(parse(page), crop="clip")
         pixel = QColor(image.pixel(round(702 - 40), 300))
-        self.assertLess(pixel.red(), 250)                                     # shaded
-        self.assertGreater(pixel.red(), 150)                                  # lightly
+        # 3.29's multiply: the opaque grey 0x90 at an opacity factor of 0.8 .. 1 over white
+        # gives 255 - 111 f = 144 .. 166 (it was 0.2 flat: 150 .. 250).
+        self.assertLess(pixel.red(), 170)                                     # shaded
+        self.assertGreater(pixel.red(), 140)
         # The pen surface previews it with the page renderer.
         preview = pen_bridge.preview_scene(23, 1, 2.0, None, line.unpacked())
         self.assertEqual(preview.strokes[0].tool, Tool.SHADING_MARKER)

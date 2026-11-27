@@ -1841,10 +1841,50 @@ traced, and a light stroke must not vanish where its tile is blank); paintbrush 
 the bitmap exactly; SVG export carries the tiles as `<pattern>`s of vector runs (the tiles
 are pure black and white, so this is exact and the SVG stays vector).
 
-**Not 1:1**: version 2 pencils (13, 14) go through strokev2's FillPencil (0x140b13610),
-which shades with value noise (a permutation table at 0x140e8e1d0) rather than these
-tiles; the Shader (23, strokev2 FillShaderAA) uses no tile, so its opacity stays an
-approximation; typed-text font sizes (`crdt::TextProperties::FontSize`). The typed-text
+**strokev2 Shader and v2 pencil** [O, read 2026-11-27]. Both build each segment as a quad
+(corners ± half-width along the normal, 0x140b326a0 / 0x140b32cc0, two triangles each,
+0x140b20220; joins 0x140b30590 / 0x140b30ba0) whose vertices carry attributes from the
+pipeline's attribute generator (arc length, half-width, side ±1), and a scanline
+rasteriser (0x140b19420) calls the fill per span.
+- **Shader** (ShaderPipeline vtable 0x140e8e528: per point 0x140b334d0, fill
+  0x140b2c5a0). Per point: k = speed/4 (u16 point field ×0.25), s = 0 below 2, 1 above
+  10, else smoothstep((k − 2)/8) = (3 − 2t)t²; opacity factor = 0.8 + 0.2 (1 − s); the
+  pressure byte / 255 is kept beside it. The segments are rasterised into 32 × 32 tiles of
+  8-bit coverage (anti-aliased), then blended into the target per pixel with the colour C
+  (premultiplied ARGB, pipeline +0x78). 32-bit target (0x140b053f0 / 0x140b059a0; the
+  0x140b051a0 / 0x140b055e0 variants, chosen by a target flag +0x71, and every 16-bit RGB565
+  path first dither the coverage c with the noise table, c &= (perm[perm[y & 255] + (x &
+  255)] | 0xF0)):
+  * C with r = g = b = a (a white tint): additive, each channel min(255, D + C·c/255);
+  * otherwise (unless the environment sets `SHADING_NORMAL_BLEND`): c ← c ·
+    (76 R + 150 G + 29 B)/A_D / 255 of the destination (its unpremultiplied luminance, so a
+    dark pixel takes less), then the **multiply** composite: with sa = A_C·c/255 and
+    s_ch = C_ch·c/255, out_ch = (D_ch (255 − sa) + s_ch (255 − A_D + D_ch)) / 255, out_A =
+    sa + A_D − sa·A_D/255 (all /255 as (x + 0x101 >> 8) + x >> 8).
+  The permutation table (0x140e8e1d0) is 256 bytes, stored twice:
+  `177da134…201605` (`viewer.brushes.PERM`).
+- **v2 pencils** (13 Mechanical, 14 Pencil; PencilPipeline vtable 0x140e8e7c8: per point
+  0x140b33470, fill 0x140b13610 FillPencil). Per point the density is pressure/255 × 165
+  + 35. Per pixel (no anti-aliasing): with the span's interpolated attributes (u, v,
+  density d, half-width h) and the pixel's (x, y) relative to the rasteriser origin, scaled
+  by 1/S, value noise N(a, b) = bilinear over perm[perm[b] + a] (8-bit weights, 255 −
+  w / w) at four scales: n = N(u, v) >> 3 + ((N(7x, 7y) + 3 N(3x, 3y) + 2 N(x, y)) / 6 · 7 >>
+  3), and the pixel takes the stroke colour when n ≤ d', where d' = d when h ≤ 2, else d ×
+  1 for |v|/h < 0.5, × (1 − smoothstep(2(|v|/h − 0.5))) up to 1, 0 beyond.
+  [I] not read: the rasteriser's S and origin (0x140b19420, param+0x20/0x24/0x28), the
+  attribute generators' exact outputs and the target flag +0x71 on the desktop.
+- **The client** (`viewer.brushes`, milestone parity/brush-shaders-l3) blends the Shader
+  per pixel as above (coverage from Qt's anti-aliased fill of the same quads) and fills v2
+  pencils with the noise threshold above. [I] choices: C is the stroke's palette ARGB
+  (opaque for the palette greys, so a shader stroke is a near-opaque multiply; how 3.29
+  fills +0x78 and whether the pressure kept at +0x74 scales coverage were not read), the
+  opacity factor scales C; noise scale S = 1 and origin = the stroke's first point;
+  N's arguments floor + 8-bit fraction; Shader joins are bevels with butt caps, pencil
+  segments overlap by the half-width; a one-point Shader stroke draws nothing, a one-point
+  v2 pencil is a segment as long as it is wide; the 32-bit
+  path is not dithered; SVG export embeds these strokes as PNG images (the Shader's under
+  `mix-blend-mode:multiply`), and the PDF export draws them as images too.
+Not 1:1 here: typed-text font sizes (`crdt::TextProperties::FontSize`). The typed-text
 fonts are the proprietary reMarkable Sans and reMarkable Serif Small, embedded in the exe;
 they are not extracted or redistributed.
 

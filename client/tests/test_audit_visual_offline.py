@@ -86,7 +86,7 @@ class TextureTests(unittest.TestCase):
 
     @unittest.skipUnless(TEXTURES_INSTALLED, "the app's brush textures are not installed (install.py)")
     def test_pencil_runs_are_drawn_through_the_tiles(self):
-        stroke = line_item(LAYER, (1, 40), tool=14, color=0, points=points_v2(
+        stroke = line_item(LAYER, (1, 40), tool=1, color=0, points=points_v2(     # the legacy pencil: 14 shades per pixel
             [(-200 + 10 * n, 400, 1, 0, 40, 220) for n in range(41)]))
         scene = rm_parser.parse(v6_file(tree_node(LAYER, "Layer 1"), scene_tree(LAYER),
                                         group_item(ROOT, (1, 30), LAYER), stroke))

@@ -767,13 +767,15 @@ class RendererTests(unittest.TestCase):
 
     def test_runs_opacity_and_fallbacks(self):
         scene = PageScene(version=6, x_origin=702)
-        pencil = self.stroke(Tool.PENCIL_V2, points=[Point(0, 0, width=2, pressure=0),
-                                                     Point(5, 5, width=2, pressure=0)])
-        self.assertEqual(stroke_runs(scene, pencil)[0].opacity, 0.35)
+        pencil = self.stroke(Tool.PENCIL, points=[Point(0, 0, width=2, pressure=0),
+                                                  Point(5, 5, width=2, pressure=0)])
+        self.assertEqual(stroke_runs(scene, pencil)[0].opacity, 0.35)    # the legacy pencil (tile grain)
+        v2 = self.stroke(Tool.PENCIL_V2, points=pencil.points)
+        self.assertEqual((stroke_runs(scene, v2)[0].opacity, stroke_runs(scene, v2)[0].texture), (1.0, None))
         hl = stroke_runs(scene, self.stroke(Tool.HIGHLIGHTER_V2, points=[Point(0, 0), Point(9, 0)]))
         self.assertEqual((hl[0].width, hl[0].opacity), (30, 1.0))   # opaque; Darken blends
         shader = stroke_runs(scene, self.stroke(Tool.SHADING_MARKER))
-        self.assertEqual(shader[0].opacity, 0.2)
+        self.assertEqual(shader[0].opacity, 1.0)    # the per-point factor is the Shader's own (brushes.shader_opacity)
         single = stroke_runs(scene, self.stroke(Tool.FINELINER, points=[Point(1, 2, width=3)]))
         self.assertEqual(single[0].points, ((703, 2), (703, 2)))
         self.assertEqual(stroke_runs(scene, self.stroke(Tool.FINELINER, points=[])), [])

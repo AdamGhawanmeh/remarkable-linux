@@ -12,8 +12,9 @@ Fidelity (ARCHITECTURE.md §5.2):
   * Typed text is laid out as 3.29 lays it out, in a QTextDocument with the app's
     block and character formats (layout_text with qt_measure); the app's fonts,
     reMarkable Sans / Serif Small, are registered from the assets (ensure_fonts),
-    otherwise Noto Sans / Serif stand in. Approximations: pencil/brush textures (the
-    app rasterises those itself) and shader opacity.
+    otherwise Noto Sans / Serif stand in. The Shader and the v2 pencils are shaded per
+    pixel as 3.29's strokev2 pipelines do (viewer.brushes; SVG carries them as raster
+    images). Approximations: the legacy pencil/brush textures' mix with pressure.
 
 Stroke widths come from each point's recorded width, so pressure-sensitive tools
 taper naturally. Eraser strokes (legacy files) take away the ink drawn before them and
@@ -30,7 +31,7 @@ from typing import Callable
 from xml.sax.saxutils import escape, quoteattr
 
 from .rm_parser import (PAGE_HEIGHT, PAGE_WIDTH, Color, GlyphRange, ImageItem, PageScene, ParagraphStyle, Stroke,
-                        TextBlock)
+                        TextBlock, Tool)
 
 # Official stroke palette (ARGB), indexed by Color; built inline by the renderer in
 # reMarkable.exe (e.g. VA 0x1409d9fc1). White comes from a sign-extended 64-bit store.
@@ -118,13 +119,26 @@ def stroke_style(stroke: Stroke, background: str = "#ffffff") -> StrokeStyle | N
                        family == "highlighter")
 
 
-def _opacity(family: str, pressure: float) -> float:
+def raster_kind(stroke) -> str | None:
+    """"shader" for the Shader (23), "pencil" for the v2 pencils (13, 14): strokes 3.29
+    shades per pixel (viewer.brushes), drawn as a raster rather than as runs."""
+    tool = stroke.tool
+    if tool == Tool.SHADING_MARKER:
+        return "shader"
+    if tool in (Tool.SHARP_PENCIL_V2, Tool.PENCIL_V2):
+        return "pencil"
+    return None
+
+
+def _opacity(family: str, pressure: float, tool=None) -> float:
     if family == "highlighter":
         return HIGHLIGHTER_OPACITY
     if family == "shader":
-        return 0.2            # approximation: shading builds up over passes
+        return 1.0            # the opacity factor lives in the per-pixel Shader (brushes.shader_opacity)
     if family in ("pencil", "mechanical_pencil"):
-        return min(1.0, 0.35 + 0.65 * pressure)   # approximation of graphite texture
+        if tool in (Tool.SHARP_PENCIL_V2, Tool.PENCIL_V2):
+            return 1.0        # FillPencil sets the pure colour (brushes.pencil_image)
+        return min(1.0, 0.35 + 0.65 * pressure)   # approximation of graphite texture (legacy pencils)
     return 1.0
 
 
@@ -135,11 +149,14 @@ def _quantise(value: float, step: float) -> float:
 TEXTURED = {"pencil", "mechanical_pencil", "paintbrush"}
 
 
-def _texture(family: str, point) -> tuple[str | None, float]:
+def _texture(family: str, point, tool=None) -> tuple[str | None, float]:
     """(tile, rotation) for a point of a stroke drawn through 3.29's textures
-    (viewer.brushes); (None, 0.0) for solid ink or when the tiles are not installed."""
+    (viewer.brushes); (None, 0.0) for solid ink or when the tiles are not installed.
+    The v2 pencils shade per pixel instead (raster_kind) and use no tile."""
     from . import brushes
 
+    if tool in (Tool.SHARP_PENCIL_V2, Tool.PENCIL_V2):
+        return None, 0.0
     if family in ("pencil", "mechanical_pencil"):
         name = brushes.pencil_texture(point.x, point.y, point.pressure)
         return (name, 0.0) if brushes.available(name) else (None, 0.0)
@@ -165,7 +182,8 @@ def stroke_runs(scene: PageScene, stroke: Stroke,
     for p in pts:
         width = _quantise(p.width if p.width > 0 else fallback, 0.25) or 0.25
         keyed.append((scene.to_page(p.x + dx, p.y + dy),
-                      (width, _quantise(_opacity(family, p.pressure), 0.05), *_texture(family, p))))
+                      (width, _quantise(_opacity(family, p.pressure, stroke.tool), 0.05),
+                       *_texture(family, p, stroke.tool))))
     if len(keyed) == 1:
         (xy, key), = keyed
         return [Run((xy, xy), *key)]
@@ -996,6 +1014,68 @@ def erased_after(scene: PageScene, items: list, offsets: dict) -> dict:
     return out
 
 
+# Shader and v2 pencils (ARCHITECTURE.md 5.2, "strokev2 Shader and v2 pencil"): per pixel,
+# so a raster. The page-resolution image (stroke_raster) is what SVG embeds and what
+# painters that cannot be read back draw; a QImage target is blended into directly.
+
+def _raster_points(scene: PageScene, stroke: Stroke, offset: tuple[float, float] = (0.0, 0.0)):
+    """(x, y, half width, speed k, pressure) per point in page coordinates (k is the
+    parser's Point.speed, already the u16 field x 0.25)."""
+    fallback = FALLBACK_WIDTH.get(stroke.tool.family, 2.0) * (stroke.thickness_scale or 1.0)
+    out = []
+    for p in stroke.points:
+        x, y = scene.to_page(p.x + offset[0], p.y + offset[1])
+        out.append((x, y, (p.width if p.width > 0 else fallback) / 2, p.speed, p.pressure))
+    return out
+
+
+def _rgba(style: StrokeStyle) -> tuple[int, int, int, int]:
+    value = int(style.color[1:], 16)
+    return (value >> 16) & 255, (value >> 8) & 255, value & 255, round(style.alpha * 255)
+
+
+def stroke_raster(scene: PageScene, stroke: Stroke, style: StrokeStyle,
+                  offset: tuple[float, float] = (0.0, 0.0)):
+    """(QImage ARGB32_Premultiplied, x, y) of a Shader / v2 pencil stroke at page
+    resolution, or None (not such a stroke, or nothing to draw). The pencil image holds
+    pure colour or nothing; the Shader image is the multiply composite over a transparent
+    page (the colour at its coverage), to be multiplied over what is below."""
+    from . import brushes
+
+    kind = raster_kind(stroke)
+    points = _raster_points(scene, stroke, offset)
+    if kind == "pencil":
+        return brushes.pencil_image([(x, y, half, pressure) for x, y, half, _, pressure in points], _rgba(style))
+    if kind == "shader":
+        return brushes.shader_image(brushes.shader_points([(x, y, half, k) for x, y, half, k, _ in points]),
+                                    brushes.premultiplied(_rgba(style)))
+    return None
+
+
+def _png_data_uri(image) -> str:
+    import base64
+
+    from PySide6.QtCore import QBuffer, QIODevice
+
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image.save(buffer, "PNG")
+    return f"data:image/png;base64,{base64.b64encode(bytes(buffer.data())).decode()}"
+
+
+def _svg_raster(scene: PageScene, stroke: Stroke, style: StrokeStyle, offset: tuple[float, float]) -> list[str]:
+    """The stroke as one <image> (a PNG of exactly what the QPainter path makes) at the
+    stroke's bounds; the Shader's image is multiplied over the page."""
+    made = stroke_raster(scene, stroke, style, offset)
+    if made is None:
+        return []
+    image, x, y = made
+    blend = ' style="mix-blend-mode:multiply"' if raster_kind(stroke) == "shader" else ""
+    return [f'<g data-tool="{stroke.tool.name.lower()}"{blend}>',
+            f'<image x="{x}" y="{y}" width="{image.width()}" height="{image.height()}" '
+            f'preserveAspectRatio="none" href="{_png_data_uri(image)}"/>', "</g>"]
+
+
 _BRUSH_TILE = 64
 
 
@@ -1066,6 +1146,9 @@ def svg_scene(scene: PageScene, *, background: str = "#ffffff", include_hidden: 
                 continue
             style = stroke_style(stroke, background)
             if style is None:
+                continue
+            if raster_kind(stroke):         # shaded per pixel: not vector (see _svg_raster)
+                cur += _svg_raster(scene, stroke, style, offsets.get(id(stroke), (0.0, 0.0)))
                 continue
             cap = "square" if style.square_cap else "round"
             blend = ' style="mix-blend-mode:darken"' if style.blend_darken else ""
@@ -1227,6 +1310,9 @@ def _paint_item(painter, scene: PageScene, stroke, background: str, layers: str,
     if style is None or (layers == "darken" and not style.blend_darken) \
             or (layers == "normal" and style.blend_darken):
         return 0
+    if raster_kind(stroke):
+        _paint_raster(painter, scene, stroke, style, blend_modes, offsets.get(id(stroke), (0.0, 0.0)))
+        return 1
     if blend_modes:
         painter.setCompositionMode(
             QPainter.CompositionMode.CompositionMode_Darken if style.blend_darken
@@ -1248,6 +1334,63 @@ def _paint_item(painter, scene: PageScene, stroke, background: str, layers: str,
             path.lineTo(px, py)
         painter.drawPath(path)
     return drawn
+
+
+def _paint_raster(painter, scene: PageScene, stroke: Stroke, style: StrokeStyle, blend_modes: bool,
+                  offset: tuple[float, float]) -> None:
+    """Draw a Shader / v2 pencil stroke. A v2 pencil's pixels are drawn over the page
+    (page resolution, resampled under a scale). The Shader is blended per pixel into a
+    QImage target (device pixels, over the stroke's bounds only; the painter's clip is
+    honoured by drawing the blended copy back); any other painter gets the stroke's
+    multiply image (the luminance weighting needs the destination, so it is left out)."""
+    from PySide6.QtCore import QPoint, QPointF, QRect
+    from PySide6.QtGui import QImage, QPainter, QTransform
+
+    from . import brushes
+
+    kind = raster_kind(stroke)
+    device = painter.device()
+    direct = (kind == "shader" and isinstance(device, QImage)
+              and device.format() in (QImage.Format.Format_RGB32, QImage.Format.Format_ARGB32,
+                                      QImage.Format.Format_ARGB32_Premultiplied))
+    if direct:
+        matrix = painter.worldTransform()
+        scale = math.sqrt(abs(matrix.determinant()))
+        points = []
+        for x, y, half, k, _ in _raster_points(scene, stroke, offset):
+            dx, dy = matrix.map(x, y)
+            points.append((dx, dy, half * scale, k))
+        points = brushes.shader_points(points)
+        rect = brushes.shader_rect(points)
+        if rect is None:
+            return
+        bounds = QRect(*rect).intersected(device.rect())
+        if bounds.isEmpty():
+            return
+        region = device.copy(bounds).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        brushes.shade_into(region, [(x - bounds.x(), y - bounds.y(), half, f) for x, y, half, f in points],
+                           brushes.premultiplied(_rgba(style)), origin=(bounds.x(), bounds.y()))
+        painter.save()
+        try:
+            painter.setWorldTransform(QTransform())
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            painter.drawImage(QPoint(bounds.x(), bounds.y()), region)
+        finally:
+            painter.restore()
+        return
+    made = stroke_raster(scene, stroke, style, offset)
+    if made is None:
+        return
+    image, x, y = made
+    painter.save()
+    try:
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)   # a scaled-down grain averages
+        if blend_modes:
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Multiply if kind == "shader"
+                                       else QPainter.CompositionMode.CompositionMode_SourceOver)
+        painter.drawImage(QPointF(x, y), image)
+    finally:
+        painter.restore()
 
 
 def _texture_brush(scene: PageScene, run: Run, style: StrokeStyle):
