@@ -198,7 +198,8 @@ class PersistenceTests(Base):
         self.assertEqual(self.new_client().deleted_immutable_action(), "ReDownload")
 
     def test_absent_survives_deepcopy_of_the_cloud(self):
-        clone = copy.deepcopy(FakeCloud(4))
+        self.assertIs(self.cloud.deleted_immutable_action, ABSENT)
+        clone = copy.deepcopy(self.cloud)
         self.assertIs(clone.deleted_immutable_action, ABSENT)
         response = clone("GET", "https://sync.example/sync/v4/root",
                          {"Authorization": "Bearer synthetic"}, None, 10)
