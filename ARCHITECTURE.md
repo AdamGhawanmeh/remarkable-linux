@@ -1881,12 +1881,44 @@ strokes). [O] Parser strings in the binary: the variables `templateWidth/Height`
 `parentX/Y/Width/Height`, `physicalDpi`, `pixelRatio`, `paperOriginX/Y`, `paperWidth/Height`,
 `textWidth`; colours `#RRGGBB`; a path whose stroke and fill are both invisible is
 illegal. The expression language is JS-like (`+ - * / ( ) < > ? : ||`).
+**Text items** [O, parser 0x140a8e190, drawer 0x140a91750, read 2026-11-27]: `text` (a
+non-empty string, else "'text' property cannot be empty"), `fontSize` (int > 0, else
+"'fontSize' must be a positive value"), `color` (absent → opaque black 0xff000000;
+`null` → 0, transparent; "#RRGGBB" → 0xffRRGGBB; "#AARRGGBB" as written; anything else is
+an error, 0x140a8b580), `position` (an object, else "'position' is empty or missing"),
+`bold` / `italic` (absent → false; a JSON bool; anything else "boolean value expected",
+0x140a8acb0), `rotate` (a number, default 0, error outside −360..360: "'rotate' must be
+within +/- 0-360 degrees."), and an `id`. An item with an error fails the whole template: the item builder
+(0x140a8c3d0: "group" / "path" / "text", else "unknown item type") records (type, id) with the
+message and returns nothing, and the items loop (0x140a89fb0) then returns no Root. Every
+item also takes `visible`: absent or of another type → true, a bool as given, a string →
+the expression's value with |v| > 1e−5; an invisible item is left out. `position.x` and
+`position.y` must both evaluate (0x140a8d130), else the item fails. Before
+`position.x` / `position.y` are evaluated, `textWidth` is set to the width of
+`QFontMetrics(font).boundingRect(text)` (whole pixels, a QRect) for a QFont with that
+pixel size, weight 700/400 and italic, family not set [I: the application default; the
+client measures in reMarkable Sans]. Drawing: pen = the colour (QColor::fromRgba), font
+= the painter's with family "reMarkable Sans", that pixel size, weight 700 when bold else
+400, italic style; rotate 0 → `drawText(QPointF(x, y), text)`, so (x, y) is the
+**baseline** start; otherwise translate to (x, y), rotate by `rotate` degrees, draw at
+(0, 0), restore the transform.
 Per-page template: `cPages.pages[].template.value` (e.g. "P Lines small"), or one name
 per line in `.pagedata` for formatVersion 1 content.
 Validated: all 65 render; real handwriting sits between the "P Lines small" rules (52 px).
 
 Exports: `rm.export.{pdf,png,svg,html,bundle}`; PDF export draws strokes as PDFium path
 objects (`FPDFPath_*`, `FPDFPageObj_SetStrokeColor/Width`, `FPDFAnnot_*` for highlights).
+**Text highlights in a PDF export** [O, read 2026-11-27]: the PDF painter (`PdfExporter`,
+ctors 0x1400a2d30 / lambda 0x1400c1db0) copies a flag into +0x2a1 (painter +0xb1) from the
+`DocumentExporter` factory registered in `XoApp::initializeMembers` (0x1400a14f0,
+lambda_5), which captures the setting **`Experimental/AnnotatePdfs`** (QSettings value,
+no default → false). Off (the default, so a normal 3.29 export): a glyph range is drawn
+as the scene draws it (base 0x1409d1c00/0x1409d19e0: rectangles, Darken), as the client
+does. On: per glyph range one `FPDFPage_CreateAnnot(page, 9 = Highlight)` with
+`FPDFAnnot_SetColor(annot, 0 = colour, r, g, b, a)` of its colour (0x14059d930), and per
+rectangle `FPDFAnnot_AppendAttachmentPoints` with the corners mapped by the page transform
+(painter +200) in the order top-left, top-right, bottom-left, bottom-right, as float
+(0x14059c930); nothing is drawn. The client follows the same setting.
 
 Linux client PDF export (`client/src/ui/export.py`) follows the same idea: the original
 PDF pages go into the output untouched (vector, text selectable), with ink on top.

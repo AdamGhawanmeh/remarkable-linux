@@ -11,7 +11,8 @@ not images (ARCHITECTURE.md §5.3):
            repeat values: "down" | "up" | "right" | "left" | "infinite" | count expression
     path:  {"data": ["M", x, y, "L", x, y, "C", x1, y1, x2, y2, x, y, "Z"],
             "strokeColor"?, "fillColor"?, "strokeWidth"?, "antialiasing"?}
-    text:  {"text", "fontSize", "position": {x, y}}
+    text:  {"text", "fontSize", "position": {x, y}, "color"?, "bold"?, "italic"?, "rotate"?}
+           (x, y is the baseline start; ARCHITECTURE.md §5.3 "Text items")
 
 Numbers may be expressions in a small JavaScript-like language: + - * / %, comparisons,
 && ||, ?:, parentheses, and the variables the app's parser defines (templateWidth,
@@ -24,7 +25,7 @@ portrait unless the page's SceneInfo gives another paper size, ARCHITECTURE.md �
 whose centre line is the scene's x = 0. Children are positioned relative to their
 parent group instance. Repeats fill the area being drawn, so a lined template
 continues down an extended page, as on the tablet. Defaults not stated in the files
-(stroke black, 1 px, no fill; text black, top-left anchored) are assumptions;
+(stroke black, 1 px, no fill) are assumptions;
 paperOriginX is the left edge of the scene's "note bounds" (base_environment).
 """
 
@@ -426,30 +427,90 @@ class TemplatePath:
     cosmetic: bool = False              # QPen::setCosmetic: the width is in device pixels
 
 
+TEXT_FONT = "reMarkable Sans"      # the family the drawer sets (0x140a91750)
+DEFAULT_TEXT_ARGB = 0xFF000000
+
+
 @dataclass(frozen=True)
 class TemplateText:
+    """One text item instance, as 3.29's drawer (0x140a91750) draws it: (x, y) is the
+    baseline start, in page coordinates; rotate (degrees) turns it about (x, y)."""
     text: str
     size: int            # pixel size, as drawn
-    x: float             # baseline start, page coordinates
-    baseline: float
+    x: float
+    y: float
+    bold: bool = False
+    italic: bool = False
+    argb: int = DEFAULT_TEXT_ARGB
+    rotate: float = 0.0
 
 
-# text_metrics(text, pixel_size) -> (advance width, ascent), in page pixels
-TextMetrics = Callable[[str, int], tuple[float, float]]
+# text_metrics(text, pixel_size, bold, italic) -> textWidth: the whole-pixel width of
+# QFontMetrics(font).boundingRect(text)
+TextMetrics = Callable[[str, int, bool, bool], int]
 
 
-def _qt_font(size: int):
+def _qt_font(size: int, bold: bool = False, italic: bool = False):
     from PySide6.QtGui import QFont
-    font = QFont()
-    font.setFamilies(list(FONT_FAMILIES))
+    font = QFont(TEXT_FONT)
     font.setPixelSize(max(1, size))
+    font.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)       # 700 / 400
+    font.setItalic(italic)
     return font
 
 
-def qt_text_metrics(text: str, size: int) -> tuple[float, float]:
-    from PySide6.QtGui import QFontMetricsF
-    metrics = QFontMetricsF(_qt_font(size))
-    return metrics.horizontalAdvance(text), metrics.ascent()
+def estimate_text_width(text: str, size: int, bold: bool = False, italic: bool = False) -> int:
+    """A headless textWidth [I]: no font is available, so each character is taken as
+    0.55 em (0.6 bold), in whole pixels like boundingRect().width()."""
+    return round(len(text) * size * (0.6 if bold else 0.55))
+
+
+def qt_text_metrics(text: str, size: int, bold: bool = False, italic: bool = False) -> int:
+    """textWidth as 3.29 measures it: QFontMetrics(font).boundingRect(text).width() in
+    reMarkable Sans (the app's fonts registered, renderer.ensure_fonts); the estimate
+    when Qt or a QGuiApplication is missing."""
+    try:
+        from PySide6.QtGui import QFontMetrics, QGuiApplication
+    except ImportError:
+        return estimate_text_width(text, size, bold, italic)
+    if QGuiApplication.instance() is None:
+        return estimate_text_width(text, size, bold, italic)
+    from .renderer import ensure_fonts
+    ensure_fonts()
+    return QFontMetrics(_qt_font(size, bold, italic)).boundingRect(text).width()
+
+
+def _text_color(item: dict) -> int:
+    """The item's "color" as an ARGB int (parser 0x140a8b580): absent opaque black, null
+    transparent (0), "#RRGGBB" opaque, "#AARRGGBB" as written; anything else an error."""
+    if "color" not in item:
+        return DEFAULT_TEXT_ARGB
+    value = item["color"]
+    if value is None:
+        return 0
+    if isinstance(value, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?", value):
+        number = int(value[1:], 16)
+        return number if len(value) == 9 else 0xFF000000 | number
+    raise TemplateError(f"invalid color, expected '#RRGGBB' or '#AARRGGBB': {value!r}")
+
+
+def _is_visible(item: dict, env: dict) -> bool:
+    """An item's "visible" (items loop 0x140a89fb0, any item type): absent or neither a
+    bool nor a string → visible; a bool as given; a string is an expression, visible
+    iff |value| > 1e-5. Invisible items are skipped without error."""
+    value = item.get("visible")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return abs(evaluate(value, env)) > 1e-5
+    return True
+
+
+def _text_bool(item: dict, key: str) -> bool:
+    value = item.get(key, False)
+    if not isinstance(value, bool):
+        raise TemplateError(f"{key!r}: boolean value expected")        # 0x140a8acb0
+    return value
 
 
 def _color(value: str | None, default: str | None) -> tuple[str, int] | None:
@@ -499,24 +560,37 @@ def template_shapes(template: Template, area: tuple[float, float, float, float],
                             float(item.get("strokeWidth", 1)), bool(item.get("antialiasing", True)))
 
     def text(item: dict, env: dict, ox: float, oy: float) -> TemplateText:
+        """A text item as 3.29's parser reads it (0x140a8e190); an item with an error
+        raises TemplateError, as a path does."""
         value = item.get("text")
-        if not value:
+        if not isinstance(value, str) or not value:
             raise TemplateError("'text' property cannot be empty")
-        size = evaluate(item.get("fontSize", 0), env)
-        if size <= 0:
+        size = item.get("fontSize", 0)
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
             raise TemplateError("'fontSize' must be a positive value")
+        argb = _text_color(item)
         position = item.get("position")
-        if not position:
+        if not isinstance(position, dict):
             raise TemplateError("'position' is empty or missing")
-        pixels = max(1, round(size))
-        advance, ascent = text_metrics(value, pixels)
-        local = dict(env, textWidth=advance)
-        x, y = evaluate(position.get("x", 0), local), evaluate(position.get("y", 0), local)
-        return TemplateText(value, pixels, ox + x, oy + y + ascent)
+        bold, italic = _text_bool(item, "bold"), _text_bool(item, "italic")
+        rotate = item.get("rotate", 0)
+        if isinstance(rotate, bool) or not isinstance(rotate, (int, float)):
+            raise TemplateError("'rotate' must be a number")
+        if abs(rotate) > 360:
+            raise TemplateError("'rotate' must be within +/- 0-360 degrees.")
+        # textWidth is bound before position.x / position.y are evaluated
+        local = dict(env, textWidth=int(text_metrics(value, size, bold, italic)))
+        for axis in ("x", "y"):             # both must evaluate (0x140a8d130)
+            if axis not in position:
+                raise TemplateError(f"'position' needs '{axis}'")
+        x, y = evaluate(position["x"], local), evaluate(position["y"], local)
+        return TemplateText(value, size, ox + x, oy + y, bold, italic, argb, float(rotate))
 
     def items(entries, env: dict, ox: float, oy: float):
         for item in entries:
             kind = item.get("type")
+            if not _is_visible(item, env):
+                continue
             if kind == "group":
                 box = item.get("boundingBox")
                 if not box:
@@ -564,9 +638,20 @@ def paint_template(painter, template: Template, area: tuple[float, float, float,
     try:
         for shape in template_shapes(template, area, width, height):
             if isinstance(shape, TemplateText):
-                painter.setFont(_qt_font(shape.size))
-                painter.setPen(QColor("#000000"))
-                painter.drawText(QPointF(shape.x, shape.baseline), shape.text)
+                # 0x140a91750: pen = the colour, font reMarkable Sans; rotate 0 draws at
+                # the baseline start (x, y), else translate, rotate, draw at (0, 0).
+                from .renderer import ensure_fonts
+                ensure_fonts()
+                painter.save()
+                painter.setFont(_qt_font(shape.size, shape.bold, shape.italic))
+                painter.setPen(QColor.fromRgba(shape.argb))
+                if shape.rotate == 0:
+                    painter.drawText(QPointF(shape.x, shape.y), shape.text)
+                else:
+                    painter.translate(shape.x, shape.y)
+                    painter.rotate(shape.rotate)
+                    painter.drawText(QPointF(0, 0), shape.text)
+                painter.restore()
                 continue
             path = QPainterPath()
             for cmd, pts in shape.commands:
@@ -670,8 +755,16 @@ def template_svg(template: Template, area: tuple[float, float, float, float],
         if isinstance(shape, TemplateText):
             flush()
             families = ", ".join(f"'{f}'" if " " in f else f for f in FONT_FAMILIES)
-            out.append(f'<text x="{_num(shape.x)}" y="{_num(shape.baseline)}" font-family="{families}" '
-                       f'font-size="{shape.size}" fill="#000000">{escape(shape.text)}</text>')
+            alpha = (shape.argb >> 24) & 255
+            opacity = f' fill-opacity="{alpha / 255:.4g}"' if alpha < 255 else ""
+            if shape.rotate == 0:
+                place = f'x="{_num(shape.x)}" y="{_num(shape.y)}"'
+            else:
+                place = f'x="0" y="0" transform="translate({_num(shape.x)} {_num(shape.y)}) rotate({_num(shape.rotate)})"'
+            out.append(f'<text {place} font-family="{families}" font-size="{shape.size}" '
+                       f'font-weight="{700 if shape.bold else 400}" '
+                       f'font-style="{"italic" if shape.italic else "normal"}" '
+                       f'fill="#{shape.argb & 0xFFFFFF:06x}"{opacity}>{escape(shape.text)}</text>')
             continue
         if _outside(shape, area):
             continue

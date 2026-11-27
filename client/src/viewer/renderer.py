@@ -1148,8 +1148,24 @@ qt_measure.qt_document = True       # layout_text lays out in a real QTextDocume
 LAYERS = ("all", "darken", "normal")
 
 
+def glyph_highlights(scene: PageScene, include_hidden: bool = False) -> list[tuple[int, list[tuple[float, float, float, float]]]]:
+    """The PDF/EPUB text highlights of the visible layers, in drawing order: (ARGB colour,
+    its non-empty rectangles as (x, y, w, h) in page coordinates), as _paint_glyphs
+    draws them. PDF export's annotation mode (Experimental/AnnotatePdfs) adds these as
+    annotations instead of drawing them."""
+    out = []
+    for layer in _visible_layers(scene, include_hidden):
+        for item in layer.items():
+            if isinstance(item, GlyphRange):
+                rects = [(*scene.to_page(x, y), w, h) for x, y, w, h in item.rects if w > 0 and h > 0]
+                if rects:
+                    out.append((item.colour_argb(), rects))
+    return out
+
+
 def paint(painter, scene: PageScene, *, background: str = "#ffffff",
-          include_hidden: bool = False, layers: str = "all", blend_modes: bool = True) -> int:
+          include_hidden: bool = False, layers: str = "all", blend_modes: bool = True,
+          text_highlights: bool = True) -> int:
     """Draw the scene with an active QPainter (page coordinates); returns how many
     strokes and text lines were drawn.
 
@@ -1158,6 +1174,8 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
     highlighters as their own layer and blend it with the PDF /BM /Darken mode, which
     QPdfWriter itself cannot express.
     blend_modes=False never changes the composition mode (devices without support).
+    text_highlights=False leaves out PDF/EPUB text highlights (3.29's annotation mode
+    draws none; see glyph_highlights).
     """
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QPainter, QPainterPath
@@ -1182,7 +1200,8 @@ def paint(painter, scene: PageScene, *, background: str = "#ffffff",
             painter.save()
             painter.setClipPath(everywhere.subtracted(clip), Qt.ClipOperation.IntersectClip)
         try:
-            drawn += _paint_item(painter, scene, stroke, background, layers, blend_modes, offsets)
+            if text_highlights or not isinstance(stroke, GlyphRange):
+                drawn += _paint_item(painter, scene, stroke, background, layers, blend_modes, offsets)
         finally:
             if clip is not None:
                 painter.restore()

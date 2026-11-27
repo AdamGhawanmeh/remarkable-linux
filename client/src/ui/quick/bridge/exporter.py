@@ -67,11 +67,13 @@ class _Request:
 
 class DocumentExporter(QObject):
     def __init__(self, source: LibrarySource, library, notify: Callable[[str], None],
-                 parent: QObject | None = None) -> None:
+                 parent: QObject | None = None, annotate_pdfs: Callable[[], bool] | None = None) -> None:
         super().__init__(parent)
         self.library = library
         self.notify = notify                  # a message for the app's notification
         self.worker = Exporter(source, self)
+        if annotate_pdfs is not None:         # Experimental/AnnotatePdfs, read per export
+            self.worker.annotate_pdfs = annotate_pdfs
         self.worker.progress.connect(self._progress)
         self.worker.finished.connect(self._finished)
         self.worker.failed.connect(self._failed)

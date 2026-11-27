@@ -32,7 +32,7 @@ import base64
 import io
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Callable, Sequence
 
@@ -42,7 +42,7 @@ from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject, F
 from PySide6.QtCore import QBuffer, QIODevice, QMarginsF, QRectF, QSize, QSizeF
 from PySide6.QtGui import QColor, QPageSize, QPainter, QPdfWriter
 
-from viewer.renderer import paint, qt_measure, svg_scene
+from viewer.renderer import glyph_highlights, paint, qt_measure, svg_scene
 from viewer.templates import paint_template, template_svg
 
 from .pages import PAPER, DocumentPages, PageContent, render_content
@@ -67,6 +67,18 @@ class _Placed:
     frame: QRectF                                 # page pixels
     source: PageObject | None                     # original PDF page: the vector base
     drawn: dict[str, bool]                        # layer → has content
+    highlights: list = field(default_factory=list)   # annotation mode: (ARGB, page-pixel rects) per glyph range
+
+
+ANNOTATE_PDFS_KEY = "Experimental/AnnotatePdfs"
+
+
+def annotate_pdfs_enabled(store) -> bool:
+    """The app's `Experimental/AnnotatePdfs` setting (a QSettings value, absent → false:
+    3.29's PdfExporter reads it without a default, ARCHITECTURE.md §5.3). `store` is the
+    app's SettingsStore (anything with get(key, default))."""
+    value = store.get(ANNOTATE_PDFS_KEY, False) if store is not None else False
+    return value if isinstance(value, bool) else str(value).strip().lower() in ("1", "true")
 
 
 def _open_source(path: Path) -> PdfReader | None:
@@ -127,10 +139,11 @@ def _source_page(reader: PdfReader, content: PageContent) -> PageObject | None:
 
 def _paint_layer(painter: QPainter, layer: str, content: PageContent,
                  bounds: tuple[float, float, float, float], vector_base: bool,
-                 background_scale: float) -> bool:
+                 background_scale: float, annotate: bool = False) -> bool:
     if layer != "base":
         return content.scene is not None and paint(
-            painter, content.scene, background=PAPER, layers=layer, blend_modes=False) > 0
+            painter, content.scene, background=PAPER, layers=layer, blend_modes=False,
+            text_highlights=not annotate) > 0
     if vector_base:
         return False                              # the original PDF page is the base
     painter.fillRect(QRectF(*bounds), QColor(PAPER))
@@ -146,7 +159,7 @@ def _paint_layer(painter: QPainter, layer: str, content: PageContent,
 
 def _draw_layers(pages: DocumentPages, reader: PdfReader | None, background_scale: float,
                  progress: Callable[[int, int], None] | None,
-                 indexes: Sequence[int]) -> tuple[bytes, list[_Placed]]:
+                 indexes: Sequence[int], annotate: bool = False) -> tuple[bytes, list[_Placed]]:
     """Draw the layers of the pages at `indexes` as consecutive pages of one PDF (fonts
     are shared)."""
     buffer = QBuffer()
@@ -175,9 +188,10 @@ def _draw_layers(pages: DocumentPages, reader: PdfReader | None, background_scal
                 painter.save()
                 painter.translate(-x, -y)
                 drawn[layer] = _paint_layer(painter, layer, content, bounds, source is not None,
-                                            background_scale)
+                                            background_scale, annotate)
                 painter.restore()
-            placed.append(_Placed(bounds, content.frame(), source, drawn))
+            highlights = glyph_highlights(content.scene) if annotate and content.scene is not None else []
+            placed.append(_Placed(bounds, content.frame(), source, drawn, highlights))
             if progress is not None:
                 progress(done, count)
     finally:
@@ -287,6 +301,44 @@ def _stamp(writer: PdfWriter, page: PageObject, layers: list[tuple[PageObject, b
     ])
 
 
+def _highlight_annotations(writer: PdfWriter, page: PageObject, item: _Placed,
+                           ctm: tuple[float, ...], top: float) -> None:
+    """One /Highlight annotation per glyph range (PdfExporter with Experimental/
+    AnnotatePdfs, ARCHITECTURE.md §5.3: FPDFPage_CreateAnnot 9, FPDFAnnot_SetColor,
+    FPDFAnnot_AppendAttachmentPoints per rectangle). /C is r g b in 0..1 and /CA the alpha,
+    as FPDFAnnot_SetColor writes them; /QuadPoints lists each rectangle's corners in the
+    order top-left, top-right, bottom-left, bottom-right through the same page transform
+    the layers are stamped with (page pixels → layer points → `ctm`); /Rect [I] is the box
+    of all quad points. No appearance stream [I]: viewers draw a Highlight from its colour."""
+    if not item.highlights:
+        return
+    x, y = item.bounds[0], item.bounds[1]
+    a, b, c, d, e, f = ctm
+
+    def pdf_point(px: float, py: float) -> tuple[float, float]:
+        lx, ly = (px - x) * PT_PER_PX, top - (py - y) * PT_PER_PX
+        return a * lx + c * ly + e, b * lx + d * ly + f
+
+    annots = ArrayObject(page["/Annots"] if "/Annots" in page else [])
+    for argb, rects in item.highlights:
+        quad: list[float] = []
+        for rx, ry, rw, rh in rects:
+            for corner in ((rx, ry), (rx + rw, ry), (rx, ry + rh), (rx + rw, ry + rh)):
+                quad.extend(pdf_point(*corner))
+        xs, ys = quad[0::2], quad[1::2]
+        annot = DictionaryObject({
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Highlight"),
+            NameObject("/Rect"): ArrayObject(FloatObject(v) for v in (min(xs), min(ys), max(xs), max(ys))),
+            NameObject("/C"): ArrayObject(FloatObject(v / 255) for v in
+                                          ((argb >> 16) & 255, (argb >> 8) & 255, argb & 255)),
+            NameObject("/CA"): FloatObject(((argb >> 24) & 255) / 255),
+            NameObject("/QuadPoints"): ArrayObject(FloatObject(v) for v in quad),
+        })
+        annots.append(writer._add_object(annot))
+    page[NameObject("/Annots")] = annots
+
+
 def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO, password: str = "") -> None:
     overlay = PdfReader(io.BytesIO(layers))
     writer = PdfWriter()
@@ -303,6 +355,7 @@ def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO, p
         ink = [(layer, name == "darken") for name, layer in (("darken", darken), ("normal", normal))
                if item.drawn[name]]
         _stamp(writer, page, ink, box, ctm, clip)
+        _highlight_annotations(writer, page, item, ctm, box[3])
     writer.add_metadata({"/Title": title, "/Creator": "reMarkable for Linux"})
     if password:                    # ExportDialog's "Keep password protection"
         writer.encrypt(user_password=password, algorithm="AES-256")
@@ -312,11 +365,14 @@ def _assemble(layers: bytes, placed: list[_Placed], title: str, out: BinaryIO, p
 def export_pdf(pages: DocumentPages, path: str | Path, *,
                progress: Callable[[int, int], None] | None = None,
                background_scale: float = BACKGROUND_SCALE,
-               indexes: Sequence[int] | None = None, password: str = "") -> Path:
+               indexes: Sequence[int] | None = None, password: str = "",
+               annotate: bool = False) -> Path:
     """Write every page of `pages`, or those at `indexes` in that order, to a PDF at
     `path`; returns the path. `progress(done, total)` follows each page drawn; whatever
     it raises stops the export before anything is written. `password`: the PDF written
-    is protected with it (AES-256), as the app keeps a protected PDF's protection."""
+    is protected with it (AES-256), as the app keeps a protected PDF's protection.
+    `annotate`: the Experimental/AnnotatePdfs setting (annotate_pdfs_enabled): text
+    highlights become /Highlight annotations instead of Darken rectangles."""
     path = Path(path)
     if not pages.pages:
         raise ValueError("document has no pages")
@@ -327,7 +383,7 @@ def export_pdf(pages: DocumentPages, path: str | Path, *,
     if not path.parent.is_dir():
         raise FileNotFoundError(f"no such folder: {path.parent}")
     reader = _open_source(pages.pdf_path) if pages.pdf is not None else None
-    layers, placed = _draw_layers(pages, reader, background_scale, progress, indexes)
+    layers, placed = _draw_layers(pages, reader, background_scale, progress, indexes, annotate)
     partial = path.with_name(path.name + ".part")
     try:
         with open(partial, "wb") as out:

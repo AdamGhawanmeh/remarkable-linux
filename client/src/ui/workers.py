@@ -195,6 +195,8 @@ class Exporter(QObject):
         self.pool.setMaxThreadCount(1)
         self.running = False
         self._cancel = threading.Event()
+        # Experimental/AnnotatePdfs, read when an export starts (ui.export.annotate_pdfs_enabled)
+        self.annotate_pdfs: Callable[[], bool] = lambda: False
 
     def export(self, kind: str, doc: Document, path: str, pages: list[int] | None = None,
                password: str = "", keep_password: bool = False) -> bool:
@@ -205,6 +207,7 @@ class Exporter(QObject):
             return False
         self.running = True
         cancel = self._cancel = threading.Event()
+        annotate = bool(self.annotate_pdfs()) if kind == "pdf" else False
 
         def report(done: int, total: int) -> None:
             if cancel.is_set():
@@ -224,6 +227,8 @@ class Exporter(QObject):
                     document = DocumentPages(self.source, doc)     # own PDF handle for this thread
                     write = WRITERS[kind]
                     extra = {"password": password} if kind == "pdf" and password and keep_password else {}
+                    if annotate:
+                        extra["annotate"] = True
                     try:
                         result = write(document, path, progress=report, indexes=pages, **extra)
                     finally:

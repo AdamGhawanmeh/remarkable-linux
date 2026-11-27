@@ -43,6 +43,7 @@ from core.auth import AuthError, AuthNetworkError
 from core.sync import UnsupportedProtocolError
 from core.models import DocumentTree
 
+from ..export import annotate_pdfs_enabled
 from ..library import LibrarySource
 from ..outgoing import EditSettings, OutgoingSync, install_settings_cell
 from ..workers import Account, InternetCheck, Mutator, Syncer
@@ -127,7 +128,8 @@ class QuickApp:
                                      notify=lambda message: self.library.errorMessage.emit(message))
         # ExportDialog -> PlatformHelpers.exportFile; results show as the app's notifications.
         self.exporter = DocumentExporter(source, self.library,
-                                         notify=lambda message: self.singletons.platform_helpers.errorMessage.emit(message))
+                                         notify=lambda message: self.singletons.platform_helpers.errorMessage.emit(message),
+                                         annotate_pdfs=lambda: annotate_pdfs_enabled(store))
         self.library.abort_export = self.exporter.abort
         self.library.save_reading_position = self._save_reading_position
         self.singletons = Singletons(
