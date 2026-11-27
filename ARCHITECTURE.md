@@ -1436,8 +1436,8 @@ code is in the binary, mouse path included:
   `clearLinesInLayer(currentLayer)`; the Layers foldout's slot keeps its index), keeps
   it as one `StrokeDelete` (pending edit) and one undo step (`StrokeChange` readd in
   that order), and nothing when the layer holds no stroke.
-- Deviations: an emptied group node is left attached and anchored (as the client's
-  eraser leaves it); strokes stored with version-1 points (which the client cannot put
+- Deviations: an emptied group node is left attached and anchored by Erase all (the
+  eraser instead regroups and detaches emptied groups, §5.1 anchoring); strokes stored with version-1 points (which the client cannot put
   back) stay. Glyph ranges (PDF/EPUB text highlights, block 0x03) go with the strokes,
   as the filter has it (§5.11).
   Checked read-only on the same 150 cached pages: every current-layer clear takes no
@@ -1974,7 +1974,10 @@ rasteriser (0x140b19420) calls the fill per span.
   (premultiplied ARGB, pipeline +0x78). 32-bit target (0x140b053f0 / 0x140b059a0; the
   0x140b051a0 / 0x140b055e0 variants, chosen by a target flag +0x71, and every 16-bit RGB565
   path first dither the coverage c with the noise table, c &= (perm[perm[y & 255] + (x &
-  255)] | 0xF0)):
+  255)] | 0xF0)). The RGB565 pair is 0x140b04af0 (read: the additive white-tint rule
+  below on 5/6/5 channels, called from the fill 0x140b2c5a0 and 0x140b3b2b0) and
+  0x140b04d80 (its multiply counterpart [I], not decompiled). The client draws to a
+  32-bit target and ports only the 32-bit pair ([I] that 3.29's desktop target is 32-bit):
   * C with r = g = b = a (a white tint): additive, each channel min(255, D + C·c/255);
   * otherwise (unless the environment sets `SHADING_NORMAL_BLEND`): c ← c ·
     (76 R + 150 G + 29 B)/A_D / 255 of the destination (its unpremultiplied luminance, so a
